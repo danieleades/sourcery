@@ -63,8 +63,10 @@ pub struct AuditLog {
 }
 
 impl Projection for AuditLog {
+    const KIND: &'static str = "audit-log";
     type Id = String;
     type Metadata = EventMetadata;
+    type InstanceId = ();
 }
 
 impl ApplyProjection<FundsDeposited> for AuditLog {
@@ -157,8 +159,10 @@ pub struct TenantMetadata {
 }
 
 impl Projection for TenantDashboard {
+    const KIND: &'static str = "tenant-dashboard";
     type Id = String;
     type Metadata = TenantMetadata;
+    type InstanceId = ();
 }
 
 impl ApplyProjection<OrderPlaced> for TenantDashboard {

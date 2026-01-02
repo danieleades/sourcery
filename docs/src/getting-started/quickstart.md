@@ -1,6 +1,6 @@
 # Quick Start
 
-Build a simple bank account aggregate in under 50 lines. This example demonstrates events, commands, an aggregate, a projection, and the repository.
+Build a simple bank account aggregate in a compact, end-to-end example. This example demonstrates events, commands, an aggregate, a projection, and the repository.
 
 ## The Complete Example
 

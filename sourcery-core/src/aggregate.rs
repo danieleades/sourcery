@@ -119,7 +119,7 @@ impl<'a, R, A> AggregateBuilder<'a, R, A> {
     }
 }
 
-impl<S, C, A> AggregateBuilder<'_, Repository<S, C, NoSnapshots<S::Id, S::Position>>, A>
+impl<S, C, A> AggregateBuilder<'_, Repository<S, C, NoSnapshots<S::Position>>, A>
 where
     S: EventStore,
     C: ConcurrencyStrategy,
@@ -148,7 +148,7 @@ where
 impl<S, SS, C, A> AggregateBuilder<'_, Repository<S, C, Snapshots<SS>>, A>
 where
     S: EventStore,
-    SS: SnapshotStore<Id = S::Id, Position = S::Position>,
+    SS: SnapshotStore<S::Id, Position = S::Position>,
     C: ConcurrencyStrategy,
     A: Aggregate<Id = S::Id> + Serialize + DeserializeOwned,
 {

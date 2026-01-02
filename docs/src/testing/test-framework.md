@@ -36,12 +36,6 @@ fn deposit_increases_balance() {
 
 ## The Given-When-Then Pattern
 
-```mermaid
-flowchart LR
-    Given["Given<br/>(past events)"] --> When["When<br/>(command)"]
-    When --> Then["Then<br/>(expected outcome)"]
-```
-
 - **Given**: Events that have already occurred (establishes state)
 - **When**: The command being tested
 - **Then**: Expected events or error

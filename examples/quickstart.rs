@@ -60,7 +60,10 @@ pub struct TotalDeposits {
 
 impl Projection for TotalDeposits {
     type Id = String;
+    type InstanceId = ();
     type Metadata = ();
+
+    const KIND: &'static str = "total-deposits";
 }
 
 impl ApplyProjection<FundsDeposited> for TotalDeposits {
@@ -75,7 +78,7 @@ impl ApplyProjection<FundsDeposited> for TotalDeposits {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create an in-memory store
     let store = inmemory::Store::new(JsonCodec);
-    let mut repository = Repository::new(store);
+    let repository = Repository::new(store);
 
     // Execute a command
     repository

@@ -1,10 +1,15 @@
-use std::{collections::HashMap, convert::Infallible};
+use std::{
+    collections::HashMap,
+    convert::Infallible,
+    sync::{Arc, RwLock},
+};
 
 use crate::{
     codec::Codec,
     concurrency::{ConcurrencyConflict, ConcurrencyStrategy},
     store::{
-        AppendError, EventFilter, EventStore, PersistableEvent, StoredEvent, StreamKey, Transaction,
+        AppendError, AppendResult, EventFilter, EventStore, GloballyOrderedStore, NonEmpty,
+        PersistableEvent, StoredEvent, StreamKey, Transaction,
     },
 };
 
@@ -18,11 +23,16 @@ use crate::{
 /// - `Id`: Aggregate identifier type (must be hashable/equatable for map keys)
 /// - `C`: Serialization codec
 /// - `M`: Metadata type (use `()` when not needed)
+#[derive(Clone)]
 pub struct Store<Id, C, M>
 where
     C: Codec,
 {
     codec: C,
+    inner: Arc<RwLock<Inner<Id, M>>>,
+}
+
+struct Inner<Id, M> {
     streams: HashMap<StreamKey<Id>, Vec<StoredEvent<Id, u64, M>>>,
     next_position: u64,
 }
@@ -35,8 +45,10 @@ where
     pub fn new(codec: C) -> Self {
         Self {
             codec,
-            streams: HashMap::new(),
-            next_position: 0,
+            inner: Arc::new(RwLock::new(Inner {
+                streams: HashMap::new(),
+                next_position: 0,
+            })),
         }
     }
 }
@@ -78,16 +90,19 @@ where
         aggregate_id: &'a Self::Id,
     ) -> impl Future<Output = Result<Option<u64>, Self::Error>> + Send + 'a {
         let stream_key = StreamKey::new(aggregate_kind, aggregate_id.clone());
-        let version = self
-            .streams
-            .get(&stream_key)
-            .and_then(|s| s.last().map(|e| e.position));
+        let version = {
+            let inner = self.inner.read().expect("in-memory store lock poisoned");
+            inner
+                .streams
+                .get(&stream_key)
+                .and_then(|s| s.last().map(|e| e.position))
+        };
         tracing::trace!(?version, "retrieved stream version");
         std::future::ready(Ok(version))
     }
 
     fn begin<Conc: ConcurrencyStrategy>(
-        &mut self,
+        &self,
         aggregate_kind: &str,
         aggregate_id: Self::Id,
         expected_version: Option<Self::Position>,
@@ -102,19 +117,21 @@ where
 
     #[tracing::instrument(skip(self, aggregate_id, events), fields(event_count = events.len()))]
     fn append<'a>(
-        &'a mut self,
+        &'a self,
         aggregate_kind: &'a str,
         aggregate_id: &'a Self::Id,
         expected_version: Option<u64>,
-        events: Vec<PersistableEvent<Self::Metadata>>,
-    ) -> impl Future<Output = Result<(), AppendError<u64, Self::Error>>> + Send + 'a {
+        events: NonEmpty<PersistableEvent<Self::Metadata>>,
+    ) -> impl Future<Output = Result<AppendResult<u64>, AppendError<u64, Self::Error>>> + Send + 'a
+    {
         let event_count = events.len();
 
         let result = (|| {
+            let mut inner = self.inner.write().expect("in-memory store lock poisoned");
             // Check version if provided
             if let Some(expected) = expected_version {
                 let stream_key = StreamKey::new(aggregate_kind, aggregate_id.clone());
-                let current = self
+                let current = inner
                     .streams
                     .get(&stream_key)
                     .and_then(|s| s.last().map(|e| e.position));
@@ -129,11 +146,13 @@ where
             }
 
             let stream_key = StreamKey::new(aggregate_kind, aggregate_id.clone());
+            let mut last_position = None;
             let stored: Vec<StoredEvent<Id, u64, M>> = events
                 .into_iter()
                 .map(|e| {
-                    let position = self.next_position;
-                    self.next_position += 1;
+                    let position = inner.next_position;
+                    inner.next_position += 1;
+                    last_position = Some(position);
                     StoredEvent {
                         aggregate_kind: aggregate_kind.to_string(),
                         aggregate_id: aggregate_id.clone(),
@@ -145,9 +164,12 @@ where
                 })
                 .collect();
 
-            self.streams.entry(stream_key).or_default().extend(stored);
+            inner.streams.entry(stream_key).or_default().extend(stored);
+            drop(inner);
             tracing::debug!(events_appended = event_count, "events appended to stream");
-            Ok(())
+            Ok(AppendResult {
+                last_position: last_position.expect("nonempty append"),
+            })
         })();
 
         std::future::ready(result)
@@ -155,17 +177,19 @@ where
 
     #[tracing::instrument(skip(self, aggregate_id, events), fields(event_count = events.len()))]
     fn append_expecting_new<'a>(
-        &'a mut self,
+        &'a self,
         aggregate_kind: &'a str,
         aggregate_id: &'a Self::Id,
-        events: Vec<PersistableEvent<Self::Metadata>>,
-    ) -> impl Future<Output = Result<(), AppendError<u64, Self::Error>>> + Send + 'a {
+        events: NonEmpty<PersistableEvent<Self::Metadata>>,
+    ) -> impl Future<Output = Result<AppendResult<u64>, AppendError<u64, Self::Error>>> + Send + 'a
+    {
         let event_count = events.len();
 
         let result = (|| {
+            let mut inner = self.inner.write().expect("in-memory store lock poisoned");
             // Check that stream is empty (new aggregate)
             let stream_key = StreamKey::new(aggregate_kind, aggregate_id.clone());
-            let current = self
+            let current = inner
                 .streams
                 .get(&stream_key)
                 .and_then(|s| s.last().map(|e| e.position));
@@ -185,11 +209,13 @@ where
 
             // Stream is empty, proceed with append (no further version check needed)
             let stream_key = StreamKey::new(aggregate_kind, aggregate_id.clone());
+            let mut last_position = None;
             let stored: Vec<StoredEvent<Id, u64, M>> = events
                 .into_iter()
                 .map(|e| {
-                    let position = self.next_position;
-                    self.next_position += 1;
+                    let position = inner.next_position;
+                    inner.next_position += 1;
+                    last_position = Some(position);
                     StoredEvent {
                         aggregate_kind: aggregate_kind.to_string(),
                         aggregate_id: aggregate_id.clone(),
@@ -201,12 +227,15 @@ where
                 })
                 .collect();
 
-            self.streams.entry(stream_key).or_default().extend(stored);
+            inner.streams.entry(stream_key).or_default().extend(stored);
+            drop(inner);
             tracing::debug!(
                 events_appended = event_count,
                 "new stream created with events"
             );
-            Ok(())
+            Ok(AppendResult {
+                last_position: last_position.expect("nonempty append"),
+            })
         })();
 
         std::future::ready(result)
@@ -219,6 +248,7 @@ where
     ) -> impl Future<Output = Result<Vec<StoredEvent<Id, u64, M>>, Self::Error>> + Send + 'a {
         use std::collections::HashSet;
 
+        let inner = self.inner.read().expect("in-memory store lock poisoned");
         let mut result = Vec::new();
         let mut seen: HashSet<(StreamKey<Id>, String)> = HashSet::new(); // (stream key, event kind)
 
@@ -246,7 +276,7 @@ where
 
         // Load events for specific aggregates
         for (stream_key, kinds) in &by_aggregate {
-            if let Some(stream) = self.streams.get(stream_key) {
+            if let Some(stream) = inner.streams.get(stream_key) {
                 for event in stream {
                     // Check if this event kind is requested AND passes its specific position filter
                     if let Some(&after_pos) = kinds.get(&event.kind)
@@ -269,7 +299,7 @@ where
         // Load events from all aggregates for unfiltered kinds
         // Skip events we've already loaded for specific aggregates
         if !all_kinds.is_empty() {
-            for stream in self.streams.values() {
+            for stream in inner.streams.values() {
                 for event in stream {
                     // Check if this event kind is requested AND passes its specific position filter
                     if let Some(&after_pos) = all_kinds.get(&event.kind)
@@ -296,4 +326,12 @@ where
         tracing::debug!(events_loaded = result.len(), "loaded events from store");
         std::future::ready(Ok(result))
     }
+}
+
+impl<Id, C, M> GloballyOrderedStore for Store<Id, C, M>
+where
+    Id: Clone + Eq + std::hash::Hash + Send + Sync + 'static,
+    C: Codec + Clone + Send + Sync + 'static,
+    M: Clone + Send + Sync + 'static,
+{
 }

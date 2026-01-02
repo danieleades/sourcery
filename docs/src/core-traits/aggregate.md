@@ -66,7 +66,8 @@ Use `AggregateBuilder` to load an aggregate's current state:
 ```rust,ignore
 let account: Account = repository
     .aggregate_builder()
-    .load(&account_id)?;
+    .load(&account_id)
+    .await?;
 
 println!("Current balance: {}", account.balance);
 ```

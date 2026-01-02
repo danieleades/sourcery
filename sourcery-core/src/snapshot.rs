@@ -11,10 +11,15 @@
 //! - [`InMemorySnapshotStore`] - Reference implementation with configurable
 //!   policy
 
-use std::{collections::HashMap, convert::Infallible, future::Future};
+use std::{
+    any::TypeId,
+    collections::HashMap,
+    convert::Infallible,
+    future::Future,
+    sync::{Arc, RwLock},
+};
 
-use crate::store::StreamKey;
-
+use serde::Serialize;
 /// Point-in-time snapshot of aggregate state.
 ///
 /// The `position` field indicates the event stream position when this snapshot
@@ -49,12 +54,10 @@ pub struct Snapshot<Pos> {
 /// - Every N events: balance between storage and replay cost
 /// - Never save: read-only replicas that only load snapshots created elsewhere
 // ANCHOR: snapshot_store_trait
-pub trait SnapshotStore: Send + Sync {
-    /// Aggregate identifier type.
-    ///
-    /// Must match the `EventStore::Id` type used in the same repository.
-    type Id: Send + Sync + 'static;
-
+pub trait SnapshotStore<Id>: Send + Sync
+where
+    Id: Send + Sync + 'static,
+{
     /// Position type for tracking snapshot positions.
     ///
     /// Must match the `EventStore::Position` type used in the same repository.
@@ -72,8 +75,8 @@ pub trait SnapshotStore: Send + Sync {
     /// Returns an error if the underlying storage fails.
     fn load<'a>(
         &'a self,
-        aggregate_kind: &'a str,
-        aggregate_id: &'a Self::Id,
+        kind: &'a str,
+        id: &'a Id,
     ) -> impl Future<Output = Result<Option<Snapshot<Self::Position>>, Self::Error>> + Send + 'a;
 
     /// Whether to store a snapshot, with lazy snapshot creation.
@@ -93,9 +96,9 @@ pub trait SnapshotStore: Send + Sync {
     /// Returns [`OfferSnapshotError::Create`] if `create_snapshot` fails.
     /// Returns [`OfferSnapshotError::Snapshot`] if persistence fails.
     fn offer_snapshot<'a, CE, Create>(
-        &'a mut self,
-        aggregate_kind: &'a str,
-        aggregate_id: &'a Self::Id,
+        &'a self,
+        kind: &'a str,
+        id: &'a Id,
         events_since_last_snapshot: u64,
         create_snapshot: Create,
     ) -> impl Future<Output = Result<SnapshotOffer, OfferSnapshotError<Self::Error, CE>>> + Send + 'a
@@ -137,11 +140,11 @@ where
 ///
 /// Use this as the default when snapshots are not needed.
 ///
-/// Generic over `Id` and `Pos` to match the `EventStore` types.
+/// Generic over `Pos` to match the `EventStore` position type.
 #[derive(Clone, Debug, Default)]
-pub struct NoSnapshots<Id, Pos>(std::marker::PhantomData<(Id, Pos)>);
+pub struct NoSnapshots<Pos>(std::marker::PhantomData<Pos>);
 
-impl<Id, Pos> NoSnapshots<Id, Pos> {
+impl<Pos> NoSnapshots<Pos> {
     /// Create a new no-op snapshot store.
     #[must_use]
     pub const fn new() -> Self {
@@ -149,27 +152,26 @@ impl<Id, Pos> NoSnapshots<Id, Pos> {
     }
 }
 
-impl<Id, Pos> SnapshotStore for NoSnapshots<Id, Pos>
+impl<Id, Pos> SnapshotStore<Id> for NoSnapshots<Pos>
 where
     Id: Send + Sync + 'static,
     Pos: Send + Sync + 'static,
 {
     type Error = Infallible;
-    type Id = Id;
     type Position = Pos;
 
     fn load<'a>(
         &'a self,
-        _aggregate_kind: &'a str,
-        _aggregate_id: &'a Self::Id,
+        _kind: &'a str,
+        _id: &'a Id,
     ) -> impl Future<Output = Result<Option<Snapshot<Pos>>, Self::Error>> + Send + 'a {
         std::future::ready(Ok(None))
     }
 
     fn offer_snapshot<'a, CE, Create>(
-        &'a mut self,
-        _aggregate_kind: &'a str,
-        _aggregate_id: &'a Self::Id,
+        &'a self,
+        _kind: &'a str,
+        _id: &'a Id,
         _events_since_last_snapshot: u64,
         _create_snapshot: Create,
     ) -> impl Future<Output = Result<SnapshotOffer, OfferSnapshotError<Self::Error, CE>>> + Send + 'a
@@ -240,7 +242,10 @@ impl SnapshotPolicy {
 /// This is a reference implementation suitable for testing and development.
 /// Production systems should implement [`SnapshotStore`] with durable storage.
 ///
-/// Generic over `Id` and `Pos` to match the `EventStore` types.
+/// Keys are derived from `(kind, id)` via `serde_json`, so `Id: Serialize` is
+/// required for this store.
+///
+/// Generic over `Pos` to match the `EventStore` position type.
 ///
 /// # Example
 ///
@@ -251,12 +256,12 @@ impl SnapshotPolicy {
 ///     .with_snapshots(InMemorySnapshotStore::every(100));
 /// ```
 #[derive(Clone, Debug)]
-pub struct InMemorySnapshotStore<Id, Pos> {
-    snapshots: HashMap<StreamKey<Id>, Snapshot<Pos>>,
+pub struct InMemorySnapshotStore<Pos> {
+    snapshots: Arc<RwLock<HashMap<SnapshotKey, Snapshot<Pos>>>>,
     policy: SnapshotPolicy,
 }
 
-impl<Id, Pos> InMemorySnapshotStore<Id, Pos> {
+impl<Pos> InMemorySnapshotStore<Pos> {
     /// Create a snapshot store that saves after every command.
     ///
     /// Best for aggregates with expensive replay or many events.
@@ -264,7 +269,7 @@ impl<Id, Pos> InMemorySnapshotStore<Id, Pos> {
     #[must_use]
     pub fn always() -> Self {
         Self {
-            snapshots: HashMap::new(),
+            snapshots: Arc::new(RwLock::new(HashMap::new())),
             policy: SnapshotPolicy::Always,
         }
     }
@@ -277,7 +282,7 @@ impl<Id, Pos> InMemorySnapshotStore<Id, Pos> {
     #[must_use]
     pub fn every(n: u64) -> Self {
         Self {
-            snapshots: HashMap::new(),
+            snapshots: Arc::new(RwLock::new(HashMap::new())),
             policy: SnapshotPolicy::EveryNEvents(n),
         }
     }
@@ -290,44 +295,48 @@ impl<Id, Pos> InMemorySnapshotStore<Id, Pos> {
     #[must_use]
     pub fn never() -> Self {
         Self {
-            snapshots: HashMap::new(),
+            snapshots: Arc::new(RwLock::new(HashMap::new())),
             policy: SnapshotPolicy::Never,
         }
     }
 }
 
-impl<Id, Pos> Default for InMemorySnapshotStore<Id, Pos> {
+impl<Pos> Default for InMemorySnapshotStore<Pos> {
     fn default() -> Self {
         Self::always()
     }
 }
 
-impl<Id, Pos> SnapshotStore for InMemorySnapshotStore<Id, Pos>
+impl<Id, Pos> SnapshotStore<Id> for InMemorySnapshotStore<Pos>
 where
-    Id: Clone + Eq + std::hash::Hash + Send + Sync + 'static,
-    Pos: Clone + Send + Sync + 'static,
+    Id: Serialize + Send + Sync + 'static,
+    Pos: Clone + Ord + Send + Sync + 'static,
 {
-    type Error = Infallible;
-    type Id = Id;
+    type Error = serde_json::Error;
     type Position = Pos;
 
-    #[tracing::instrument(skip(self, aggregate_id))]
+    #[tracing::instrument(skip(self, id))]
     fn load<'a>(
         &'a self,
-        aggregate_kind: &'a str,
-        aggregate_id: &'a Self::Id,
+        kind: &'a str,
+        id: &'a Id,
     ) -> impl Future<Output = Result<Option<Snapshot<Pos>>, Self::Error>> + Send + 'a {
-        let key = StreamKey::new(aggregate_kind, aggregate_id.clone());
-        let snapshot = self.snapshots.get(&key).cloned();
-        tracing::trace!(found = snapshot.is_some(), "snapshot lookup");
-        std::future::ready(Ok(snapshot))
+        async move {
+            let key = SnapshotKey::new(kind, id)?;
+            let snapshot = {
+                let snapshots = self.snapshots.read().expect("snapshot store lock poisoned");
+                snapshots.get(&key).cloned()
+            };
+            tracing::trace!(found = snapshot.is_some(), "snapshot lookup");
+            Ok(snapshot)
+        }
     }
 
-    #[tracing::instrument(skip(self, aggregate_id, create_snapshot))]
+    #[tracing::instrument(skip(self, id, create_snapshot))]
     fn offer_snapshot<'a, CE, Create>(
-        &'a mut self,
-        aggregate_kind: &'a str,
-        aggregate_id: &'a Self::Id,
+        &'a self,
+        kind: &'a str,
+        id: &'a Id,
         events_since_last_snapshot: u64,
         create_snapshot: Create,
     ) -> impl Future<Output = Result<SnapshotOffer, OfferSnapshotError<Self::Error, CE>>> + Send + 'a
@@ -343,10 +352,51 @@ where
             Ok(snapshot) => snapshot,
             Err(e) => return std::future::ready(Err(OfferSnapshotError::Create(e))),
         };
+        let key = match SnapshotKey::new(kind, id) {
+            Ok(key) => key,
+            Err(e) => return std::future::ready(Err(OfferSnapshotError::Snapshot(e))),
+        };
 
-        let key = StreamKey::new(aggregate_kind, aggregate_id.clone());
-        self.snapshots.insert(key, snapshot);
-        tracing::debug!(events_since_last_snapshot, "snapshot saved");
-        std::future::ready(Ok(SnapshotOffer::Stored))
+        let offer = {
+            let mut snapshots = self
+                .snapshots
+                .write()
+                .expect("snapshot store lock poisoned");
+            match snapshots.get(&key) {
+                Some(existing) if existing.position >= snapshot.position => SnapshotOffer::Declined,
+                _ => {
+                    snapshots.insert(key, snapshot);
+                    SnapshotOffer::Stored
+                }
+            }
+        };
+
+        tracing::debug!(
+            events_since_last_snapshot,
+            ?offer,
+            "snapshot offer evaluated"
+        );
+        std::future::ready(Ok(offer))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+struct SnapshotKey {
+    kind: String,
+    type_id: TypeId,
+    id: Vec<u8>,
+}
+
+impl SnapshotKey {
+    fn new<Id>(kind: &str, id: &Id) -> Result<Self, serde_json::Error>
+    where
+        Id: Serialize + 'static,
+    {
+        let id_bytes = serde_json::to_vec(id)?;
+        Ok(Self {
+            kind: kind.to_string(),
+            type_id: TypeId::of::<Id>(),
+            id: id_bytes,
+        })
     }
 }

@@ -334,7 +334,10 @@ pub struct CustomerBillingProjection {
 
 impl Projection for CustomerBillingProjection {
     type Id = String;
+    type InstanceId = ();
     type Metadata = EventMetadata;
+
+    const KIND: &'static str = "customer-billing";
 }
 
 impl CustomerBillingProjection {
@@ -447,7 +450,7 @@ impl ApplyProjection<InvoiceSettled> for CustomerBillingProjection {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store: inmemory::Store<String, JsonCodec, EventMetadata> = inmemory::Store::new(JsonCodec);
-    let mut repository = Repository::new(store);
+    let repository = Repository::new(store);
 
     let customer_id = String::from("ACME-001");
     let subscription_corr = format!("subscription/{}", customer_id.as_str());

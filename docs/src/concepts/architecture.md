@@ -84,13 +84,6 @@ Repo -> Snap: "offer_snapshot()?"
 Repo -> App: "Ok(())" {style.stroke-dash: 3}
 ```
 
-1. Optionally load a snapshot to skip replaying old events
-2. Load remaining events from the store
-3. Replay events to rebuild aggregate state
-4. Execute the command handler
-5. Persist new events atomically
-6. Optionally create a new snapshot
-
 ## Projection Building Flow
 
 ```d2

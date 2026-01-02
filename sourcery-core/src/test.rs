@@ -121,7 +121,6 @@ pub trait StoreAccess {
     type Store: EventStore;
 
     fn store(&self) -> &Self::Store;
-    fn store_mut(&mut self) -> &mut Self::Store;
 }
 
 impl<S, C, M> StoreAccess for Repository<S, C, M>
@@ -133,10 +132,6 @@ where
 
     fn store(&self) -> &Self::Store {
         &self.store
-    }
-
-    fn store_mut(&mut self) -> &mut Self::Store {
-        &mut self.store
     }
 }
 
@@ -168,7 +163,11 @@ pub trait RepositoryTestExt: StoreAccess + Send {
     {
         let id = id.clone();
         async move {
-            let store = self.store_mut();
+            if events.is_empty() {
+                return Ok(());
+            }
+
+            let store = self.store();
             let mut tx = store.begin::<Unchecked>(A::KIND, id, None);
 
             for event in events {
@@ -176,7 +175,11 @@ pub trait RepositoryTestExt: StoreAccess + Send {
                     .map_err(SeedError::Codec)?;
             }
 
-            tx.commit().await.map_err(SeedError::Store)
+            tx.commit().await.map(|_| ()).map_err(|e| match e {
+                AppendError::Store(err) => SeedError::Store(err),
+                AppendError::Conflict(_) => unreachable!("conflict impossible without version"),
+                AppendError::EmptyAppend => unreachable!("empty append filtered above"),
+            })
         }
     }
 
@@ -209,7 +212,7 @@ pub trait RepositoryTestExt: StoreAccess + Send {
     {
         let id = id.clone();
         async move {
-            let store = self.store_mut();
+            let store = self.store();
             let persistable = event
                 .to_persistable(
                     store.codec(),
@@ -218,13 +221,20 @@ pub trait RepositoryTestExt: StoreAccess + Send {
                 .map_err(SeedError::Codec)?;
 
             store
-                .append(A::KIND, &id, None, vec![persistable])
+                .append(
+                    A::KIND,
+                    &id,
+                    None,
+                    crate::store::NonEmpty::from_vec(vec![persistable]).expect("nonempty"),
+                )
                 .await
+                .map(|_| ())
                 .map_err(|e| match e {
                     AppendError::Store(e) => SeedError::Store(e),
                     AppendError::Conflict(_) => {
                         unreachable!("no version check on inject_concurrent_event")
                     }
+                    AppendError::EmptyAppend => unreachable!("nonempty injection"),
                 })
         }
     }
@@ -254,15 +264,22 @@ pub trait RepositoryTestExt: StoreAccess + Send {
         let aggregate_kind = aggregate_kind.to_string();
         let id = id.clone();
         async move {
-            let store = self.store_mut();
+            let store = self.store();
             store
-                .append(&aggregate_kind, &id, None, vec![event])
+                .append(
+                    &aggregate_kind,
+                    &id,
+                    None,
+                    crate::store::NonEmpty::from_vec(vec![event]).expect("nonempty"),
+                )
                 .await
+                .map(|_| ())
                 .map_err(|e| match e {
                     AppendError::Store(e) => e,
                     AppendError::Conflict(_) => {
                         unreachable!("no version check on inject_raw_event")
                     }
+                    AppendError::EmptyAppend => unreachable!("nonempty injection"),
                 })
         }
     }
