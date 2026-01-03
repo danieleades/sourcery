@@ -25,7 +25,7 @@ use std::{collections::HashMap, fmt};
 
 use serde::{Deserialize, Serialize};
 use sourcery::{
-    Aggregate, Apply, ApplyProjection, DomainEvent, Handle, Projection, Repository,
+    Aggregate, Apply, ApplyProjection, DomainEvent, Handle, Repository,
     store::{JsonCodec, inmemory},
 };
 
@@ -327,17 +327,10 @@ pub struct CustomerSnapshot {
     pub last_updated_by: String,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, sourcery::Projection)]
+#[projection(id = String, metadata = EventMetadata, kind = "customer-billing")]
 pub struct CustomerBillingProjection {
     customers: HashMap<String, CustomerSnapshot>,
-}
-
-impl Projection for CustomerBillingProjection {
-    type Id = String;
-    type InstanceId = ();
-    type Metadata = EventMetadata;
-
-    const KIND: &'static str = "customer-billing";
 }
 
 impl CustomerBillingProjection {

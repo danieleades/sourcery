@@ -14,7 +14,7 @@ pub use sourcery_core::{
     snapshot,
 };
 // Re-export proc macro derives so consumers only depend on `sourcery`.
-pub use sourcery_macros::Aggregate;
+pub use sourcery_macros::{Aggregate, Projection};
 
 pub mod store {
 

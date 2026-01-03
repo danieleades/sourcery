@@ -57,16 +57,10 @@ Each event produced by the command receives this metadata.
 Projections receive metadata as the third parameter:
 
 ```rust,ignore
-#[derive(Debug, Default)]
+#[derive(Debug, Default, sourcery::Projection)]
+#[projection(id = String, metadata = EventMetadata)]
 pub struct AuditLog {
     pub entries: Vec<AuditEntry>,
-}
-
-impl Projection for AuditLog {
-    const KIND: &'static str = "audit-log";
-    type Id = String;
-    type Metadata = EventMetadata;
-    type InstanceId = ();
 }
 
 impl ApplyProjection<FundsDeposited> for AuditLog {
@@ -158,11 +152,12 @@ pub struct TenantMetadata {
     pub request_id: String,
 }
 
-impl Projection for TenantDashboard {
-    const KIND: &'static str = "tenant-dashboard";
-    type Id = String;
-    type Metadata = TenantMetadata;
-    type InstanceId = ();
+#[derive(Default, sourcery::Projection)]
+#[projection(id = String, metadata = TenantMetadata)]
+pub struct TenantDashboard {
+    tenant_id: String,
+    order_count: u64,
+    total_revenue: i64,
 }
 
 impl ApplyProjection<OrderPlaced> for TenantDashboard {

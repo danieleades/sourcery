@@ -98,16 +98,10 @@ Singleton projections use `InstanceId = ()` and call `.load()`; multi-instance
 projections use `.load_for(&id)`.
 
 ```rust,ignore
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize, sourcery::Projection)]
+#[projection(id = String, kind = "loyalty.summary")]
 struct LoyaltySummary {
     total_earned: u64,
-}
-
-impl Projection for LoyaltySummary {
-    const KIND: &'static str = "loyalty.summary";
-    type Id = String;
-    type Metadata = ();
-    type InstanceId = ();
 }
 
 let repo = Repository::new(store).with_snapshots(InMemorySnapshotStore::every(100));

@@ -17,7 +17,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use sourcery::{
-    Aggregate, Apply, ApplyProjection, DomainEvent, Handle, Projection, Repository,
+    Aggregate, Apply, ApplyProjection, DomainEvent, Handle, Repository,
     snapshot::InMemorySnapshotStore,
     store::{JsonCodec, inmemory},
 };
@@ -146,19 +146,12 @@ impl Handle<RedeemPoints> for LoyaltyAccount {
 // Projection (Snapshotting)
 // =============================================================================
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize, sourcery::Projection)]
+#[projection(id = String, kind = "loyalty.summary")]
 pub struct LoyaltySummary {
     total_earned: u64,
     total_redeemed: u64,
     customer_points: HashMap<String, u64>,
-}
-
-impl Projection for LoyaltySummary {
-    type Id = String;
-    type InstanceId = ();
-    type Metadata = ();
-
-    const KIND: &'static str = "loyalty.summary";
 }
 
 impl ApplyProjection<PointsEarned> for LoyaltySummary {
