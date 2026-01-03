@@ -19,7 +19,9 @@ Choose based on your ordering needs:
 | `()` | Unordered, append-only log |
 | `u64` | Global sequence number |
 | `(i64, i32)` | Timestamp + sequence for distributed systems |
-| `Uuid` | Event IDs for deduplication |
+| `u128` | Snowflake-style IDs (must be `Copy`) |
+
+Position must be `Copy`. Use `u128` if you want UUID-like IDs.
 
 ### Storage Schema
 
@@ -48,7 +50,8 @@ CREATE INDEX idx_events_kind
 ```rust,ignore
 use std::future::Future;
 use sourcery::store::{
-    AppendError, EventFilter, EventStore, JsonCodec, PersistableEvent, StoredEvent, Transaction,
+    AppendOutcome, EventFilter, EventStore, JsonCodec, NonEmpty, PersistableEvent, StoredEvent,
+    Transaction,
 };
 use sourcery::concurrency::ConcurrencyStrategy;
 
@@ -72,20 +75,20 @@ impl EventStore for PostgresEventStore {
         async move { todo!("SELECT MAX(position) WHERE aggregate_kind = $1 AND aggregate_id = $2") }
     }
 
-    fn begin<C: ConcurrencyStrategy>(&mut self, aggregate_kind: &str, aggregate_id: Self::Id, expected_version: Option<Self::Position>)
+    fn begin<C: ConcurrencyStrategy>(&self, aggregate_kind: &str, aggregate_id: Self::Id, expected_version: Option<Self::Position>)
         -> Transaction<'_, Self, C>
     {
         Transaction::new(self, aggregate_kind.to_string(), aggregate_id, expected_version)
     }
 
-    fn append<'a>(&'a mut self, aggregate_kind: &'a str, aggregate_id: &'a Self::Id, expected_version: Option<Self::Position>, events: Vec<PersistableEvent<Self::Metadata>>)
-        -> impl Future<Output = Result<(), AppendError<Self::Position, Self::Error>>> + Send + 'a
+    fn append<'a>(&'a self, aggregate_kind: &'a str, aggregate_id: &'a Self::Id, expected_version: Option<Self::Position>, events: NonEmpty<PersistableEvent<Self::Metadata>>)
+        -> impl Future<Output = AppendOutcome<Self::Position, Self::Error>> + Send + 'a
     {
         async move { todo!("INSERT with version check") }
     }
 
-    fn append_expecting_new<'a>(&'a mut self, aggregate_kind: &'a str, aggregate_id: &'a Self::Id, events: Vec<PersistableEvent<Self::Metadata>>)
-        -> impl Future<Output = Result<(), AppendError<Self::Position, Self::Error>>> + Send + 'a
+    fn append_expecting_new<'a>(&'a self, aggregate_kind: &'a str, aggregate_id: &'a Self::Id, events: NonEmpty<PersistableEvent<Self::Metadata>>)
+        -> impl Future<Output = AppendOutcome<Self::Position, Self::Error>> + Send + 'a
     {
         async move { todo!("INSERT only if stream empty") }
     }
@@ -105,10 +108,10 @@ The `Transaction` type manages event batching:
 ```rust,ignore
 impl PostgresEventStore {
     pub async fn append_batch(
-        &mut self,
+        &self,
         aggregate_kind: &str,
         aggregate_id: &str,
-        events: Vec<PersistableEvent<serde_json::Value>>,
+        events: NonEmpty<PersistableEvent<serde_json::Value>>,
     ) -> Result<(), sqlx::Error> {
         let mut tx = self.pool.begin().await?;
 
@@ -207,17 +210,19 @@ Use the same test patterns as `inmemory::Store`:
 ```rust,ignore
 #[tokio::test]
 async fn test_append_and_load() {
-    let mut store = PostgresEventStore::new(test_pool()).await;
+    let store = PostgresEventStore::new(test_pool()).await;
 
     // Append events
     let mut tx = store.begin::<Unchecked>("account", "ACC-001".to_string(), None);
     tx.append(event, metadata)?;
-    tx.commit()?;
+    tx.commit().await?;
 
     // Load and verify
-    let events = store.load_events(&[
+    let events = store
+        .load_events(&[
         EventFilter::for_aggregate("account.deposited", "account", "ACC-001".to_string())
-    ])?;
+    ])
+        .await?;
 
     assert_eq!(events.len(), 1);
 }

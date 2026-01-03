@@ -91,6 +91,38 @@ pub struct Snapshot<Pos> {
 
 The `data` is the serialized aggregate state encoded using the repository's event codec.
 
+## Projection Snapshots
+
+Projection snapshots use the same store and are keyed by `(P::KIND, instance_id)`.
+Singleton projections use `InstanceId = ()` and call `.load()`; multi-instance
+projections use `.load_for(&id)`.
+
+```rust,ignore
+#[derive(Default, Serialize, Deserialize)]
+struct LoyaltySummary {
+    total_earned: u64,
+}
+
+impl Projection for LoyaltySummary {
+    const KIND: &'static str = "loyalty.summary";
+    type Id = String;
+    type Metadata = ();
+    type InstanceId = ();
+}
+
+let repo = Repository::new(store).with_snapshots(InMemorySnapshotStore::every(100));
+
+let summary: LoyaltySummary = repo
+    .build_projection::<LoyaltySummary>()
+    .event::<PointsEarned>()
+    .with_snapshot()
+    .load()
+    .await?;
+```
+
+Projection snapshots require a globally ordered store (`S: GloballyOrderedStore`)
+and `P: Serialize + DeserializeOwned`.
+
 ## When to Snapshot
 
 | Aggregate Type | Recommendation |

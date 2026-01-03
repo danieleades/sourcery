@@ -12,7 +12,8 @@ use crate::{
     aggregate::Aggregate,
     codec::{Codec, EventDecodeError, ProjectionEvent},
     event::DomainEvent,
-    store::{EventFilter, EventStore, StoredEvent},
+    snapshot::{Snapshot, SnapshotStore},
+    store::{EventFilter, EventStore, GloballyOrderedStore, StoredEvent},
 };
 
 /// Trait implemented by read models that can be constructed from an event
@@ -24,10 +25,17 @@ use crate::{
 /// streams before invoking [`ProjectionBuilder::load`].
 // ANCHOR: projection_trait
 pub trait Projection: Default + Sized {
+    /// Stable identifier for this projection type.
+    const KIND: &'static str;
     /// Aggregate identifier type this projection is compatible with.
     type Id;
     /// Metadata type expected by this projection
     type Metadata;
+    /// Projection instance identifier
+    ///
+    /// For 'singleton' projections (those for which there is only one global
+    /// projection with it's 'KIND') use `()`.
+    type InstanceId: Send + Sync + 'static;
 }
 // ANCHOR_END: projection_trait
 
@@ -97,27 +105,34 @@ type EventHandler<P, S> = Box<
 >;
 
 /// Builder used to configure which events should be loaded for a projection.
-pub struct ProjectionBuilder<'a, S, P>
+pub struct ProjectionBuilder<'a, S, P, SS, Snap = NoSnapshot>
 where
     S: EventStore,
     P: Projection<Id = S::Id>,
+    SS: SnapshotStore<P::InstanceId, Position = S::Position>,
 {
     pub(super) store: &'a S,
+    pub(super) snapshots: &'a SS,
     /// Event kind -> handler mapping for O(1) dispatch
     handlers: HashMap<String, EventHandler<P, S>>,
     /// Filters for loading events from the store
     filters: Vec<EventFilter<S::Id, S::Position>>,
-    pub(super) _phantom: PhantomData<fn() -> P>,
+    pub(super) _phantom: PhantomData<fn() -> (P, Snap)>,
 }
 
-impl<'a, S, P> ProjectionBuilder<'a, S, P>
+pub struct NoSnapshot;
+pub struct WithSnapshot;
+
+impl<'a, S, P, SS, Snap> ProjectionBuilder<'a, S, P, SS, Snap>
 where
     S: EventStore,
     P: Projection<Id = S::Id>,
+    SS: SnapshotStore<P::InstanceId, Position = S::Position>,
 {
-    pub(super) fn new(store: &'a S) -> Self {
+    pub(super) fn new(store: &'a S, snapshots: &'a SS) -> Self {
         Self {
             store,
+            snapshots,
             handlers: HashMap::new(),
             filters: Vec::new(),
             _phantom: PhantomData,
@@ -268,12 +283,27 @@ where
         }
         self
     }
+}
+
+impl<'a, S, P, SS> ProjectionBuilder<'a, S, P, SS, NoSnapshot>
+where
+    S: EventStore,
+    P: Projection<Id = S::Id>,
+    SS: SnapshotStore<P::InstanceId, Position = S::Position>,
+{
+    /// Enable snapshot loading/saving for this projection.
+    #[must_use]
+    pub fn with_snapshot(self) -> ProjectionBuilder<'a, S, P, SS, WithSnapshot> {
+        ProjectionBuilder {
+            store: self.store,
+            snapshots: self.snapshots,
+            handlers: self.handlers,
+            filters: self.filters,
+            _phantom: PhantomData,
+        }
+    }
 
     /// Replays the configured events and materializes the projection.
-    ///
-    /// Events are dispatched to the projection via the registered handlers,
-    /// which deserialize and apply each event through the appropriate
-    /// `ApplyProjection` implementation.
     ///
     /// # Errors
     ///
@@ -287,7 +317,31 @@ where
             handler_count = self.handlers.len()
         )
     )]
-    pub async fn load(self) -> Result<P, ProjectionError<S::Error, <S::Codec as Codec>::Error>> {
+    pub async fn load(self) -> Result<P, ProjectionError<S::Error, <S::Codec as Codec>::Error>>
+    where
+        P: Projection<InstanceId = ()>,
+    {
+        self.load_for(&()).await
+    }
+
+    /// Replays the configured events for a specific projection instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectionError`] when the store fails to load events or when
+    /// an event cannot be deserialized.
+    #[tracing::instrument(
+        skip(self, instance_id),
+        fields(
+            projection_type = std::any::type_name::<P>(),
+            filter_count = self.filters.len(),
+            handler_count = self.handlers.len()
+        )
+    )]
+    pub async fn load_for(
+        self,
+        instance_id: &P::InstanceId,
+    ) -> Result<P, ProjectionError<S::Error, <S::Codec as Codec>::Error>> {
         tracing::debug!("loading projection");
 
         let events = self
@@ -325,9 +379,146 @@ where
                     },
                 )?;
             }
-            // Unknown kinds are intentionally skipped - projections only care
-            // about the events they explicitly registered handlers
-            // for
+        }
+
+        tracing::info!(events_applied = event_count, "projection loaded");
+        let _ = instance_id;
+        Ok(projection)
+    }
+}
+
+impl<S, P, SS> ProjectionBuilder<'_, S, P, SS, WithSnapshot>
+where
+    S: EventStore + GloballyOrderedStore,
+    P: Projection<Id = S::Id> + serde::Serialize + serde::de::DeserializeOwned,
+    SS: SnapshotStore<P::InstanceId, Position = S::Position>,
+    S::Position: Ord,
+    P::InstanceId: Send + Sync + 'static,
+{
+    /// Replays the configured events and materializes the projection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectionError`] when the store fails to load events or when
+    /// an event cannot be deserialized.
+    #[tracing::instrument(
+        skip(self),
+        fields(
+            projection_type = std::any::type_name::<P>(),
+            filter_count = self.filters.len(),
+            handler_count = self.handlers.len()
+        )
+    )]
+    pub async fn load(self) -> Result<P, ProjectionError<S::Error, <S::Codec as Codec>::Error>>
+    where
+        P: Projection<InstanceId = ()>,
+    {
+        self.load_for(&()).await
+    }
+
+    /// Replays the configured events for a specific projection instance,
+    /// using snapshots when available.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectionError`] when the store fails to load events or when
+    /// an event cannot be deserialized.
+    #[tracing::instrument(
+        skip(self, instance_id),
+        fields(
+            projection_type = std::any::type_name::<P>(),
+            filter_count = self.filters.len(),
+            handler_count = self.handlers.len()
+        )
+    )]
+    pub async fn load_for(
+        self,
+        instance_id: &P::InstanceId,
+    ) -> Result<P, ProjectionError<S::Error, <S::Codec as Codec>::Error>> {
+        tracing::debug!("loading projection");
+
+        let snapshot_result = self
+            .snapshots
+            .load(P::KIND, instance_id)
+            .await
+            .inspect_err(|e| {
+                tracing::error!(error = %e, "failed to load projection snapshot");
+            })
+            .ok()
+            .flatten();
+
+        let codec = self.store.codec();
+        let (mut projection, snapshot_position) = if let Some(snapshot) = snapshot_result {
+            let restored: P = codec
+                .deserialize(&snapshot.data)
+                .map_err(ProjectionError::SnapshotDeserialize)?;
+            (restored, Some(snapshot.position))
+        } else {
+            (P::default(), None)
+        };
+
+        let filters = if let Some(position) = snapshot_position {
+            self.filters
+                .into_iter()
+                .map(|filter| filter.after(position))
+                .collect::<Vec<_>>()
+        } else {
+            self.filters
+        };
+
+        let events = self
+            .store
+            .load_events(&filters)
+            .await
+            .map_err(ProjectionError::Store)?;
+
+        let event_count = events.len();
+        let mut last_position = None;
+
+        for stored in events {
+            let StoredEvent {
+                aggregate_id,
+                kind,
+                data,
+                metadata,
+                position,
+                ..
+            } = stored;
+
+            if let Some(handler) = self.handlers.get(&kind) {
+                (handler)(&mut projection, &aggregate_id, &data, &metadata, codec).map_err(
+                    |error| match error {
+                        HandlerError::Codec(error) => ProjectionError::Codec {
+                            event_kind: kind.clone(),
+                            error,
+                        },
+                        HandlerError::EventDecode(error) => ProjectionError::EventDecode(error),
+                    },
+                )?;
+            }
+            last_position = Some(position);
+        }
+
+        if event_count > 0
+            && let Some(position) = last_position
+        {
+            let codec = codec.clone();
+            let projection_ref = &projection;
+            let offer = self.snapshots.offer_snapshot(
+                P::KIND,
+                instance_id,
+                event_count as u64,
+                move || -> Result<Snapshot<S::Position>, <S::Codec as Codec>::Error> {
+                    Ok(Snapshot {
+                        position,
+                        data: codec.serialize(projection_ref)?,
+                    })
+                },
+            );
+
+            if let Err(e) = offer.await {
+                tracing::error!(error = %e, "failed to store projection snapshot");
+            }
         }
 
         tracing::info!(events_applied = event_count, "projection loaded");

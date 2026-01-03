@@ -19,7 +19,8 @@ pub use sourcery_macros::Aggregate;
 pub mod store {
 
     pub use sourcery_core::store::{
-        EventFilter, EventStore, JsonCodec, PersistableEvent, StoredEvent, Transaction,
+        AppendError, AppendResult, EventFilter, EventStore, GloballyOrderedStore, JsonCodec,
+        NonEmpty, PersistableEvent, StoredEvent, Transaction,
     };
 
     #[cfg(feature = "postgres")]

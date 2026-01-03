@@ -43,21 +43,7 @@ An event represents something that happened in the past. It is immutable—you n
 
 ## Reconstructing State
 
-When you need the current state of an entity:
-
-```d2
-shape: sequence_diagram
-
-Store: Event Store
-Agg: Aggregate
-
-Store -> Agg: 'Load events for ID "ACC-001"'
-Store."Start with default state"
-Agg -> Agg: "apply(event) [For each event]"
-Agg."Current state ready"
-```
-
-This "replay" process runs every time you load an aggregate. For long-lived entities, [snapshots](../advanced/snapshots.md) optimize this by checkpointing state periodically.
+When you need the current state of an entity, the repository replays its events in order into a fresh aggregate instance. This "replay" process runs every time you load an aggregate. For long-lived entities, [snapshots](../advanced/snapshots.md) optimize this by checkpointing state periodically.
 
 ## Benefits
 

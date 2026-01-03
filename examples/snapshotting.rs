@@ -13,9 +13,11 @@
 //!
 //! Run with: `cargo run --example snapshotting`
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 use sourcery::{
-    Aggregate, Apply, DomainEvent, Handle, Repository,
+    Aggregate, Apply, ApplyProjection, DomainEvent, Handle, Projection, Repository,
     snapshot::InMemorySnapshotStore,
     store::{JsonCodec, inmemory},
 };
@@ -141,6 +143,46 @@ impl Handle<RedeemPoints> for LoyaltyAccount {
 }
 
 // =============================================================================
+// Projection (Snapshotting)
+// =============================================================================
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct LoyaltySummary {
+    total_earned: u64,
+    total_redeemed: u64,
+    customer_points: HashMap<String, u64>,
+}
+
+impl Projection for LoyaltySummary {
+    type Id = String;
+    type InstanceId = ();
+    type Metadata = ();
+
+    const KIND: &'static str = "loyalty.summary";
+}
+
+impl ApplyProjection<PointsEarned> for LoyaltySummary {
+    fn apply_projection(&mut self, aggregate_id: &Self::Id, event: &PointsEarned, &(): &()) {
+        self.total_earned += event.amount;
+        *self
+            .customer_points
+            .entry(aggregate_id.clone())
+            .or_default() += event.amount;
+    }
+}
+
+impl ApplyProjection<PointsRedeemed> for LoyaltySummary {
+    fn apply_projection(&mut self, aggregate_id: &Self::Id, event: &PointsRedeemed, &(): &()) {
+        self.total_redeemed += event.amount;
+        let entry = self
+            .customer_points
+            .entry(aggregate_id.clone())
+            .or_default();
+        *entry = entry.saturating_sub(event.amount);
+    }
+}
+
+// =============================================================================
 // Example
 // =============================================================================
 
@@ -150,7 +192,7 @@ async fn run_repository_without_snapshots() -> ExampleResult {
     println!("1. Repository without snapshots (default behavior)");
 
     let event_store = inmemory::Store::new(JsonCodec);
-    let mut repo = Repository::new(event_store);
+    let repo = Repository::new(event_store);
     let customer_id = "CUST-001".to_string();
 
     for i in 1..=10 {
@@ -180,7 +222,7 @@ async fn run_always_snapshot_policy() -> ExampleResult {
 
     let event_store = inmemory::Store::new(JsonCodec);
     let snapshot_store = InMemorySnapshotStore::always();
-    let mut repo = Repository::new(event_store).with_snapshots(snapshot_store);
+    let repo = Repository::new(event_store).with_snapshots(snapshot_store);
     let customer_id = "CUST-002".to_string();
 
     for i in 1..=5 {
@@ -211,7 +253,7 @@ async fn run_every_n_snapshot_policy() -> ExampleResult {
 
     let event_store = inmemory::Store::new(JsonCodec);
     let snapshot_store = InMemorySnapshotStore::every(5);
-    let mut repo = Repository::new(event_store).with_snapshots(snapshot_store);
+    let repo = Repository::new(event_store).with_snapshots(snapshot_store);
     let customer_id = "CUST-003".to_string();
 
     for i in 1..=12 {
@@ -245,7 +287,7 @@ async fn run_snapshot_restoration() -> ExampleResult {
 
     let event_store = inmemory::Store::new(JsonCodec);
     let snapshot_store = InMemorySnapshotStore::every(3);
-    let mut repo = Repository::new(event_store).with_snapshots(snapshot_store);
+    let repo = Repository::new(event_store).with_snapshots(snapshot_store);
     let customer_id = "CUST-004".to_string();
 
     for i in 1..=5 {
@@ -287,7 +329,7 @@ async fn run_never_snapshot_policy() -> ExampleResult {
 
     let event_store = inmemory::Store::new(JsonCodec);
     let snapshot_store = InMemorySnapshotStore::never();
-    let mut repo = Repository::new(event_store).with_snapshots(snapshot_store);
+    let repo = Repository::new(event_store).with_snapshots(snapshot_store);
     let customer_id = "CUST-005".to_string();
 
     for i in 1..=3 {
@@ -312,6 +354,68 @@ async fn run_never_snapshot_policy() -> ExampleResult {
     Ok(())
 }
 
+async fn run_projection_snapshotting() -> ExampleResult {
+    println!("6. Projection snapshotting (global ordering required)");
+
+    let event_store = inmemory::Store::new(JsonCodec);
+    let snapshot_store = InMemorySnapshotStore::every(2);
+    let repo = Repository::new(event_store).with_snapshots(snapshot_store);
+
+    let customer_a = "CUST-P1".to_string();
+    let customer_b = "CUST-P2".to_string();
+
+    repo.execute_command::<LoyaltyAccount, EarnPoints>(
+        &customer_a,
+        &EarnPoints {
+            amount: 120,
+            reason: "Signup bonus".to_string(),
+        },
+        &(),
+    )
+    .await?;
+    repo.execute_command::<LoyaltyAccount, EarnPoints>(
+        &customer_b,
+        &EarnPoints {
+            amount: 75,
+            reason: "First purchase".to_string(),
+        },
+        &(),
+    )
+    .await?;
+    repo.execute_command::<LoyaltyAccount, RedeemPoints>(
+        &customer_a,
+        &RedeemPoints {
+            amount: 50,
+            reward: "Discount code".to_string(),
+        },
+        &(),
+    )
+    .await?;
+
+    let projection: LoyaltySummary = repo
+        .build_projection::<LoyaltySummary>()
+        .event::<PointsEarned>()
+        .event::<PointsRedeemed>()
+        .with_snapshot()
+        .load()
+        .await?;
+
+    println!(
+        "   Totals: earned {}, redeemed {}",
+        projection.total_earned, projection.total_redeemed
+    );
+    println!(
+        "   Points: {} -> {}, {} -> {}",
+        customer_a,
+        projection.customer_points.get(&customer_a).unwrap_or(&0u64),
+        customer_b,
+        projection.customer_points.get(&customer_b).unwrap_or(&0u64)
+    );
+    println!();
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> ExampleResult {
     println!("=== Snapshotting Example ===\n");
@@ -321,12 +425,14 @@ async fn main() -> ExampleResult {
     run_every_n_snapshot_policy().await?;
     run_snapshot_restoration().await?;
     run_never_snapshot_policy().await?;
+    run_projection_snapshotting().await?;
 
     println!("=== Summary ===\n");
     println!("✓ Default repository: No snapshotting, full event replay");
     println!("✓ Always policy: Snapshot after every command (fastest loads, most storage)");
     println!("✓ Every-N policy: Balance between storage and replay cost");
     println!("✓ Never policy: Useful for read replicas consuming external snapshots");
+    println!("✓ Projection snapshots: Read models can snapshot global streams");
     println!();
     println!("Snapshots are transparent - aggregate behavior is identical regardless of policy.");
     println!("The only difference is loading performance for aggregates with many events.");

@@ -243,7 +243,10 @@ pub struct ProductStats {
 
 impl Projection for InventoryReport {
     type Id = String;
+    type InstanceId = ();
     type Metadata = ();
+
+    const KIND: &'static str = "inventory-report";
 }
 
 // ApplyProjection implementations - for events that need stream context
@@ -334,7 +337,7 @@ impl ApplyProjection<SaleRefunded> for InventoryReport {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = inmemory::Store::new(JsonCodec);
-    let mut repository = Repository::new(store);
+    let repository = Repository::new(store);
 
     println!("=== Inventory Management System ===\n");
 

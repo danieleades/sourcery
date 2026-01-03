@@ -127,7 +127,7 @@ pub type UncheckedSnapshotCommandResult<A, S, SS> = Result<
         <A as Aggregate>::Error,
         <S as EventStore>::Error,
         <<S as EventStore>::Codec as Codec>::Error,
-        <SS as SnapshotStore>::Error,
+        <SS as SnapshotStore<<S as EventStore>::Id>>::Error,
     >,
 >;
 
@@ -150,7 +150,7 @@ pub type OptimisticSnapshotCommandResult<A, S, SS> = Result<
         <S as EventStore>::Position,
         <S as EventStore>::Error,
         <<S as EventStore>::Codec as Codec>::Error,
-        <SS as SnapshotStore>::Error,
+        <SS as SnapshotStore<<S as EventStore>::Id>>::Error,
     >,
 >;
 
@@ -173,7 +173,7 @@ pub type SnapshotRetryResult<A, S, SS> = Result<
         <S as EventStore>::Position,
         <S as EventStore>::Error,
         <<S as EventStore>::Codec as Codec>::Error,
-        <SS as SnapshotStore>::Error,
+        <SS as SnapshotStore<<S as EventStore>::Id>>::Error,
     >,
 >;
 
@@ -229,11 +229,44 @@ where
 /// Snapshot-enabled repository mode wrapper.
 pub struct Snapshots<SS>(pub SS);
 
+impl<Id, SS> SnapshotStore<Id> for Snapshots<SS>
+where
+    Id: Send + Sync + 'static,
+    SS: SnapshotStore<Id>,
+{
+    type Error = SS::Error;
+    type Position = SS::Position;
+
+    fn load<'a>(
+        &'a self,
+        kind: &'a str,
+        id: &'a Id,
+    ) -> impl Future<Output = Result<Option<Snapshot<Self::Position>>, Self::Error>> + Send + 'a
+    {
+        self.0.load(kind, id)
+    }
+
+    fn offer_snapshot<'a, CE, Create>(
+        &'a self,
+        kind: &'a str,
+        id: &'a Id,
+        events_since_last_snapshot: u64,
+        create_snapshot: Create,
+    ) -> impl Future<Output = Result<SnapshotOffer, OfferSnapshotError<Self::Error, CE>>> + Send + 'a
+    where
+        CE: std::error::Error + Send + Sync + 'static,
+        Create: FnOnce() -> Result<Snapshot<Self::Position>, CE> + 'a,
+    {
+        self.0
+            .offer_snapshot(kind, id, events_since_last_snapshot, create_snapshot)
+    }
+}
+
 /// Repository.
 pub struct Repository<
     S,
     C = Optimistic,
-    M = crate::snapshot::NoSnapshots<<S as EventStore>::Id, <S as EventStore>::Position>,
+    M = crate::snapshot::NoSnapshots<<S as EventStore>::Position>,
 > where
     S: EventStore,
     C: ConcurrencyStrategy,
@@ -282,17 +315,18 @@ where
         &self.store
     }
 
-    pub fn build_projection<P>(&self) -> ProjectionBuilder<'_, S, P>
+    pub fn build_projection<P>(&self) -> ProjectionBuilder<'_, S, P, M>
     where
         P: Projection<Id = S::Id>,
+        M: SnapshotStore<P::InstanceId, Position = S::Position>,
     {
-        ProjectionBuilder::new(&self.store)
+        ProjectionBuilder::new(&self.store, &self.snapshots)
     }
 
     #[must_use]
     pub fn with_snapshots<SS>(self, snapshots: SS) -> Repository<S, C, Snapshots<SS>>
     where
-        SS: SnapshotStore<Id = S::Id, Position = S::Position>,
+        SS: SnapshotStore<S::Id, Position = S::Position>,
     {
         Repository {
             store: self.store,
@@ -302,7 +336,7 @@ where
     }
 }
 
-impl<S, C> Repository<S, C, crate::snapshot::NoSnapshots<S::Id, S::Position>>
+impl<S, C> Repository<S, C, crate::snapshot::NoSnapshots<S::Position>>
 where
     S: EventStore,
     C: ConcurrencyStrategy,
@@ -370,7 +404,7 @@ where
     /// cannot be encoded, the store fails to persist, or the aggregate
     /// cannot be rebuilt.
     pub async fn execute_command<A, Cmd>(
-        &mut self,
+        &self,
         id: &S::Id,
         command: &Cmd,
         metadata: &S::Metadata,
@@ -400,7 +434,11 @@ where
             tx.append(event, metadata.clone())
                 .map_err(CommandError::Codec)?;
         }
-        tx.commit().await.map_err(CommandError::Store)?;
+        tx.commit().await.map_err(|e| match e {
+            AppendError::Store(err) => CommandError::Store(err),
+            AppendError::Conflict(_) => unreachable!("conflict impossible without version"),
+            AppendError::EmptyAppend => unreachable!("empty append filtered above"),
+        })?;
         Ok(())
     }
 }
@@ -418,7 +456,7 @@ where
     /// aggregate validation, encoding, persistence, and projection rebuild
     /// errors.
     pub async fn execute_command<A, Cmd>(
-        &mut self,
+        &self,
         id: &S::Id,
         command: &Cmd,
         metadata: &S::Metadata,
@@ -451,11 +489,13 @@ where
                 .map_err(OptimisticCommandError::Codec)?;
         }
 
-        if let Err(e) = tx.commit().await {
-            match e {
-                AppendError::Conflict(c) => return Err(OptimisticCommandError::Concurrency(c)),
-                AppendError::Store(s) => return Err(OptimisticCommandError::Store(s)),
+        match tx.commit().await {
+            Ok(_) => {}
+            Err(AppendError::Conflict(c)) => {
+                return Err(OptimisticCommandError::Concurrency(c));
             }
+            Err(AppendError::Store(s)) => return Err(OptimisticCommandError::Store(s)),
+            Err(AppendError::EmptyAppend) => unreachable!("empty append filtered above"),
         }
 
         Ok(())
@@ -468,7 +508,7 @@ where
     /// Returns the last error if all retries are exhausted, or a
     /// non-concurrency error immediately.
     pub async fn execute_with_retry<A, Cmd>(
-        &mut self,
+        &self,
         id: &S::Id,
         command: &Cmd,
         metadata: &S::Metadata,
@@ -497,7 +537,7 @@ where
 impl<S, SS, C> Repository<S, C, Snapshots<SS>>
 where
     S: EventStore,
-    SS: SnapshotStore<Id = S::Id, Position = S::Position>,
+    SS: SnapshotStore<S::Id, Position = S::Position>,
     C: ConcurrencyStrategy,
 {
     #[must_use]
@@ -584,7 +624,7 @@ where
 impl<S, SS> Repository<S, Unchecked, Snapshots<SS>>
 where
     S: EventStore,
-    SS: SnapshotStore<Id = S::Id, Position = S::Position>,
+    SS: SnapshotStore<S::Id, Position = S::Position>,
 {
     /// Execute a command with last-writer-wins semantics and optional
     /// snapshotting.
@@ -594,14 +634,8 @@ where
     /// Returns [`SnapshotCommandError`] when the aggregate rejects the command,
     /// events cannot be encoded, the store fails to persist, snapshot
     /// persistence fails, or the aggregate cannot be rebuilt.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the store reports `None` from `stream_version` after a
-    /// successful append. This indicates a bug in the event store
-    /// implementation.
     pub async fn execute_command<A, Cmd>(
-        &mut self,
+        &self,
         id: &S::Id,
         command: &Cmd,
         metadata: &S::Metadata,
@@ -640,14 +674,12 @@ where
             tx.append(event, metadata.clone())
                 .map_err(SnapshotCommandError::Codec)?;
         }
-        tx.commit().await.map_err(SnapshotCommandError::Store)?;
-
-        let new_position = self
-            .store
-            .stream_version(A::KIND, id)
-            .await
-            .map_err(SnapshotCommandError::Store)?
-            .expect("stream should have events after append");
+        let append_result = tx.commit().await.map_err(|e| match e {
+            AppendError::Store(err) => SnapshotCommandError::Store(err),
+            AppendError::Conflict(_) => unreachable!("conflict impossible without version"),
+            AppendError::EmptyAppend => unreachable!("empty append filtered above"),
+        })?;
+        let new_position = append_result.last_position;
 
         let codec = self.store.codec().clone();
         let offer_result =
@@ -673,7 +705,7 @@ where
 impl<S, SS> Repository<S, Optimistic, Snapshots<SS>>
 where
     S: EventStore,
-    SS: SnapshotStore<Id = S::Id, Position = S::Position>,
+    SS: SnapshotStore<S::Id, Position = S::Position>,
 {
     /// Execute a command using optimistic concurrency control and optional
     /// snapshotting.
@@ -684,14 +716,8 @@ where
     /// version changed between loading and committing. Other variants cover
     /// aggregate validation, encoding, persistence, snapshot persistence,
     /// and projection rebuild errors.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the store reports `None` from `stream_version` after a
-    /// successful append. This indicates a bug in the event store
-    /// implementation.
     pub async fn execute_command<A, Cmd>(
-        &mut self,
+        &self,
         id: &S::Id,
         command: &Cmd,
         metadata: &S::Metadata,
@@ -731,21 +757,15 @@ where
                 .map_err(OptimisticSnapshotCommandError::Codec)?;
         }
 
-        if let Err(e) = tx.commit().await {
-            match e {
-                AppendError::Conflict(c) => {
-                    return Err(OptimisticSnapshotCommandError::Concurrency(c));
-                }
-                AppendError::Store(s) => return Err(OptimisticSnapshotCommandError::Store(s)),
+        let append_result = match tx.commit().await {
+            Ok(result) => result,
+            Err(AppendError::Conflict(c)) => {
+                return Err(OptimisticSnapshotCommandError::Concurrency(c));
             }
-        }
-
-        let new_position = self
-            .store
-            .stream_version(A::KIND, id)
-            .await
-            .map_err(OptimisticSnapshotCommandError::Store)?
-            .expect("stream should have events after append");
+            Err(AppendError::Store(s)) => return Err(OptimisticSnapshotCommandError::Store(s)),
+            Err(AppendError::EmptyAppend) => unreachable!("empty append filtered above"),
+        };
+        let new_position = append_result.last_position;
 
         let codec = self.store.codec().clone();
         let offer_result =
@@ -778,7 +798,7 @@ where
     /// Returns the last error if all retries are exhausted, or a
     /// non-concurrency error immediately.
     pub async fn execute_with_retry<A, Cmd>(
-        &mut self,
+        &self,
         id: &S::Id,
         command: &Cmd,
         metadata: &S::Metadata,

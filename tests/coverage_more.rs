@@ -131,7 +131,10 @@ struct TotalsProjection {
 
 impl Projection for TotalsProjection {
     type Id = String;
+    type InstanceId = ();
     type Metadata = ();
+
+    const KIND: &'static str = "totals";
 }
 
 impl ApplyProjection<ValueAdded> for TotalsProjection {
@@ -167,7 +170,7 @@ fn concurrency_conflict_formats_unexpected_empty_state() {
 
 #[tokio::test]
 async fn in_memory_snapshot_store_policy_always_saves() {
-    let mut snapshots = InMemorySnapshotStore::<String, u64>::always();
+    let snapshots = InMemorySnapshotStore::<u64>::always();
     let id = "c1".to_string();
 
     let result = snapshots
@@ -192,7 +195,7 @@ async fn in_memory_snapshot_store_policy_always_saves() {
 
 #[tokio::test]
 async fn in_memory_snapshot_store_policy_every_n_events_saves_at_threshold() {
-    let mut snapshots = InMemorySnapshotStore::<String, u64>::every(3);
+    let snapshots = InMemorySnapshotStore::<u64>::every(3);
     let id = "c1".to_string();
 
     let result = snapshots
@@ -230,7 +233,7 @@ async fn in_memory_snapshot_store_policy_every_n_events_saves_at_threshold() {
 
 #[tokio::test]
 async fn in_memory_snapshot_store_policy_never_does_not_save() {
-    let mut snapshots = InMemorySnapshotStore::<String, u64>::never();
+    let snapshots = InMemorySnapshotStore::<u64>::never();
     let id = "c1".to_string();
 
     let result = snapshots
@@ -252,7 +255,7 @@ async fn in_memory_snapshot_store_policy_never_does_not_save() {
 #[tokio::test]
 async fn projection_event_for_filters_by_aggregate() {
     let store = inmemory::Store::new(JsonCodec);
-    let mut repo = Repository::new(store);
+    let repo = Repository::new(store);
 
     repo.execute_command::<Counter, AddValue>(&"c1".to_string(), &AddValue { amount: 10 }, &())
         .await
@@ -306,7 +309,7 @@ async fn projection_load_surfaces_codec_error_with_event_kind() {
 async fn unchecked_repository_saves_snapshot_and_exposes_snapshot_store() {
     let store = inmemory::Store::new(JsonCodec);
     let snapshots = InMemorySnapshotStore::always();
-    let mut repo = Repository::new(store)
+    let repo = Repository::new(store)
         .with_snapshots(snapshots)
         .without_concurrency_checking();
 
@@ -327,7 +330,7 @@ async fn unchecked_repository_saves_snapshot_and_exposes_snapshot_store() {
 async fn unchecked_execute_command_with_no_events_does_not_persist_or_snapshot() {
     let store = inmemory::Store::new(JsonCodec);
     let snapshots = InMemorySnapshotStore::always();
-    let mut repo = Repository::new(store)
+    let repo = Repository::new(store)
         .with_snapshots(snapshots)
         .without_concurrency_checking();
 
@@ -359,15 +362,14 @@ struct SnapshotLoadError;
 #[derive(Debug)]
 struct FailingLoadSnapshotStore;
 
-impl SnapshotStore for FailingLoadSnapshotStore {
+impl SnapshotStore<String> for FailingLoadSnapshotStore {
     type Error = SnapshotLoadError;
-    type Id = String;
     type Position = u64;
 
     fn load<'a>(
         &'a self,
         _: &'a str,
-        _: &'a Self::Id,
+        _: &'a String,
     ) -> impl std::future::Future<Output = Result<Option<Snapshot<Self::Position>>, Self::Error>>
     + Send
     + 'a {
@@ -375,9 +377,9 @@ impl SnapshotStore for FailingLoadSnapshotStore {
     }
 
     fn offer_snapshot<'a, CE, Create>(
-        &'a mut self,
+        &'a self,
         _: &'a str,
-        _: &'a Self::Id,
+        _: &'a String,
         _: u64,
         _: Create,
     ) -> impl std::future::Future<
@@ -395,7 +397,7 @@ impl SnapshotStore for FailingLoadSnapshotStore {
 #[tokio::test]
 async fn snapshot_load_failure_falls_back_to_full_replay() {
     let store = inmemory::Store::new(JsonCodec);
-    let mut repo = Repository::new(store)
+    let repo = Repository::new(store)
         .with_snapshots(FailingLoadSnapshotStore)
         .without_concurrency_checking();
 
@@ -412,15 +414,14 @@ async fn snapshot_load_failure_falls_back_to_full_replay() {
 #[derive(Debug, Default)]
 struct CorruptSnapshotStore;
 
-impl SnapshotStore for CorruptSnapshotStore {
+impl SnapshotStore<String> for CorruptSnapshotStore {
     type Error = SnapshotLoadError;
-    type Id = String;
     type Position = u64;
 
     fn load<'a>(
         &'a self,
         _: &'a str,
-        _: &'a Self::Id,
+        _: &'a String,
     ) -> impl std::future::Future<Output = Result<Option<Snapshot<Self::Position>>, Self::Error>>
     + Send
     + 'a {
@@ -431,9 +432,9 @@ impl SnapshotStore for CorruptSnapshotStore {
     }
 
     fn offer_snapshot<'a, CE, Create>(
-        &'a mut self,
+        &'a self,
         _: &'a str,
-        _: &'a Self::Id,
+        _: &'a String,
         _: u64,
         _: Create,
     ) -> impl std::future::Future<
@@ -451,7 +452,7 @@ impl SnapshotStore for CorruptSnapshotStore {
 #[tokio::test]
 async fn corrupt_snapshot_data_returns_projection_error() {
     let store = inmemory::Store::new(JsonCodec);
-    let mut repo = Repository::new(store)
+    let repo = Repository::new(store)
         .with_snapshots(CorruptSnapshotStore)
         .without_concurrency_checking();
 
@@ -466,7 +467,7 @@ async fn corrupt_snapshot_data_returns_projection_error() {
 #[tokio::test]
 async fn execute_with_retry_with_zero_retries_still_attempts_once() {
     let store = inmemory::Store::new(JsonCodec);
-    let mut repo = Repository::new(store);
+    let repo = Repository::new(store);
 
     let attempts = repo
         .execute_with_retry::<Counter, AddValue>(&"c1".to_string(), &AddValue { amount: 1 }, &(), 0)
@@ -479,7 +480,7 @@ async fn execute_with_retry_with_zero_retries_still_attempts_once() {
 #[tokio::test]
 async fn optimistic_execute_with_retry_surfaces_non_concurrency_errors() {
     let store = inmemory::Store::new(JsonCodec);
-    let mut repo = Repository::new(store);
+    let repo = Repository::new(store);
 
     let err = repo
         .execute_with_retry::<Counter, AddValue>(&"c1".to_string(), &AddValue { amount: 0 }, &(), 3)
@@ -506,15 +507,14 @@ impl TrackingSnapshotStore {
     }
 }
 
-impl SnapshotStore for TrackingSnapshotStore {
+impl SnapshotStore<String> for TrackingSnapshotStore {
     type Error = Infallible;
-    type Id = String;
     type Position = u64;
 
     fn load<'a>(
         &'a self,
         _: &'a str,
-        _: &'a Self::Id,
+        _: &'a String,
     ) -> impl std::future::Future<Output = Result<Option<Snapshot<Self::Position>>, Self::Error>>
     + Send
     + 'a {
@@ -523,9 +523,9 @@ impl SnapshotStore for TrackingSnapshotStore {
     }
 
     fn offer_snapshot<'a, CE, Create>(
-        &'a mut self,
+        &'a self,
         _: &'a str,
-        _: &'a Self::Id,
+        _: &'a String,
         _: u64,
         _: Create,
     ) -> impl std::future::Future<

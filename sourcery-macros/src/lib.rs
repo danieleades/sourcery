@@ -1,5 +1,7 @@
-// This lint is triggered by darling's generated code for `#[darling(default)]`
+// These lints are triggered by darling's generated code for
+// `#[darling(default)]`.
 #![allow(clippy::option_if_let_else)]
+#![allow(clippy::needless_continue)]
 
 use darling::{FromDeriveInput, FromMeta, util::PathList};
 use proc_macro::TokenStream;

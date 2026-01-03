@@ -31,8 +31,10 @@ pub struct AccountSummary {
 }
 
 impl Projection for AccountSummary {
+    const KIND: &'static str = "account-summary";
     type Id = String;
     type Metadata = ();
+    type InstanceId = ();
 }
 
 impl ApplyProjection<FundsDeposited> for AccountSummary {
@@ -99,26 +101,52 @@ pub struct EventMetadata {
     pub user_id: String,
 }
 
+#[derive(Debug)]
+pub struct AuditEntry {
+    pub timestamp: DateTime<Utc>,
+    pub user: String,
+    pub action: String,
+}
+
 #[derive(Debug, Default)]
 pub struct AuditLog {
     pub entries: Vec<AuditEntry>,
 }
 
 impl Projection for AuditLog {
+    const KIND: &'static str = "audit-log";
     type Id = String;
     type Metadata = EventMetadata;
+    type InstanceId = ();
 }
 
 impl ApplyProjection<FundsDeposited> for AuditLog {
     fn apply_projection(&mut self, id: &Self::Id, event: &FundsDeposited, meta: &Self::Metadata) {
         self.entries.push(AuditEntry {
-            timestamp: meta.timestamp,
+            timestamp: meta.timestamp.clone(),
             user: meta.user_id.clone(),
             action: format!("Deposited {} to {}", event.amount, id),
         });
     }
 }
 ```
+
+## Snapshotting Projections
+
+Projection snapshots reuse the repository snapshot store. Enable snapshotting
+by calling `.with_snapshot()` on the builder:
+
+```rust,ignore
+let projection = repo
+    .build_projection::<AuditLog>()
+    .event::<FundsDeposited>()
+    .with_snapshot()
+    .load()
+    .await?;
+```
+
+Snapshotting requires a globally ordered store (`S: GloballyOrderedStore`),
+`S::Position: Ord`, and `P: Serialize + DeserializeOwned`.
 
 ## Projections vs Aggregates
 

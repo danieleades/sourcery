@@ -105,7 +105,10 @@ struct ProductSummary {
 
 impl Projection for ProductSummary {
     type Id = String;
+    type InstanceId = ();
     type Metadata = ();
+
+    const KIND: &'static str = "product-summary";
 }
 
 impl ApplyProjection<ProductRestocked> for ProductSummary {

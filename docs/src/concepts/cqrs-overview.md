@@ -37,22 +37,7 @@ Write.Store -> Read.Store: {style.stroke-dash: 3}
 | **Updates** | Transactional | Eventually consistent |
 | **Scaling** | Consistent writes | Replicated reads |
 
-A single aggregate might feed multiple projections:
-
-```d2
-direction: right
-
-Events: Events {
-  shape: cylinder
-}
-
-Events -> Account Summary
-Events -> Transaction History
-Events -> Fraud Detection
-Events -> Analytics Dashboard
-```
-
-Each projection sees the same events but builds a different view.
+A single aggregate might feed multiple projections (account summary, transaction history, fraud detection, analytics). Each projection sees the same events but builds a different view.
 
 ## In This Crate
 

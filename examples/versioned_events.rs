@@ -360,7 +360,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Use OrderMetadata (versioned) as the metadata type for the store
     let store: inmemory::Store<String, JsonCodec, OrderMetadata> = inmemory::Store::new(JsonCodec);
-    let mut repository = Repository::new(store);
+    let repository = Repository::new(store);
 
     // ========================================
     // Simulate historical V1 event (old schema)

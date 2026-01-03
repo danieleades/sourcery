@@ -144,8 +144,10 @@ pub struct AccountBalance {
 }
 
 impl Projection for AccountBalance {
+    const KIND: &'static str = "account-balance";
     type Id = String;
     type Metadata = ();
+    type InstanceId = ();
 }
 
 impl ApplyProjection<FundsDeposited> for AccountBalance {
@@ -162,7 +164,7 @@ impl ApplyProjection<FundsDeposited> for AccountBalance {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store: inmemory::Store<String, JsonCodec, ()> = inmemory::Store::new(JsonCodec);
-    let mut repository = Repository::new(store);
+    let repository = Repository::new(store);
 
     let account_id = "ACC-001".to_string();
     let command = DepositFunds { amount_cents: 25_00 };
@@ -197,8 +199,8 @@ event you care about, then add `Handle<C>` implementations for each command. The
 ### Projections
 
 Read models that keep their state in sync by replaying events. Projections implement
-`ApplyProjection<E>` for the event types they care about and declare their identifier + metadata
-requirements via the `Projection` trait. Build them by calling
+`ApplyProjection<E>` for the event types they care about and declare their kind, instance ID,
+aggregate ID, and metadata requirements via the `Projection` trait. Build them by calling
 `Repository::build_projection::<P>()`, chaining the relevant `.event::<E>()` / `.event_for::<A, E>()`
 registrations (or `.events::<A::Event>()` / `.events_for::<A>()` for aggregate event enums), and
 finally `.load().await`.

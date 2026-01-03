@@ -10,11 +10,13 @@ use sourcery_core::{
     codec::Codec,
     concurrency::{ConcurrencyConflict, ConcurrencyStrategy},
     store::{
-        AppendError, EventFilter, EventStore, LoadEventsResult, PersistableEvent, StoredEvent,
-        Transaction,
+        AppendError, AppendResult, EventFilter, EventStore, GloballyOrderedStore, LoadEventsResult,
+        NonEmpty, PersistableEvent, StoredEvent, Transaction,
     },
 };
 use sqlx::{PgPool, Postgres, QueryBuilder, Row};
+
+type AppendOutcome = Result<AppendResult<i64>, AppendError<i64, Error>>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -141,7 +143,7 @@ where
     }
 
     fn begin<Conc: ConcurrencyStrategy>(
-        &mut self,
+        &self,
         aggregate_kind: &str,
         aggregate_id: Self::Id,
         expected_version: Option<Self::Position>,
@@ -164,16 +166,12 @@ where
         )
     )]
     async fn append<'a>(
-        &'a mut self,
+        &'a self,
         aggregate_kind: &'a str,
         aggregate_id: &'a Self::Id,
         expected_version: Option<Self::Position>,
-        events: Vec<PersistableEvent<Self::Metadata>>,
-    ) -> Result<(), AppendError<Self::Position, Self::Error>> {
-        if events.is_empty() {
-            return Ok(());
-        }
-
+        events: NonEmpty<PersistableEvent<Self::Metadata>>,
+    ) -> AppendOutcome {
         let mut tx = self
             .pool
             .begin()
@@ -219,7 +217,7 @@ where
         let mut qb = QueryBuilder::<Postgres>::new(
             "INSERT INTO es_events (aggregate_kind, aggregate_id, event_kind, data, metadata) ",
         );
-        qb.push_values(events, |mut b, event| {
+        qb.push_values(events.into_iter(), |mut b, event| {
             b.push_bind(aggregate_kind);
             b.push_bind(aggregate_id);
             b.push_bind(event.kind);
@@ -256,7 +254,9 @@ where
             .await
             .map_err(|e| AppendError::store(Error::Database(e)))?;
 
-        Ok(())
+        Ok(AppendResult {
+            last_position: *last_position,
+        })
     }
 
     #[tracing::instrument(skip(self, filters), fields(filters_len = filters.len()))]
@@ -330,15 +330,11 @@ where
         fields(aggregate_kind, aggregate_id = %aggregate_id, events_len = events.len())
     )]
     async fn append_expecting_new<'a>(
-        &'a mut self,
+        &'a self,
         aggregate_kind: &'a str,
         aggregate_id: &'a Self::Id,
-        events: Vec<PersistableEvent<Self::Metadata>>,
-    ) -> Result<(), AppendError<Self::Position, Self::Error>> {
-        if events.is_empty() {
-            return Ok(());
-        }
-
+        events: NonEmpty<PersistableEvent<Self::Metadata>>,
+    ) -> AppendOutcome {
         let mut tx = self
             .pool
             .begin()
@@ -382,7 +378,7 @@ where
         let mut qb = QueryBuilder::<Postgres>::new(
             "INSERT INTO es_events (aggregate_kind, aggregate_id, event_kind, data, metadata) ",
         );
-        qb.push_values(events, |mut b, event| {
+        qb.push_values(events.into_iter(), |mut b, event| {
             b.push_bind(aggregate_kind);
             b.push_bind(aggregate_id);
             b.push_bind(event.kind);
@@ -419,6 +415,15 @@ where
             .await
             .map_err(|e| AppendError::store(Error::Database(e)))?;
 
-        Ok(())
+        Ok(AppendResult {
+            last_position: *last_position,
+        })
     }
+}
+
+impl<C, M> GloballyOrderedStore for Store<C, M>
+where
+    C: Codec + Clone + Send + Sync + 'static,
+    M: Serialize + DeserializeOwned + Send + Sync + 'static,
+{
 }

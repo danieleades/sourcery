@@ -103,7 +103,12 @@ impl Codec for VersionedCodec {
 
 ```rust,ignore
 // Projection consumes from multiple aggregates
-impl Projection for Dashboard { type Id = String; type Metadata = (); }
+impl Projection for Dashboard {
+    const KIND: &'static str = "dashboard";
+    type Id = String;
+    type Metadata = ();
+    type InstanceId = ();
+}
 impl ApplyProjection<OrderPlaced> for Dashboard { /* ... */ }
 impl ApplyProjection<PaymentReceived> for Dashboard { /* ... */ }
 impl ApplyProjection<ShipmentDispatched> for Dashboard { /* ... */ }
@@ -119,7 +124,7 @@ impl ApplyProjection<ShipmentDispatched> for Dashboard { /* ... */ }
 - Message brokers differ (Kafka, RabbitMQ, NATS, none)
 - Database choices affect outbox patterns
 - Keeps dependencies minimal
-- **may be added in future!!**
+- May be added later.
 
 **What we do provide**:
 - Core traits for aggregates and projections

@@ -6,6 +6,7 @@
 //! concerns together.
 use std::{future::Future, marker::PhantomData};
 
+pub use nonempty::NonEmpty;
 use thiserror::Error;
 
 use crate::{
@@ -105,6 +106,9 @@ where
     Pos: std::fmt::Debug,
     StoreError: std::error::Error,
 {
+    /// Attempted to commit or append an empty batch.
+    #[error("cannot append an empty event batch")]
+    EmptyAppend,
     /// Concurrency conflict - another writer modified the stream.
     #[error(transparent)]
     Conflict(#[from] ConcurrencyConflict<Pos>),
@@ -120,6 +124,16 @@ impl<Pos: std::fmt::Debug, StoreError: std::error::Error> AppendError<Pos, Store
     }
 }
 
+/// Result of a successful append operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AppendResult<Pos> {
+    /// Position of the last event written in the batch.
+    pub last_position: Pos,
+}
+
+/// Convenience alias for append outcomes returned by event stores.
+pub type AppendOutcome<Pos, Err> = Result<AppendResult<Pos>, AppendError<Pos, Err>>;
+
 /// Transaction for appending events to an aggregate instance.
 ///
 /// Events are accumulated in the transaction and persisted atomically when
@@ -131,7 +145,7 @@ impl<Pos: std::fmt::Debug, StoreError: std::error::Error> AppendError<Pos, Store
 /// - [`Unchecked`]: No version checking (default)
 /// - [`Optimistic`]: Version checked on commit
 pub struct Transaction<'a, S: EventStore, C: ConcurrencyStrategy = Unchecked> {
-    store: &'a mut S,
+    store: &'a S,
     aggregate_kind: String,
     aggregate_id: S::Id,
     expected_version: Option<S::Position>,
@@ -142,7 +156,7 @@ pub struct Transaction<'a, S: EventStore, C: ConcurrencyStrategy = Unchecked> {
 
 impl<'a, S: EventStore, C: ConcurrencyStrategy> Transaction<'a, S, C> {
     pub const fn new(
-        store: &'a mut S,
+        store: &'a S,
         aggregate_kind: String,
         aggregate_id: S::Id,
         expected_version: Option<S::Position>,
@@ -189,8 +203,13 @@ impl<S: EventStore> Transaction<'_, S, Unchecked> {
     /// # Errors
     ///
     /// Returns a store error if persistence fails.
-    pub async fn commit(mut self) -> Result<(), S::Error> {
+    pub async fn commit(
+        mut self,
+    ) -> Result<AppendResult<S::Position>, AppendError<S::Position, S::Error>> {
         let events = std::mem::take(&mut self.events);
+        let Some(events) = NonEmpty::from_vec(events) else {
+            return Err(AppendError::EmptyAppend);
+        };
         let event_count = events.len();
         tracing::debug!(
             aggregate_kind = %self.aggregate_kind,
@@ -202,8 +221,9 @@ impl<S: EventStore> Transaction<'_, S, Unchecked> {
             .append(&self.aggregate_kind, &self.aggregate_id, None, events)
             .await
             .map_err(|e| match e {
-                AppendError::Store(e) => e,
+                AppendError::Store(e) => AppendError::Store(e),
                 AppendError::Conflict(_) => unreachable!("conflict impossible without version"),
+                AppendError::EmptyAppend => unreachable!("empty append filtered above"),
             })
     }
 }
@@ -222,8 +242,13 @@ impl<S: EventStore> Transaction<'_, S, Optimistic> {
     ///
     /// Returns [`AppendError::Conflict`] if another writer modified the stream,
     /// or [`AppendError::Store`] if persistence fails.
-    pub async fn commit(mut self) -> Result<(), AppendError<S::Position, S::Error>> {
+    pub async fn commit(
+        mut self,
+    ) -> Result<AppendResult<S::Position>, AppendError<S::Position, S::Error>> {
         let events = std::mem::take(&mut self.events);
+        let Some(events) = NonEmpty::from_vec(events) else {
+            return Err(AppendError::EmptyAppend);
+        };
         let event_count = events.len();
         tracing::debug!(
             aggregate_kind = %self.aggregate_kind,
@@ -327,7 +352,7 @@ pub trait EventStore: Send + Sync {
     /// * `aggregate_id` - The aggregate instance identifier
     /// * `expected_version` - The version expected for optimistic concurrency
     fn begin<C: ConcurrencyStrategy>(
-        &mut self,
+        &self,
         aggregate_kind: &str,
         aggregate_id: Self::Id,
         expected_version: Option<Self::Position>,
@@ -346,12 +371,12 @@ pub trait EventStore: Send + Sync {
     /// Returns [`AppendError::Conflict`] if the version doesn't match, or
     /// [`AppendError::Store`] if persistence fails.
     fn append<'a>(
-        &'a mut self,
+        &'a self,
         aggregate_kind: &'a str,
         aggregate_id: &'a Self::Id,
         expected_version: Option<Self::Position>,
-        events: Vec<PersistableEvent<Self::Metadata>>,
-    ) -> impl Future<Output = Result<(), AppendError<Self::Position, Self::Error>>> + Send + 'a;
+        events: NonEmpty<PersistableEvent<Self::Metadata>>,
+    ) -> impl Future<Output = AppendOutcome<Self::Position, Self::Error>> + Send + 'a;
 
     /// Load events matching the specified filters.
     ///
@@ -384,12 +409,17 @@ pub trait EventStore: Send + Sync {
     /// Returns [`AppendError::Conflict`] if the stream is not empty,
     /// or [`AppendError::Store`] if persistence fails.
     fn append_expecting_new<'a>(
-        &'a mut self,
+        &'a self,
         aggregate_kind: &'a str,
         aggregate_id: &'a Self::Id,
-        events: Vec<PersistableEvent<Self::Metadata>>,
-    ) -> impl Future<Output = Result<(), AppendError<Self::Position, Self::Error>>> + Send + 'a;
+        events: NonEmpty<PersistableEvent<Self::Metadata>>,
+    ) -> impl Future<Output = AppendOutcome<Self::Position, Self::Error>> + Send + 'a;
 }
+
+/// Marker trait for stores that provide globally ordered positions.
+///
+/// Projection snapshots require this guarantee.
+pub trait GloballyOrderedStore: EventStore {}
 // ANCHOR_END: event_store_trait
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -498,7 +528,7 @@ mod tests {
     }
 
     async fn append_raw_event(
-        store: &mut inmemory::Store<String, JsonCodec, ()>,
+        store: &inmemory::Store<String, JsonCodec, ()>,
         aggregate_kind: &str,
         aggregate_id: &str,
         event_kind: &str,
@@ -509,11 +539,12 @@ mod tests {
                 aggregate_kind,
                 &aggregate_id.to_string(),
                 None,
-                vec![PersistableEvent {
+                NonEmpty::from_vec(vec![PersistableEvent {
                     kind: event_kind.to_string(),
                     data: json_bytes.to_vec(),
                     metadata: (),
-                }],
+                }])
+                .expect("nonempty"),
             )
             .await
             .unwrap();
@@ -521,10 +552,10 @@ mod tests {
 
     #[tokio::test]
     async fn in_memory_event_store_appends_and_loads_single_event() {
-        let mut store: inmemory::Store<String, JsonCodec, ()> = inmemory::Store::new(JsonCodec);
+        let store: inmemory::Store<String, JsonCodec, ()> = inmemory::Store::new(JsonCodec);
         let data = br#"{"amount":10}"#;
 
-        append_raw_event(&mut store, "counter", "c1", "value-added", data).await;
+        append_raw_event(&store, "counter", "c1", "value-added", data).await;
 
         let filters = vec![EventFilter::for_aggregate("value-added", "counter", "c1")];
         let events = store.load_events(&filters).await.unwrap();
@@ -539,17 +570,10 @@ mod tests {
 
     #[tokio::test]
     async fn in_memory_event_store_loads_multiple_kinds_from_one_stream() {
-        let mut store: inmemory::Store<String, JsonCodec, ()> = inmemory::Store::new(JsonCodec);
+        let store: inmemory::Store<String, JsonCodec, ()> = inmemory::Store::new(JsonCodec);
+        append_raw_event(&store, "counter", "c1", "value-added", br#"{"amount":10}"#).await;
         append_raw_event(
-            &mut store,
-            "counter",
-            "c1",
-            "value-added",
-            br#"{"amount":10}"#,
-        )
-        .await;
-        append_raw_event(
-            &mut store,
+            &store,
             "counter",
             "c1",
             "value-subtracted",
@@ -580,9 +604,9 @@ mod tests {
 
     #[tokio::test]
     async fn in_memory_event_store_filters_by_event_kind_and_aggregate_id() {
-        let mut store: inmemory::Store<String, JsonCodec, ()> = inmemory::Store::new(JsonCodec);
-        append_raw_event(&mut store, "counter", "c1", "value-added", b"{}").await;
-        append_raw_event(&mut store, "counter", "c2", "value-added", b"{}").await;
+        let store: inmemory::Store<String, JsonCodec, ()> = inmemory::Store::new(JsonCodec);
+        append_raw_event(&store, "counter", "c1", "value-added", b"{}").await;
+        append_raw_event(&store, "counter", "c2", "value-added", b"{}").await;
 
         let filters = vec![EventFilter::for_aggregate("value-added", "counter", "c1")];
         let events = store.load_events(&filters).await.unwrap();
@@ -593,10 +617,10 @@ mod tests {
 
     #[tokio::test]
     async fn in_memory_event_store_orders_events_by_global_position() {
-        let mut store: inmemory::Store<String, JsonCodec, ()> = inmemory::Store::new(JsonCodec);
-        append_raw_event(&mut store, "counter", "c1", "value-added", b"{}").await;
-        append_raw_event(&mut store, "counter", "c2", "value-added", b"{}").await;
-        append_raw_event(&mut store, "counter", "c1", "value-added", b"{}").await;
+        let store: inmemory::Store<String, JsonCodec, ()> = inmemory::Store::new(JsonCodec);
+        append_raw_event(&store, "counter", "c1", "value-added", b"{}").await;
+        append_raw_event(&store, "counter", "c2", "value-added", b"{}").await;
+        append_raw_event(&store, "counter", "c1", "value-added", b"{}").await;
 
         let events = store
             .load_events(&[EventFilter::for_event("value-added")])
@@ -612,8 +636,8 @@ mod tests {
 
     #[tokio::test]
     async fn in_memory_event_store_deduplicates_overlapping_filters() {
-        let mut store: inmemory::Store<String, JsonCodec, ()> = inmemory::Store::new(JsonCodec);
-        append_raw_event(&mut store, "counter", "c1", "value-added", b"{}").await;
+        let store: inmemory::Store<String, JsonCodec, ()> = inmemory::Store::new(JsonCodec);
+        append_raw_event(&store, "counter", "c1", "value-added", b"{}").await;
 
         let filters = vec![
             EventFilter::for_aggregate("value-added", "counter", "c1"),
@@ -625,10 +649,10 @@ mod tests {
 
     #[tokio::test]
     async fn in_memory_event_store_applies_after_position_filter() {
-        let mut store: inmemory::Store<String, JsonCodec, ()> = inmemory::Store::new(JsonCodec);
-        append_raw_event(&mut store, "counter", "c1", "value-added", b"{}").await; // pos 0
-        append_raw_event(&mut store, "counter", "c1", "value-added", b"{}").await; // pos 1
-        append_raw_event(&mut store, "counter", "c1", "value-added", b"{}").await; // pos 2
+        let store: inmemory::Store<String, JsonCodec, ()> = inmemory::Store::new(JsonCodec);
+        append_raw_event(&store, "counter", "c1", "value-added", b"{}").await; // pos 0
+        append_raw_event(&store, "counter", "c1", "value-added", b"{}").await; // pos 1
+        append_raw_event(&store, "counter", "c1", "value-added", b"{}").await; // pos 2
 
         let events = store
             .load_events(&[EventFilter::for_event("value-added").after(1)])
@@ -651,19 +675,20 @@ mod tests {
 
     #[tokio::test]
     async fn in_memory_event_store_version_checking_detects_conflict() {
-        let mut store: inmemory::Store<String, JsonCodec, ()> = inmemory::Store::new(JsonCodec);
-        append_raw_event(&mut store, "counter", "c1", "value-added", b"{}").await;
+        let store: inmemory::Store<String, JsonCodec, ()> = inmemory::Store::new(JsonCodec);
+        append_raw_event(&store, "counter", "c1", "value-added", b"{}").await;
 
         let ok = store
             .append(
                 "counter",
                 &"c1".to_string(),
                 Some(0),
-                vec![PersistableEvent {
+                NonEmpty::from_vec(vec![PersistableEvent {
                     kind: "value-added".to_string(),
                     data: b"{}".to_vec(),
                     metadata: (),
-                }],
+                }])
+                .expect("nonempty"),
             )
             .await;
         assert!(ok.is_ok());
@@ -673,11 +698,12 @@ mod tests {
                 "counter",
                 &"c1".to_string(),
                 Some(0),
-                vec![PersistableEvent {
+                NonEmpty::from_vec(vec![PersistableEvent {
                     kind: "value-added".to_string(),
                     data: b"{}".to_vec(),
                     metadata: (),
-                }],
+                }])
+                .expect("nonempty"),
             )
             .await;
         assert!(matches!(conflict, Err(AppendError::Conflict(_))));
@@ -711,12 +737,12 @@ mod tests {
 
     #[tokio::test]
     async fn unchecked_transaction_commit_persists_events() {
-        let mut store: inmemory::Store<String, JsonCodec, ()> = inmemory::Store::new(JsonCodec);
+        let store: inmemory::Store<String, JsonCodec, ()> = inmemory::Store::new(JsonCodec);
         let mut tx =
             store.begin::<crate::concurrency::Unchecked>("counter", "c1".to_string(), None);
         tx.append(TestEvent::Added(TestAdded { amount: 10 }), ())
             .unwrap();
-        tx.commit().await.unwrap();
+        let _ = tx.commit().await.unwrap();
 
         let events = store
             .load_events(&[EventFilter::for_aggregate("added", "counter", "c1")])
@@ -729,7 +755,7 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_transaction_without_commit_discards_buffered_events() {
-        let mut store: inmemory::Store<String, JsonCodec, ()> = inmemory::Store::new(JsonCodec);
+        let store: inmemory::Store<String, JsonCodec, ()> = inmemory::Store::new(JsonCodec);
         {
             let mut tx =
                 store.begin::<crate::concurrency::Unchecked>("counter", "c1".to_string(), None);
@@ -746,8 +772,8 @@ mod tests {
 
     #[tokio::test]
     async fn optimistic_transaction_detects_stale_expected_version() {
-        let mut store: inmemory::Store<String, JsonCodec, ()> = inmemory::Store::new(JsonCodec);
-        append_raw_event(&mut store, "counter", "c1", "added", br#"{"amount":10}"#).await;
+        let store: inmemory::Store<String, JsonCodec, ()> = inmemory::Store::new(JsonCodec);
+        append_raw_event(&store, "counter", "c1", "added", br#"{"amount":10}"#).await;
 
         let mut tx =
             store.begin::<crate::concurrency::Optimistic>("counter", "c1".to_string(), Some(999));
@@ -760,8 +786,8 @@ mod tests {
 
     #[tokio::test]
     async fn optimistic_transaction_detects_non_new_stream_when_expect_new() {
-        let mut store: inmemory::Store<String, JsonCodec, ()> = inmemory::Store::new(JsonCodec);
-        append_raw_event(&mut store, "counter", "c1", "added", br#"{"amount":10}"#).await;
+        let store: inmemory::Store<String, JsonCodec, ()> = inmemory::Store::new(JsonCodec);
+        append_raw_event(&store, "counter", "c1", "added", br#"{"amount":10}"#).await;
 
         let mut tx =
             store.begin::<crate::concurrency::Optimistic>("counter", "c1".to_string(), None);

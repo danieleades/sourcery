@@ -120,7 +120,7 @@ async fn part1_basic_usage() -> Result<(OptimisticRepo, String), Box<dyn std::er
     println!("PART 1: Basic optimistic concurrency usage\n");
 
     let store: inmemory::Store<String, JsonCodec, ()> = inmemory::Store::new(JsonCodec);
-    let mut repo = Repository::new(store); // Optimistic concurrency is the default
+    let repo = Repository::new(store); // Optimistic concurrency is the default
 
     let item_id = "SKU-001".to_string();
 
@@ -233,7 +233,7 @@ async fn part3_retry_pattern() -> Result<(OptimisticRepo, String), Box<dyn std::
 /// Part 4: Business rule enforcement.
 ///
 /// Demonstrates that business rules are enforced against fresh state.
-async fn part4_business_rules(repo: &mut OptimisticRepo, item_id: &String) {
+async fn part4_business_rules(repo: &OptimisticRepo, item_id: &String) {
     println!("PART 4: Business rules with optimistic concurrency\n");
 
     println!("7. Attempting to reserve 40 units (should fail - only 35 available)...");
@@ -279,8 +279,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (mut repo1, item1_id) = part1_basic_usage().await?;
     part2_conflict_detection(&mut repo1, &item1_id).await?;
 
-    let (mut repo2, item2_id) = part3_retry_pattern().await?;
-    part4_business_rules(&mut repo2, &item2_id).await;
+    let (repo2, item2_id) = part3_retry_pattern().await?;
+    part4_business_rules(&repo2, &item2_id).await;
 
     print_summary();
 
