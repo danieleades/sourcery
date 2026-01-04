@@ -2,7 +2,7 @@
 //!
 //! This example demonstrates how to compose a projection that mixes
 //! global and scoped event subscriptions without relying on the
-//! any derive helper. We manually register:
+//! aggregate event enums. We manually register:
 //!
 //! - All `ProductRestocked` events (global)
 //! - `InventoryAdjusted` events scoped to a specific product SKU
@@ -13,7 +13,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use sourcery::{
-    Aggregate, Apply, ApplyProjection, DomainEvent, Projection, Repository,
+    Aggregate, Apply, ApplyProjection, DomainEvent, Repository,
     store::{JsonCodec, inmemory},
     test::RepositoryTestExt,
 };
@@ -96,19 +96,12 @@ impl Apply<PromotionApplied> for Promotion {
 // Manual projection
 // =============================================================================
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, sourcery::Projection)]
+#[projection(id = String)]
 struct ProductSummary {
     stock_levels: HashMap<String, i64>,
     sales: HashMap<String, i64>,
     promotion_totals: HashMap<String, i64>,
-}
-
-impl Projection for ProductSummary {
-    type Id = String;
-    type InstanceId = ();
-    type Metadata = ();
-
-    const KIND: &'static str = "product-summary";
 }
 
 impl ApplyProjection<ProductRestocked> for ProductSummary {

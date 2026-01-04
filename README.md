@@ -88,7 +88,7 @@ the aggregate derive and the in-memory store.
 ```rust,no_run
 use sourcery::{
     Apply, ApplyProjection, DomainEvent, Handle, store::{inmemory, JsonCodec},
-    Projection, Repository,
+    Repository,
 };
 use serde::{Deserialize, Serialize};
 
@@ -138,16 +138,10 @@ impl Handle<DepositFunds> for Account {
 
 // === Projection ===
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, sourcery::Projection)]
+#[projection(id = String)]
 pub struct AccountBalance {
     pub total_cents: i64,
-}
-
-impl Projection for AccountBalance {
-    const KIND: &'static str = "account-balance";
-    type Id = String;
-    type Metadata = ();
-    type InstanceId = ();
 }
 
 impl ApplyProjection<FundsDeposited> for AccountBalance {
@@ -200,8 +194,9 @@ event you care about, then add `Handle<C>` implementations for each command. The
 
 Read models that keep their state in sync by replaying events. Projections implement
 `ApplyProjection<E>` for the event types they care about and declare their kind, instance ID,
-aggregate ID, and metadata requirements via the `Projection` trait. Build them by calling
-`Repository::build_projection::<P>()`, chaining the relevant `.event::<E>()` / `.event_for::<A, E>()`
+aggregate ID, and metadata requirements via the `Projection` trait (usually with
+`#[derive(Projection)]`). Build them by calling `Repository::build_projection::<P>()`,
+chaining the relevant `.event::<E>()` / `.event_for::<A, E>()`
 registrations (or `.events::<A::Event>()` / `.events_for::<A>()` for aggregate event enums), and
 finally `.load().await`.
 

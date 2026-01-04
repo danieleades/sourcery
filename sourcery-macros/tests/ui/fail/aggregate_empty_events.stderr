@@ -1,0 +1,5 @@
+error: events(...) must contain at least one event type
+  --> tests/ui/fail/aggregate_empty_events.rs:14:12
+   |
+14 | pub struct Account {}
+   |            ^^^^^^^

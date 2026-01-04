@@ -24,6 +24,7 @@
 # Derive Macros
 
 - [The Aggregate Derive](derive-macros/aggregate-derive.md)
+- [The Projection Derive](derive-macros/projection-derive.md)
 - [Manual Implementation](derive-macros/manual-implementation.md)
 
 # Advanced Topics

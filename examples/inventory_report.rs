@@ -22,7 +22,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use sourcery::{
-    Aggregate, Apply, ApplyProjection, DomainEvent, Handle, Projection, Repository,
+    Aggregate, Apply, ApplyProjection, DomainEvent, Handle, Repository,
     store::{JsonCodec, inmemory},
 };
 
@@ -222,7 +222,8 @@ impl Handle<RefundSale> for Sale {
 // Projection constructed manually through ProjectionBuilder
 // =============================================================================
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, sourcery::Projection)]
+#[projection(id = String)]
 pub struct InventoryReport {
     pub total_products_restocked: i64,
     pub total_items_in_stock: i64,
@@ -239,14 +240,6 @@ pub struct ProductStats {
     pub unit_price_cents: i64,
     pub times_restocked: i64,
     pub units_sold: i64,
-}
-
-impl Projection for InventoryReport {
-    type Id = String;
-    type InstanceId = ();
-    type Metadata = ();
-
-    const KIND: &'static str = "inventory-report";
 }
 
 // ApplyProjection implementations - for events that need stream context

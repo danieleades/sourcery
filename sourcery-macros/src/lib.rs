@@ -4,25 +4,42 @@
 #![allow(clippy::needless_continue)]
 
 use darling::{FromDeriveInput, FromMeta, util::PathList};
+use heck::{ToKebabCase, ToUpperCamelCase};
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
-use quote::quote;
+use quote::{ToTokens, quote};
 use syn::{DeriveInput, Ident, Path, parse_macro_input};
 
-/// Converts a `PascalCase` or `camelCase` string to `kebab-case`.
-fn to_kebab_case(s: &str) -> String {
-    let mut result = String::with_capacity(s.len() + 4);
-    for (i, c) in s.chars().enumerate() {
-        if c.is_uppercase() {
-            if i > 0 {
-                result.push('-');
-            }
-            result.push(c.to_ascii_lowercase());
-        } else {
-            result.push(c);
+#[allow(clippy::doc_markdown, reason = "false positive")]
+/// Build a PascalCase enum variant name from a type path.
+fn path_to_pascal_ident(path: &Path) -> Ident {
+    let mut combined = String::new();
+    for (index, segment) in path.segments.iter().enumerate() {
+        if index > 0 {
+            combined.push('_');
         }
+        combined.push_str(&segment.ident.to_string());
     }
-    result
+    let pascal = combined.to_upper_camel_case();
+    let span = path
+        .segments
+        .last()
+        .map_or_else(proc_macro2::Span::call_site, |segment| segment.ident.span());
+    Ident::new(&pascal, span)
+}
+
+/// Parse `key = Type` meta items into a `syn::Type`.
+fn parse_name_value_type(item: &syn::Meta) -> darling::Result<syn::Type> {
+    let error = || darling::Error::unsupported_shape("expected `key = Type`");
+    let syn::Meta::NameValue(nv) = item else {
+        return Err(error());
+    };
+    syn::parse2(nv.value.to_token_stream()).map_err(|_| error())
+}
+
+/// Returns the kind override or the default kebab-case name from the ident.
+fn default_kind(ident: &Ident, kind: Option<String>) -> String {
+    kind.unwrap_or_else(|| ident.to_string().to_kebab_case())
 }
 
 /// Wrapper for `syn::Path` that parses from `key = Type` syntax.
@@ -31,12 +48,21 @@ struct TypePath(Path);
 
 impl FromMeta for TypePath {
     fn from_meta(item: &syn::Meta) -> darling::Result<Self> {
-        if let syn::Meta::NameValue(nv) = item
-            && let syn::Expr::Path(expr_path) = &nv.value
-        {
-            return Ok(Self(expr_path.path.clone()));
+        let ty = parse_name_value_type(item)?;
+        match ty {
+            syn::Type::Path(type_path) if type_path.qself.is_none() => Ok(Self(type_path.path)),
+            _ => Err(darling::Error::unsupported_shape("expected `key = Type`")),
         }
-        Err(darling::Error::unsupported_shape("expected `key = Type`"))
+    }
+}
+
+/// Wrapper for `syn::Type` that parses from `key = Type` syntax.
+#[derive(Debug)]
+struct TypeValue(syn::Type);
+
+impl FromMeta for TypeValue {
+    fn from_meta(item: &syn::Meta) -> darling::Result<Self> {
+        parse_name_value_type(item).map(Self)
     }
 }
 
@@ -53,6 +79,48 @@ struct AggregateArgs {
     kind: Option<String>,
     #[darling(default)]
     event_enum: Option<String>,
+}
+
+/// Configuration for the `#[projection(...)]` attribute.
+#[derive(Debug, FromDeriveInput)]
+#[darling(attributes(projection), supports(struct_any))]
+struct ProjectionArgs {
+    ident: Ident,
+    id: TypeValue,
+    #[darling(default)]
+    metadata: Option<TypeValue>,
+    #[darling(default)]
+    instance_id: Option<TypeValue>,
+    #[darling(default)]
+    kind: Option<String>,
+}
+
+/// Captures the event type path and its generated enum variant identifier.
+struct EventSpec<'a> {
+    path: &'a Path,
+    variant: Ident,
+}
+
+impl<'a> EventSpec<'a> {
+    /// Build an event spec from a type path.
+    fn new(path: &'a Path) -> Self {
+        Self {
+            path,
+            variant: path_to_pascal_ident(path),
+        }
+    }
+}
+
+/// Parse derive input with darling and render errors as tokens.
+fn parse_or_error<T, F>(input: &DeriveInput, f: F) -> TokenStream2
+where
+    T: FromDeriveInput,
+    F: FnOnce(T) -> TokenStream2,
+{
+    match T::from_derive_input(input) {
+        Ok(args) => f(args),
+        Err(err) => err.write_errors(),
+    }
 }
 
 /// Derives the `Aggregate` trait for a struct.
@@ -97,17 +165,16 @@ pub fn derive_aggregate(input: TokenStream) -> TokenStream {
     derive_aggregate_impl(&input).into()
 }
 
+/// Internal entry point that returns tokens for the aggregate derive.
 fn derive_aggregate_impl(input: &DeriveInput) -> TokenStream2 {
-    match AggregateArgs::from_derive_input(input) {
-        Ok(args) => generate_aggregate_impl(args, input),
-        Err(err) => err.write_errors(),
-    }
+    parse_or_error::<AggregateArgs, _>(input, |args| generate_aggregate_impl(args, input))
 }
 
+/// Generate the aggregate derive implementation tokens.
 fn generate_aggregate_impl(args: AggregateArgs, input: &DeriveInput) -> TokenStream2 {
-    let event_types: Vec<&Path> = args.events.iter().collect();
+    let event_specs: Vec<EventSpec<'_>> = args.events.iter().map(EventSpec::new).collect();
 
-    if event_types.is_empty() {
+    if event_specs.is_empty() {
         return darling::Error::custom("events(...) must contain at least one event type")
             .with_span(&input.ident)
             .write_errors();
@@ -117,25 +184,17 @@ fn generate_aggregate_impl(args: AggregateArgs, input: &DeriveInput) -> TokenStr
     let struct_vis = &args.vis;
     let id_type = &args.id.0;
     let error_type = &args.error.0;
+    let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
 
-    let kind = args
-        .kind
-        .unwrap_or_else(|| to_kebab_case(&struct_name.to_string()));
+    let kind = default_kind(struct_name, args.kind);
 
     let event_enum_name = args.event_enum.map_or_else(
         || Ident::new(&format!("{struct_name}Event"), struct_name.span()),
         |name| Ident::new(&name, struct_name.span()),
     );
 
-    let variant_names: Vec<_> = event_types
-        .iter()
-        .map(|p| {
-            &p.segments
-                .last()
-                .expect("event type path must have at least one segment")
-                .ident
-        })
-        .collect();
+    let event_types: Vec<&Path> = event_specs.iter().map(|spec| spec.path).collect();
+    let variant_names: Vec<&Ident> = event_specs.iter().map(|spec| &spec.variant).collect();
 
     let expanded = quote! {
         #[derive(Clone, ::serde::Serialize, ::serde::Deserialize)]
@@ -184,7 +243,7 @@ fn generate_aggregate_impl(args: AggregateArgs, input: &DeriveInput) -> TokenStr
             }
         )*
 
-        impl ::sourcery::Aggregate for #struct_name {
+        impl #impl_generics ::sourcery::Aggregate for #struct_name #ty_generics #where_clause {
             const KIND: &'static str = #kind;
             type Event = #event_enum_name;
             type Error = #error_type;
@@ -201,19 +260,85 @@ fn generate_aggregate_impl(args: AggregateArgs, input: &DeriveInput) -> TokenStr
     expanded
 }
 
+/// Derives the `Projection` trait for a struct.
+///
+/// This macro generates:
+/// - `Projection` trait implementation
+///
+/// # Attributes
+///
+/// ## Required
+/// - `id = Type` - Aggregate ID type
+///
+/// ## Optional
+/// - `metadata = Type` - Metadata type (default: `()`)
+/// - `instance_id = Type` - Projection instance identifier type (default: `()`)
+/// - `kind = "name"` - Projection type identifier (default: lowercase struct
+///   name)
+///
+/// # Example
+///
+/// ```ignore
+/// #[derive(Projection)]
+/// #[projection(id = String)]
+/// pub struct AccountLedger;
+/// ```
+#[proc_macro_derive(Projection, attributes(projection))]
+pub fn derive_projection(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+
+    derive_projection_impl(&input).into()
+}
+
+/// Internal entry point that returns tokens for the projection derive.
+fn derive_projection_impl(input: &DeriveInput) -> TokenStream2 {
+    parse_or_error::<ProjectionArgs, _>(input, |args| generate_projection_impl(args, input))
+}
+
+/// Generate the projection derive implementation tokens.
+fn generate_projection_impl(args: ProjectionArgs, input: &DeriveInput) -> TokenStream2 {
+    let struct_name = &args.ident;
+    let id_type = &args.id.0;
+    let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
+    let default_metadata: syn::Type = syn::parse_quote!(());
+    let default_instance_id: syn::Type = syn::parse_quote!(());
+    let metadata_type = args
+        .metadata
+        .as_ref()
+        .map_or(&default_metadata, |value| &value.0);
+    let instance_id_type = args
+        .instance_id
+        .as_ref()
+        .map_or(&default_instance_id, |value| &value.0);
+    let kind = default_kind(struct_name, args.kind);
+
+    quote! {
+        impl #impl_generics ::sourcery::Projection for #struct_name #ty_generics #where_clause {
+            const KIND: &'static str = #kind;
+            type Id = #id_type;
+            type Metadata = #metadata_type;
+            type InstanceId = #instance_id_type;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use syn::parse_quote;
 
     use super::*;
 
-    #[test]
-    fn to_kebab_case_converts_pascal_and_camel() {
-        assert_eq!(to_kebab_case("BankAccount"), "bank-account");
-        assert_eq!(to_kebab_case("camelCase"), "camel-case");
+    /// Normalize token output by removing whitespace.
+    fn compact(tokens: &TokenStream2) -> String {
+        tokens
+            .to_string()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect()
     }
 
     #[test]
+    /// Verifies path parsing for `id = Type` syntax.
     fn type_path_parses_name_value_path() {
         let meta: syn::Meta = parse_quote!(id = String);
         let parsed = TypePath::from_meta(&meta).unwrap();
@@ -221,6 +346,7 @@ mod tests {
     }
 
     #[test]
+    /// Ensures non-path values are rejected for `TypePath`.
     fn type_path_rejects_non_path_value() {
         let meta: syn::Meta = parse_quote!(id = "String");
         let err = TypePath::from_meta(&meta).unwrap_err();
@@ -228,6 +354,7 @@ mod tests {
     }
 
     #[test]
+    /// Confirms default kind and event enum names are generated.
     fn generate_aggregate_impl_uses_default_kind_and_event_enum() {
         let input: DeriveInput = parse_quote! {
             #[aggregate(id = String, error = String, events(FundsDeposited))]
@@ -236,8 +363,8 @@ mod tests {
             }
         };
 
-        let expanded = derive_aggregate_impl(&input).to_string();
-        let compact: String = expanded.chars().filter(|c| !c.is_whitespace()).collect();
+        let expanded = derive_aggregate_impl(&input);
+        let compact = compact(&expanded);
 
         assert!(compact.contains("enumAccountEvent"));
         assert!(compact.contains("impl::sourcery::AggregateforAccount"));
@@ -245,6 +372,7 @@ mod tests {
     }
 
     #[test]
+    /// Confirms explicit kind and enum overrides are honored.
     fn generate_aggregate_impl_respects_kind_and_event_enum_overrides() {
         let input: DeriveInput = parse_quote! {
             #[aggregate(
@@ -259,23 +387,70 @@ mod tests {
             }
         };
 
-        let expanded = derive_aggregate_impl(&input).to_string();
-        let compact: String = expanded.chars().filter(|c| !c.is_whitespace()).collect();
+        let expanded = derive_aggregate_impl(&input);
+        let compact = compact(&expanded);
 
         assert!(compact.contains("enumBankAccountEvent"));
         assert!(compact.contains("constKIND:&'staticstr=\"bank-account\""));
     }
 
     #[test]
+    /// Ensures empty event lists yield a compile-time error.
     fn generate_aggregate_impl_emits_error_on_empty_events_list() {
         let input: DeriveInput = parse_quote! {
             #[aggregate(id = String, error = String, events())]
             pub struct Account;
         };
 
-        let expanded = derive_aggregate_impl(&input).to_string();
-        let compact: String = expanded.chars().filter(|c| !c.is_whitespace()).collect();
+        let expanded = derive_aggregate_impl(&input);
+        let compact = compact(&expanded);
 
         assert!(compact.contains("events(...)mustcontainatleastoneeventtype"));
+    }
+
+    #[test]
+    /// Verifies `TypeValue` accepts name-value type syntax.
+    fn type_value_parses_name_value_type() {
+        let meta: syn::Meta = parse_quote!(id = ());
+        let parsed = TypeValue::from_meta(&meta).unwrap();
+        assert_eq!(parsed.0, parse_quote!(()));
+    }
+
+    #[test]
+    /// Confirms default kind and type defaults for projections.
+    fn generate_projection_impl_uses_default_kind_and_types() {
+        let input: DeriveInput = parse_quote! {
+            #[projection(id = String)]
+            pub struct AccountLedger;
+        };
+
+        let expanded = derive_projection_impl(&input);
+        let compact = compact(&expanded);
+
+        assert!(compact.contains("impl::sourcery::ProjectionforAccountLedger"));
+        assert!(compact.contains("constKIND:&'staticstr=\"account-ledger\""));
+        assert!(compact.contains("typeMetadata=()"));
+        assert!(compact.contains("typeInstanceId=()"));
+    }
+
+    #[test]
+    /// Confirms projection overrides are honored.
+    fn generate_projection_impl_respects_overrides() {
+        let input: DeriveInput = parse_quote! {
+            #[projection(
+                id = String,
+                metadata = RequestMetadata,
+                instance_id = ProjectionKey,
+                kind = "account-ledger"
+            )]
+            pub struct AccountLedger;
+        };
+
+        let expanded = derive_projection_impl(&input);
+        let compact = compact(&expanded);
+
+        assert!(compact.contains("constKIND:&'staticstr=\"account-ledger\""));
+        assert!(compact.contains("typeMetadata=RequestMetadata"));
+        assert!(compact.contains("typeInstanceId=ProjectionKey"));
     }
 }

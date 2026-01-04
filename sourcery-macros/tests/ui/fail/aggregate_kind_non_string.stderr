@@ -1,0 +1,5 @@
+error: Unexpected type `int`
+  --> tests/ui/fail/aggregate_kind_non_string.rs:23:81
+   |
+23 | #[aggregate(id = String, error = AggregateError, events(FundsDeposited), kind = 123)]
+   |                                                                                 ^^^

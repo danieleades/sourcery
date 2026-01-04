@@ -19,12 +19,16 @@ jobs:
         include:
           - os: ubuntu-latest
             rust: nightly
+            # Skip trybuild tests on nightly because .stderr files are generated
+            # with stable. Error span formatting differs between Rust versions.
+            skip_tests: --skip ui
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.rust }}
-      - run: cargo test --all-features
+      - name: Run tests
+        run: cargo test --all --all-features -- ${{ matrix.skip_tests }}
 
   format:
     runs-on: ubuntu-latest
@@ -44,14 +48,14 @@ jobs:
           components: clippy
       - uses: actions-rs-plus/clippy-check@v2
         with:
-          args: --all-features --all-targets
+          args: --all --all-features --all-targets
 
   msrv:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: taiki-e/install-action@cargo-hack
-      - run: cargo hack --no-dev-deps --rust-version check --all
+      - run: cargo hack --no-dev-deps --rust-version check
 
   docs:
     runs-on: ubuntu-latest
@@ -85,7 +89,7 @@ jobs:
         with:
           components: llvm-tools-preview
       - uses: taiki-e/install-action@cargo-llvm-cov
-      - run: cargo llvm-cov --all-features --doctests --workspace --lcov --output-path lcov.info
+      - run: cargo llvm-cov --all-features --doctests --workspace --lcov --output-path lcov.info -- --skip ui
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5
         with:
@@ -112,7 +116,7 @@ jobs:
     if: github.actor == 'dependabot[bot]'
     steps:
       - name: Enable auto-merge for Dependabot PRs
-        run: gh pr merge --auto --merge "$PR_URL"
+        run: gh pr merge --auto --squash "$PR_URL"
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

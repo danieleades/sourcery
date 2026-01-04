@@ -103,12 +103,9 @@ impl Codec for VersionedCodec {
 
 ```rust,ignore
 // Projection consumes from multiple aggregates
-impl Projection for Dashboard {
-    const KIND: &'static str = "dashboard";
-    type Id = String;
-    type Metadata = ();
-    type InstanceId = ();
-}
+#[derive(Default, sourcery::Projection)]
+#[projection(id = String, kind = "dashboard")]
+struct Dashboard;
 impl ApplyProjection<OrderPlaced> for Dashboard { /* ... */ }
 impl ApplyProjection<PaymentReceived> for Dashboard { /* ... */ }
 impl ApplyProjection<ShipmentDispatched> for Dashboard { /* ... */ }

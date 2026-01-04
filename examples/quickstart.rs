@@ -7,7 +7,7 @@
 // ANCHOR: full_example
 use serde::{Deserialize, Serialize};
 use sourcery::{
-    Apply, ApplyProjection, DomainEvent, Handle, Projection, Repository,
+    Apply, ApplyProjection, DomainEvent, Handle, Repository,
     store::{JsonCodec, inmemory},
 };
 
@@ -53,17 +53,10 @@ impl Handle<Deposit> for Account {
 // ANCHOR_END: aggregate
 
 // ANCHOR: projection
-#[derive(Debug, Default)]
+#[derive(Debug, Default, sourcery::Projection)]
+#[projection(id = String)]
 pub struct TotalDeposits {
     pub total: i64,
-}
-
-impl Projection for TotalDeposits {
-    type Id = String;
-    type InstanceId = ();
-    type Metadata = ();
-
-    const KIND: &'static str = "total-deposits";
 }
 
 impl ApplyProjection<FundsDeposited> for TotalDeposits {

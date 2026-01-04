@@ -25,16 +25,10 @@ Unlike aggregate `Apply`, projections receive:
 ## Basic Example
 
 ```rust,ignore
-#[derive(Debug, Default)]
+#[derive(Debug, Default, sourcery::Projection)]
+#[projection(id = String)]
 pub struct AccountSummary {
     pub accounts: HashMap<String, i64>,
-}
-
-impl Projection for AccountSummary {
-    const KIND: &'static str = "account-summary";
-    type Id = String;
-    type Metadata = ();
-    type InstanceId = ();
 }
 
 impl ApplyProjection<FundsDeposited> for AccountSummary {
@@ -108,16 +102,10 @@ pub struct AuditEntry {
     pub action: String,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, sourcery::Projection)]
+#[projection(id = String, metadata = EventMetadata)]
 pub struct AuditLog {
     pub entries: Vec<AuditEntry>,
-}
-
-impl Projection for AuditLog {
-    const KIND: &'static str = "audit-log";
-    type Id = String;
-    type Metadata = EventMetadata;
-    type InstanceId = ();
 }
 
 impl ApplyProjection<FundsDeposited> for AuditLog {
