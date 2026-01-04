@@ -24,7 +24,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.rust }}
-      - run: cargo test --all-features
+      - run: cargo test --all --all-features
 
   format:
     runs-on: ubuntu-latest
@@ -44,14 +44,14 @@ jobs:
           components: clippy
       - uses: actions-rs-plus/clippy-check@v2
         with:
-          args: --all-features --all-targets
+          args: --all --all-features --all-targets
 
   msrv:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: taiki-e/install-action@cargo-hack
-      - run: cargo hack --no-dev-deps --rust-version check --all
+      - run: cargo hack --no-dev-deps --rust-version check
 
   docs:
     runs-on: ubuntu-latest
@@ -112,7 +112,7 @@ jobs:
     if: github.actor == 'dependabot[bot]'
     steps:
       - name: Enable auto-merge for Dependabot PRs
-        run: gh pr merge --auto --merge "$PR_URL"
+        run: gh pr merge --auto --squash "$PR_URL"
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

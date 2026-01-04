@@ -1,0 +1,5 @@
+error: Unsupported shape `expected `key = Type``
+  --> tests/ui/fail/aggregate_error_string_literal.rs:21:26
+   |
+21 | #[aggregate(id = String, error = "AggregateError", events(FundsDeposited))]
+   |                          ^^^^^^^^^^^^^^^^^^^^^^^^

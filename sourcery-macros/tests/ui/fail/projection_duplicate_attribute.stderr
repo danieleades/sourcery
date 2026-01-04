@@ -1,0 +1,5 @@
+error: Duplicate field `id`
+  --> tests/ui/fail/projection_duplicate_attribute.rs:11:27
+   |
+11 | #[projection(id = String, id = u64)]
+   |                           ^^^^^^^^

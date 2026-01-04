@@ -4,6 +4,7 @@
 #![allow(clippy::needless_continue)]
 
 use darling::{FromDeriveInput, FromMeta, util::PathList};
+use heck::{ToKebabCase, ToUpperCamelCase};
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::{ToTokens, quote};
@@ -11,18 +12,35 @@ use syn::{DeriveInput, Ident, Path, parse_macro_input};
 
 /// Converts a `PascalCase` or `camelCase` string to `kebab-case`.
 fn to_kebab_case(s: &str) -> String {
-    let mut result = String::with_capacity(s.len() + 4);
-    for (i, c) in s.chars().enumerate() {
-        if c.is_uppercase() {
-            if i > 0 {
-                result.push('-');
-            }
-            result.push(c.to_ascii_lowercase());
-        } else {
-            result.push(c);
+    s.to_kebab_case()
+}
+
+fn path_to_pascal_ident(path: &Path) -> Ident {
+    let mut combined = String::new();
+    for (index, segment) in path.segments.iter().enumerate() {
+        if index > 0 {
+            combined.push('_');
         }
+        combined.push_str(&segment.ident.to_string());
     }
-    result
+    let pascal = combined.to_upper_camel_case();
+    let span = path
+        .segments
+        .last()
+        .map_or_else(proc_macro2::Span::call_site, |segment| segment.ident.span());
+    Ident::new(&pascal, span)
+}
+
+fn parse_name_value_type(item: &syn::Meta) -> darling::Result<syn::Type> {
+    if let syn::Meta::NameValue(nv) = item {
+        return syn::parse2(nv.value.to_token_stream())
+            .map_err(|_| darling::Error::unsupported_shape("expected `key = Type`"));
+    }
+    Err(darling::Error::unsupported_shape("expected `key = Type`"))
+}
+
+fn default_kind(ident: &Ident, kind: Option<String>) -> String {
+    kind.unwrap_or_else(|| to_kebab_case(&ident.to_string()))
 }
 
 /// Wrapper for `syn::Path` that parses from `key = Type` syntax.
@@ -31,12 +49,11 @@ struct TypePath(Path);
 
 impl FromMeta for TypePath {
     fn from_meta(item: &syn::Meta) -> darling::Result<Self> {
-        if let syn::Meta::NameValue(nv) = item
-            && let syn::Expr::Path(expr_path) = &nv.value
-        {
-            return Ok(Self(expr_path.path.clone()));
+        let ty = parse_name_value_type(item)?;
+        match ty {
+            syn::Type::Path(type_path) if type_path.qself.is_none() => Ok(Self(type_path.path)),
+            _ => Err(darling::Error::unsupported_shape("expected `key = Type`")),
         }
-        Err(darling::Error::unsupported_shape("expected `key = Type`"))
     }
 }
 
@@ -46,12 +63,7 @@ struct TypeValue(syn::Type);
 
 impl FromMeta for TypeValue {
     fn from_meta(item: &syn::Meta) -> darling::Result<Self> {
-        if let syn::Meta::NameValue(nv) = item {
-            let ty: syn::Type = syn::parse2(nv.value.to_token_stream())
-                .map_err(|_| darling::Error::unsupported_shape("expected `key = Type`"))?;
-            return Ok(Self(ty));
-        }
-        Err(darling::Error::unsupported_shape("expected `key = Type`"))
+        parse_name_value_type(item).map(Self)
     }
 }
 
@@ -82,6 +94,31 @@ struct ProjectionArgs {
     instance_id: Option<TypeValue>,
     #[darling(default)]
     kind: Option<String>,
+}
+
+struct EventSpec<'a> {
+    path: &'a Path,
+    variant: Ident,
+}
+
+impl<'a> EventSpec<'a> {
+    fn new(path: &'a Path) -> Self {
+        Self {
+            path,
+            variant: path_to_pascal_ident(path),
+        }
+    }
+}
+
+fn parse_or_error<T, F>(input: &DeriveInput, f: F) -> TokenStream2
+where
+    T: FromDeriveInput,
+    F: FnOnce(T) -> TokenStream2,
+{
+    match T::from_derive_input(input) {
+        Ok(args) => f(args),
+        Err(err) => err.write_errors(),
+    }
 }
 
 /// Derives the `Aggregate` trait for a struct.
@@ -127,16 +164,13 @@ pub fn derive_aggregate(input: TokenStream) -> TokenStream {
 }
 
 fn derive_aggregate_impl(input: &DeriveInput) -> TokenStream2 {
-    match AggregateArgs::from_derive_input(input) {
-        Ok(args) => generate_aggregate_impl(args, input),
-        Err(err) => err.write_errors(),
-    }
+    parse_or_error::<AggregateArgs, _>(input, |args| generate_aggregate_impl(args, input))
 }
 
 fn generate_aggregate_impl(args: AggregateArgs, input: &DeriveInput) -> TokenStream2 {
-    let event_types: Vec<&Path> = args.events.iter().collect();
+    let event_specs: Vec<EventSpec<'_>> = args.events.iter().map(EventSpec::new).collect();
 
-    if event_types.is_empty() {
+    if event_specs.is_empty() {
         return darling::Error::custom("events(...) must contain at least one event type")
             .with_span(&input.ident)
             .write_errors();
@@ -146,25 +180,17 @@ fn generate_aggregate_impl(args: AggregateArgs, input: &DeriveInput) -> TokenStr
     let struct_vis = &args.vis;
     let id_type = &args.id.0;
     let error_type = &args.error.0;
+    let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
 
-    let kind = args
-        .kind
-        .unwrap_or_else(|| to_kebab_case(&struct_name.to_string()));
+    let kind = default_kind(struct_name, args.kind);
 
     let event_enum_name = args.event_enum.map_or_else(
         || Ident::new(&format!("{struct_name}Event"), struct_name.span()),
         |name| Ident::new(&name, struct_name.span()),
     );
 
-    let variant_names: Vec<_> = event_types
-        .iter()
-        .map(|p| {
-            &p.segments
-                .last()
-                .expect("event type path must have at least one segment")
-                .ident
-        })
-        .collect();
+    let event_types: Vec<&Path> = event_specs.iter().map(|spec| spec.path).collect();
+    let variant_names: Vec<&Ident> = event_specs.iter().map(|spec| &spec.variant).collect();
 
     let expanded = quote! {
         #[derive(Clone, ::serde::Serialize, ::serde::Deserialize)]
@@ -213,7 +239,7 @@ fn generate_aggregate_impl(args: AggregateArgs, input: &DeriveInput) -> TokenStr
             }
         )*
 
-        impl ::sourcery::Aggregate for #struct_name {
+        impl #impl_generics ::sourcery::Aggregate for #struct_name #ty_generics #where_clause {
             const KIND: &'static str = #kind;
             type Event = #event_enum_name;
             type Error = #error_type;
@@ -261,33 +287,27 @@ pub fn derive_projection(input: TokenStream) -> TokenStream {
 }
 
 fn derive_projection_impl(input: &DeriveInput) -> TokenStream2 {
-    match ProjectionArgs::from_derive_input(input) {
-        Ok(args) => generate_projection_impl(args),
-        Err(err) => err.write_errors(),
-    }
+    parse_or_error::<ProjectionArgs, _>(input, |args| generate_projection_impl(args, input))
 }
 
-fn generate_projection_impl(args: ProjectionArgs) -> TokenStream2 {
+fn generate_projection_impl(args: ProjectionArgs, input: &DeriveInput) -> TokenStream2 {
     let struct_name = &args.ident;
     let id_type = &args.id.0;
+    let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
     let default_metadata: syn::Type = syn::parse_quote!(());
     let default_instance_id: syn::Type = syn::parse_quote!(());
     let metadata_type = args
         .metadata
         .as_ref()
-        .map(|value| &value.0)
-        .unwrap_or(&default_metadata);
+        .map_or(&default_metadata, |value| &value.0);
     let instance_id_type = args
         .instance_id
         .as_ref()
-        .map(|value| &value.0)
-        .unwrap_or(&default_instance_id);
-    let kind = args
-        .kind
-        .unwrap_or_else(|| to_kebab_case(&struct_name.to_string()));
+        .map_or(&default_instance_id, |value| &value.0);
+    let kind = default_kind(struct_name, args.kind);
 
     quote! {
-        impl ::sourcery::Projection for #struct_name {
+        impl #impl_generics ::sourcery::Projection for #struct_name #ty_generics #where_clause {
             const KIND: &'static str = #kind;
             type Id = #id_type;
             type Metadata = #metadata_type;
@@ -301,6 +321,14 @@ mod tests {
     use syn::parse_quote;
 
     use super::*;
+
+    fn compact(tokens: &TokenStream2) -> String {
+        tokens
+            .to_string()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect()
+    }
 
     #[test]
     fn to_kebab_case_converts_pascal_and_camel() {
@@ -331,8 +359,8 @@ mod tests {
             }
         };
 
-        let expanded = derive_aggregate_impl(&input).to_string();
-        let compact: String = expanded.chars().filter(|c| !c.is_whitespace()).collect();
+        let expanded = derive_aggregate_impl(&input);
+        let compact = compact(&expanded);
 
         assert!(compact.contains("enumAccountEvent"));
         assert!(compact.contains("impl::sourcery::AggregateforAccount"));
@@ -354,8 +382,8 @@ mod tests {
             }
         };
 
-        let expanded = derive_aggregate_impl(&input).to_string();
-        let compact: String = expanded.chars().filter(|c| !c.is_whitespace()).collect();
+        let expanded = derive_aggregate_impl(&input);
+        let compact = compact(&expanded);
 
         assert!(compact.contains("enumBankAccountEvent"));
         assert!(compact.contains("constKIND:&'staticstr=\"bank-account\""));
@@ -368,8 +396,8 @@ mod tests {
             pub struct Account;
         };
 
-        let expanded = derive_aggregate_impl(&input).to_string();
-        let compact: String = expanded.chars().filter(|c| !c.is_whitespace()).collect();
+        let expanded = derive_aggregate_impl(&input);
+        let compact = compact(&expanded);
 
         assert!(compact.contains("events(...)mustcontainatleastoneeventtype"));
     }
@@ -388,8 +416,8 @@ mod tests {
             pub struct AccountLedger;
         };
 
-        let expanded = derive_projection_impl(&input).to_string();
-        let compact: String = expanded.chars().filter(|c| !c.is_whitespace()).collect();
+        let expanded = derive_projection_impl(&input);
+        let compact = compact(&expanded);
 
         assert!(compact.contains("impl::sourcery::ProjectionforAccountLedger"));
         assert!(compact.contains("constKIND:&'staticstr=\"account-ledger\""));
@@ -409,8 +437,8 @@ mod tests {
             pub struct AccountLedger;
         };
 
-        let expanded = derive_projection_impl(&input).to_string();
-        let compact: String = expanded.chars().filter(|c| !c.is_whitespace()).collect();
+        let expanded = derive_projection_impl(&input);
+        let compact = compact(&expanded);
 
         assert!(compact.contains("constKIND:&'staticstr=\"account-ledger\""));
         assert!(compact.contains("typeMetadata=RequestMetadata"));

@@ -1,0 +1,7 @@
+error: Missing field `events`
+  --> tests/ui/fail/aggregate_missing_events.rs:12:10
+   |
+12 | #[derive(Aggregate)]
+   |          ^^^^^^^^^
+   |
+   = note: this error originates in the derive macro `Aggregate` (in Nightly builds, run with -Z macro-backtrace for more info)

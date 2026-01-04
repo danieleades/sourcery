@@ -1,0 +1,5 @@
+error: Unexpected type `path`
+  --> tests/ui/fail/aggregate_event_enum_non_string.rs:23:87
+   |
+23 | #[aggregate(id = String, error = AggregateError, events(FundsDeposited), event_enum = EventEnum)]
+   |                                                                                       ^^^^^^^^^

@@ -1,0 +1,7 @@
+error: Missing field `id`
+  --> tests/ui/fail/aggregate_missing_id.rs:22:10
+   |
+22 | #[derive(Aggregate)]
+   |          ^^^^^^^^^
+   |
+   = note: this error originates in the derive macro `Aggregate` (in Nightly builds, run with -Z macro-backtrace for more info)
