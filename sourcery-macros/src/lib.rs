@@ -10,6 +10,7 @@ use proc_macro2::TokenStream as TokenStream2;
 use quote::{ToTokens, quote};
 use syn::{DeriveInput, Ident, Path, parse_macro_input};
 
+#[allow(clippy::doc_markdown, reason = "false positive")]
 /// Build a PascalCase enum variant name from a type path.
 fn path_to_pascal_ident(path: &Path) -> Ident {
     let mut combined = String::new();
