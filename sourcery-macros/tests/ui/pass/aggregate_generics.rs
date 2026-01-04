@@ -1,6 +1,6 @@
 extern crate self as sourcery;
 
-#[path = "support.rs"]
+#[path = "../common.rs"]
 mod support;
 
 pub use support::{codec, store, Aggregate, Apply, Projection};

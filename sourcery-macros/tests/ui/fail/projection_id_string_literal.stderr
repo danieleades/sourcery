@@ -2,4 +2,4 @@ error: Unsupported shape `expected `key = Type``
   --> tests/ui/fail/projection_id_string_literal.rs:11:14
    |
 11 | #[projection(id = "String")]
-   |              ^^^^^^^^^^^^^
+   |              ^^
