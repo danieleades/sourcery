@@ -28,7 +28,16 @@ jobs:
         with:
           toolchain: ${{ matrix.rust }}
       - name: Run tests
-        run: cargo test --all --all-features -- ${{ matrix.skip_tests }}
+        # Exclude sourcery-postgres integration tests (require Docker)
+        run: cargo test --workspace --exclude sourcery-postgres --all-features -- ${{ matrix.skip_tests }}
+
+  integration-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run PostgreSQL integration tests
+        run: cargo test -p sourcery-postgres --all-features
 
   format:
     runs-on: ubuntu-latest
@@ -101,6 +110,7 @@ jobs:
     needs:
       [
         test,
+        integration-tests,
         format,
         lint,
         msrv,

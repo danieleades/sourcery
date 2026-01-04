@@ -1,7 +1,15 @@
-//! Postgres-backed event store implementation.
+//! Postgres-backed event sourcing implementations.
 //!
-//! This crate provides [`PostgresEventStore`], an implementation of
-//! [`sourcery_core::store::EventStore`] for `PostgreSQL`.
+//! This crate provides `PostgreSQL` implementations of the core Sourcery
+//! traits:
+//!
+//! - [`Store`] - An implementation of [`sourcery_core::store::EventStore`]
+//! - [`snapshot::Store`] - An implementation of
+//!   [`sourcery_core::snapshot::SnapshotStore`]
+//!
+//! Both use the same database and can share a connection pool.
+
+pub mod snapshot;
 
 use std::marker::PhantomData;
 
@@ -191,7 +199,7 @@ where
         .await
         .map_err(|e| AppendError::store(Error::Database(e)))?;
 
-        let current: Option<i64> = sqlx::query_scalar(
+        let current: Option<i64> = sqlx::query_scalar::<_, Option<i64>>(
             r"
                 SELECT last_position
                 FROM es_streams
@@ -354,7 +362,7 @@ where
         .await
         .map_err(|e| AppendError::store(Error::Database(e)))?;
 
-        let current: Option<i64> = sqlx::query_scalar(
+        let current: Option<i64> = sqlx::query_scalar::<_, Option<i64>>(
             r"
                 SELECT last_position
                 FROM es_streams
@@ -364,7 +372,7 @@ where
         )
         .bind(aggregate_kind)
         .bind(aggregate_id)
-        .fetch_optional(&mut *tx)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|e| AppendError::store(Error::Database(e)))?;
 
