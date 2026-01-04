@@ -11,7 +11,6 @@ pub use sourcery_core::{
     projection::{ApplyProjection, Projection},
     repository,
     repository::Repository,
-    snapshot,
 };
 // Re-export proc macro derives so consumers only depend on `sourcery`.
 pub use sourcery_macros::{Aggregate, Projection};
@@ -30,4 +29,18 @@ pub mod store {
     }
 
     pub use sourcery_core::store::inmemory;
+}
+
+pub mod snapshot {
+
+    pub use sourcery_core::snapshot::{
+        InMemorySnapshotStore, NoSnapshots, OfferSnapshotError, Snapshot, SnapshotOffer,
+        SnapshotStore,
+    };
+
+    #[cfg(feature = "postgres")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "postgres")))]
+    pub mod postgres {
+        pub use sourcery_postgres::snapshot::{Error, Store};
+    }
 }
