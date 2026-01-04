@@ -10,11 +10,7 @@ use proc_macro2::TokenStream as TokenStream2;
 use quote::{ToTokens, quote};
 use syn::{DeriveInput, Ident, Path, parse_macro_input};
 
-/// Converts a `PascalCase` or `camelCase` string to `kebab-case`.
-fn to_kebab_case(s: &str) -> String {
-    s.to_kebab_case()
-}
-
+/// Build a PascalCase enum variant name from a type path.
 fn path_to_pascal_ident(path: &Path) -> Ident {
     let mut combined = String::new();
     for (index, segment) in path.segments.iter().enumerate() {
@@ -31,16 +27,18 @@ fn path_to_pascal_ident(path: &Path) -> Ident {
     Ident::new(&pascal, span)
 }
 
+/// Parse `key = Type` meta items into a `syn::Type`.
 fn parse_name_value_type(item: &syn::Meta) -> darling::Result<syn::Type> {
-    if let syn::Meta::NameValue(nv) = item {
-        return syn::parse2(nv.value.to_token_stream())
-            .map_err(|_| darling::Error::unsupported_shape("expected `key = Type`"));
-    }
-    Err(darling::Error::unsupported_shape("expected `key = Type`"))
+    let error = || darling::Error::unsupported_shape("expected `key = Type`");
+    let syn::Meta::NameValue(nv) = item else {
+        return Err(error());
+    };
+    syn::parse2(nv.value.to_token_stream()).map_err(|_| error())
 }
 
+/// Returns the kind override or the default kebab-case name from the ident.
 fn default_kind(ident: &Ident, kind: Option<String>) -> String {
-    kind.unwrap_or_else(|| to_kebab_case(&ident.to_string()))
+    kind.unwrap_or_else(|| ident.to_string().to_kebab_case())
 }
 
 /// Wrapper for `syn::Path` that parses from `key = Type` syntax.
@@ -96,12 +94,14 @@ struct ProjectionArgs {
     kind: Option<String>,
 }
 
+/// Captures the event type path and its generated enum variant identifier.
 struct EventSpec<'a> {
     path: &'a Path,
     variant: Ident,
 }
 
 impl<'a> EventSpec<'a> {
+    /// Build an event spec from a type path.
     fn new(path: &'a Path) -> Self {
         Self {
             path,
@@ -110,6 +110,7 @@ impl<'a> EventSpec<'a> {
     }
 }
 
+/// Parse derive input with darling and render errors as tokens.
 fn parse_or_error<T, F>(input: &DeriveInput, f: F) -> TokenStream2
 where
     T: FromDeriveInput,
@@ -163,10 +164,12 @@ pub fn derive_aggregate(input: TokenStream) -> TokenStream {
     derive_aggregate_impl(&input).into()
 }
 
+/// Internal entry point that returns tokens for the aggregate derive.
 fn derive_aggregate_impl(input: &DeriveInput) -> TokenStream2 {
     parse_or_error::<AggregateArgs, _>(input, |args| generate_aggregate_impl(args, input))
 }
 
+/// Generate the aggregate derive implementation tokens.
 fn generate_aggregate_impl(args: AggregateArgs, input: &DeriveInput) -> TokenStream2 {
     let event_specs: Vec<EventSpec<'_>> = args.events.iter().map(EventSpec::new).collect();
 
@@ -286,10 +289,12 @@ pub fn derive_projection(input: TokenStream) -> TokenStream {
     derive_projection_impl(&input).into()
 }
 
+/// Internal entry point that returns tokens for the projection derive.
 fn derive_projection_impl(input: &DeriveInput) -> TokenStream2 {
     parse_or_error::<ProjectionArgs, _>(input, |args| generate_projection_impl(args, input))
 }
 
+/// Generate the projection derive implementation tokens.
 fn generate_projection_impl(args: ProjectionArgs, input: &DeriveInput) -> TokenStream2 {
     let struct_name = &args.ident;
     let id_type = &args.id.0;
@@ -322,6 +327,7 @@ mod tests {
 
     use super::*;
 
+    /// Normalize token output by removing whitespace.
     fn compact(tokens: &TokenStream2) -> String {
         tokens
             .to_string()
@@ -331,12 +337,7 @@ mod tests {
     }
 
     #[test]
-    fn to_kebab_case_converts_pascal_and_camel() {
-        assert_eq!(to_kebab_case("BankAccount"), "bank-account");
-        assert_eq!(to_kebab_case("camelCase"), "camel-case");
-    }
-
-    #[test]
+    /// Verifies path parsing for `id = Type` syntax.
     fn type_path_parses_name_value_path() {
         let meta: syn::Meta = parse_quote!(id = String);
         let parsed = TypePath::from_meta(&meta).unwrap();
@@ -344,6 +345,7 @@ mod tests {
     }
 
     #[test]
+    /// Ensures non-path values are rejected for `TypePath`.
     fn type_path_rejects_non_path_value() {
         let meta: syn::Meta = parse_quote!(id = "String");
         let err = TypePath::from_meta(&meta).unwrap_err();
@@ -351,6 +353,7 @@ mod tests {
     }
 
     #[test]
+    /// Confirms default kind and event enum names are generated.
     fn generate_aggregate_impl_uses_default_kind_and_event_enum() {
         let input: DeriveInput = parse_quote! {
             #[aggregate(id = String, error = String, events(FundsDeposited))]
@@ -368,6 +371,7 @@ mod tests {
     }
 
     #[test]
+    /// Confirms explicit kind and enum overrides are honored.
     fn generate_aggregate_impl_respects_kind_and_event_enum_overrides() {
         let input: DeriveInput = parse_quote! {
             #[aggregate(
@@ -390,6 +394,7 @@ mod tests {
     }
 
     #[test]
+    /// Ensures empty event lists yield a compile-time error.
     fn generate_aggregate_impl_emits_error_on_empty_events_list() {
         let input: DeriveInput = parse_quote! {
             #[aggregate(id = String, error = String, events())]
@@ -403,6 +408,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies `TypeValue` accepts name-value type syntax.
     fn type_value_parses_name_value_type() {
         let meta: syn::Meta = parse_quote!(id = ());
         let parsed = TypeValue::from_meta(&meta).unwrap();
@@ -410,6 +416,7 @@ mod tests {
     }
 
     #[test]
+    /// Confirms default kind and type defaults for projections.
     fn generate_projection_impl_uses_default_kind_and_types() {
         let input: DeriveInput = parse_quote! {
             #[projection(id = String)]
@@ -426,6 +433,7 @@ mod tests {
     }
 
     #[test]
+    /// Confirms projection overrides are honored.
     fn generate_projection_impl_respects_overrides() {
         let input: DeriveInput = parse_quote! {
             #[projection(
