@@ -9,7 +9,7 @@ Sourcery is a well-engineered, thoughtfully designed event-sourcing library with
 | Priority | Feature | Impact |
 |----------|---------|--------|
 | 1 | Event Subscriptions/Streaming | Projections must be fully rebuilt on every read |
-| 2 | Durable PostgreSQL Snapshot Store | Snapshots lost on restart, defeating their purpose |
+| 2 | Durable Snapshot Store Implementation | No production-ready implementation provided |
 | 3 | Outbox Pattern | No reliable integration with external systems |
 
 ---
@@ -88,25 +88,27 @@ pub async fn load_for(
 
 ---
 
-## 2. Durable PostgreSQL Snapshot Store (High)
+## 2. No Durable Snapshot Store Implementation Provided (High)
 
 ### What's Missing
 
-While Sourcery provides a PostgreSQL **event store** (`sourcery-postgres`), there is **no PostgreSQL snapshot store**. The only snapshot implementations are:
+Sourcery has **full snapshot support** for both aggregates and projections via the `SnapshotStore` trait. However, **no durable implementation is provided**:
 
 | Implementation | Durability | Production Ready |
 |---------------|------------|------------------|
-| `NoSnapshots` | N/A | No (no snapshots) |
+| `NoSnapshots` | N/A | N/A (opt-out) |
 | `InMemorySnapshotStore` | Memory only | No (lost on restart) |
-| `PostgresSnapshotStore` | **Missing** | - |
+| `PostgresSnapshotStore` | **Not provided** | - |
+
+The snapshot *mechanism* is complete - what's missing is a production-ready *implementation*.
 
 ### Why This Matters for Production
 
-Snapshots exist to optimize aggregate loading. Without durable snapshots:
+Without a durable snapshot store implementation:
 
-1. **Snapshots lost on restart** - All optimization work disappears
-2. **Cold starts replay all events** - An aggregate with 10,000 events replays all 10,000 on first load after restart
-3. **Snapshot policies useless** - Even with `EveryNEvents(100)`, snapshots vanish
+1. **Users must implement their own** - Duplicating work for every production deployment
+2. **Snapshots lost on restart** - In-memory snapshots vanish, negating their benefit
+3. **Cold starts replay all events** - An aggregate with 10,000 events replays all 10,000 after restart
 
 ### What's Needed
 
@@ -241,7 +243,7 @@ From `design-decisions.md:114-137`:
 ### Immediate Actions (Blocking Production)
 
 1. **Event Subscriptions** - Add `subscribe()` API with catch-up and live modes
-2. **PostgresSnapshotStore** - Mirror the existing PostgreSQL event store pattern
+2. **PostgresSnapshotStore** - Provide a durable `SnapshotStore` implementation (trait already exists)
 
 ### Near-Term (Enables Integration)
 
