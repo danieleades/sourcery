@@ -89,7 +89,7 @@ jobs:
         with:
           components: llvm-tools-preview
       - uses: taiki-e/install-action@cargo-llvm-cov
-      - run: cargo llvm-cov --all-features --doctests --workspace  --skip ui --lcov --output-path lcov.info
+      - run: cargo llvm-cov --all-features --doctests --workspace --lcov --output-path lcov.info -- --skip ui
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5
         with:
