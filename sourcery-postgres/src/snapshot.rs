@@ -76,7 +76,8 @@ impl SnapshotPolicy {
 ///
 /// # Schema
 ///
-/// The store uses the following table schema (created by [`migrate()`](Self::migrate)):
+/// The store uses the following table schema (created by
+/// [`migrate()`](Self::migrate)):
 ///
 /// ```sql
 /// CREATE TABLE IF NOT EXISTS es_snapshots (
@@ -225,9 +226,10 @@ impl SnapshotStore<uuid::Uuid> for Store {
         id: &'a uuid::Uuid,
         events_since_last_snapshot: u64,
         create_snapshot: Create,
-    ) -> impl std::future::Future<Output = Result<SnapshotOffer, OfferSnapshotError<Self::Error, CE>>>
-           + Send
-           + 'a
+    ) -> impl std::future::Future<
+        Output = Result<SnapshotOffer, OfferSnapshotError<Self::Error, CE>>,
+    > + Send
+    + 'a
     where
         CE: std::error::Error + Send + Sync + 'static,
         Create: FnOnce() -> Result<Snapshot<Self::Position>, CE> + 'a,

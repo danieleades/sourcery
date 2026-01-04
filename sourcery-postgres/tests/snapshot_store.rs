@@ -453,6 +453,8 @@ async fn create_snapshot_error_is_propagated() {
 
     assert!(matches!(
         result,
-        Err(sourcery_core::snapshot::OfferSnapshotError::Create(CreateError))
+        Err(sourcery_core::snapshot::OfferSnapshotError::Create(
+            CreateError
+        ))
     ));
 }

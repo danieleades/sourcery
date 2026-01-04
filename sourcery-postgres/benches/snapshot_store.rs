@@ -1,21 +1,23 @@
 //! Benchmarks for the `PostgreSQL` snapshot store.
 //!
-//! These benchmarks require Docker to be running and will spin up a `PostgreSQL`
-//! container using testcontainers.
+//! These benchmarks require Docker to be running and will spin up a
+//! `PostgreSQL` container using testcontainers.
 //!
 //! Run with: `cargo bench -p sourcery-postgres`
+
+use std::sync::OnceLock;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use sourcery_core::snapshot::{Snapshot, SnapshotStore};
 use sourcery_postgres::snapshot::Store;
 use sqlx::PgPool;
-use std::sync::OnceLock;
 use testcontainers::{ContainerAsync, runners::AsyncRunner};
 use testcontainers_modules::postgres::Postgres;
 use tokio::runtime::Runtime;
 use uuid::Uuid;
 
-/// Shared test database for benchmarks (to avoid spinning up containers per benchmark)
+/// Shared test database for benchmarks (to avoid spinning up containers per
+/// benchmark)
 struct BenchDb {
     _container: ContainerAsync<Postgres>,
     pool: PgPool,

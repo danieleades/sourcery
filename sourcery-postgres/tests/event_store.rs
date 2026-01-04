@@ -262,8 +262,7 @@ async fn load_events_with_after_position_filter() {
 
     // Load only events after the first position
     let filters = vec![
-        EventFilter::for_aggregate("test.event", "test.aggregate", id)
-            .after(first.last_position),
+        EventFilter::for_aggregate("test.event", "test.aggregate", id).after(first.last_position),
     ];
 
     let events = store.load_events(&filters).await.unwrap();
