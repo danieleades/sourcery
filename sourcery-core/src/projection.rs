@@ -10,10 +10,9 @@ use thiserror::Error;
 
 use crate::{
     aggregate::Aggregate,
-    codec::{Codec, EventDecodeError, ProjectionEvent},
-    event::DomainEvent,
+    event::{DomainEvent, EventDecodeError, ProjectionEvent},
     snapshot::{Snapshot, SnapshotStore},
-    store::{EventFilter, EventStore, GloballyOrderedStore, StoredEvent},
+    store::{EventFilter, EventStore, GloballyOrderedStore, StoredEventView},
 };
 
 /// Trait implemented by read models that can be constructed from an event
@@ -24,7 +23,7 @@ use crate::{
 /// calling [`Repository::build_projection`] and configuring the desired event
 /// streams before invoking [`ProjectionBuilder::load`].
 // ANCHOR: projection_trait
-pub trait Projection: Default + Sized {
+pub trait Projection: Default {
     /// Stable identifier for this projection type.
     const KIND: &'static str;
     /// Aggregate identifier type this projection is compatible with.
@@ -35,7 +34,7 @@ pub trait Projection: Default + Sized {
     ///
     /// For 'singleton' projections (those for which there is only one global
     /// projection with it's 'KIND') use `()`.
-    type InstanceId: Send + Sync + 'static;
+    type InstanceId;
 }
 // ANCHOR_END: projection_trait
 
@@ -60,46 +59,37 @@ pub trait ApplyProjection<E>: Projection {
 
 /// Errors that can occur when rebuilding a projection.
 #[derive(Debug, Error)]
-pub enum ProjectionError<StoreError, CodecError>
+pub enum ProjectionError<StoreError>
 where
     StoreError: std::error::Error + 'static,
-    CodecError: std::error::Error + 'static,
 {
     #[error("failed to load events: {0}")]
     Store(#[source] StoreError),
-    #[error("failed to decode event kind `{event_kind}`: {error}")]
-    Codec {
-        event_kind: String,
-        #[source]
-        error: CodecError,
-    },
     #[error("failed to decode event: {0}")]
-    EventDecode(#[source] crate::codec::EventDecodeError<CodecError>),
-    #[error("failed to deserialize snapshot: {0}")]
-    SnapshotDeserialize(#[source] CodecError),
+    EventDecode(#[source] EventDecodeError<StoreError>),
 }
 
 /// Type alias for event handler closures.
 #[derive(Debug)]
-enum HandlerError<CodecError> {
-    Codec(CodecError),
-    EventDecode(EventDecodeError<CodecError>),
+enum HandlerError<StoreError> {
+    EventDecode(EventDecodeError<StoreError>),
+    Store(StoreError),
 }
 
-impl<CodecError> From<CodecError> for HandlerError<CodecError> {
-    fn from(error: CodecError) -> Self {
-        Self::Codec(error)
+impl<StoreError> From<StoreError> for HandlerError<StoreError> {
+    fn from(error: StoreError) -> Self {
+        Self::Store(error)
     }
 }
 
 type EventHandler<P, S> = Box<
     dyn Fn(
             &mut P,
-            &<S as EventStore>::Id,
-            &[u8],
-            &<S as EventStore>::Metadata,
-            &<S as EventStore>::Codec,
-        ) -> Result<(), HandlerError<<<S as EventStore>::Codec as Codec>::Error>>
+            &<<S as EventStore>::StoredEvent as StoredEventView>::Id,
+            &<S as EventStore>::StoredEvent,
+            &<<S as EventStore>::StoredEvent as StoredEventView>::Metadata,
+            &S,
+        ) -> Result<(), HandlerError<<S as EventStore>::Error>>
         + Send
         + Sync,
 >;
@@ -109,6 +99,7 @@ pub struct ProjectionBuilder<'a, S, P, SS, Snap = NoSnapshot>
 where
     S: EventStore,
     P: Projection<Id = S::Id>,
+    P::InstanceId: Sync,
     SS: SnapshotStore<P::InstanceId, Position = S::Position>,
 {
     pub(super) store: &'a S,
@@ -127,6 +118,7 @@ impl<'a, S, P, SS, Snap> ProjectionBuilder<'a, S, P, SS, Snap>
 where
     S: EventStore,
     P: Projection<Id = S::Id>,
+    P::InstanceId: Sync,
     SS: SnapshotStore<P::InstanceId, Position = S::Position>,
 {
     pub(super) fn new(store: &'a S, snapshots: &'a SS) -> Self {
@@ -155,15 +147,15 @@ where
     #[must_use]
     pub fn event<E>(mut self) -> Self
     where
-        E: DomainEvent,
+        E: DomainEvent + serde::de::DeserializeOwned,
         P: ApplyProjection<E>,
         S::Metadata: Clone + Into<P::Metadata>,
     {
         self.filters.push(EventFilter::for_event(E::KIND));
         self.handlers.insert(
             E::KIND.to_string(),
-            Box::new(|proj, agg_id, data, metadata, codec| {
-                let event: E = codec.deserialize(data)?;
+            Box::new(|proj, agg_id, stored, metadata, store| {
+                let event: E = store.decode_event(stored)?;
                 let metadata_converted: P::Metadata = metadata.clone().into();
                 ApplyProjection::apply_projection(proj, agg_id, &event, &metadata_converted);
                 Ok(())
@@ -195,9 +187,9 @@ where
             self.filters.push(EventFilter::for_event(kind));
             self.handlers.insert(
                 kind.to_string(),
-                Box::new(move |proj, agg_id, data, metadata, codec| {
+                Box::new(move |proj, agg_id, stored, metadata, store| {
                     let event =
-                        E::from_stored(kind, data, codec).map_err(HandlerError::EventDecode)?;
+                        E::from_stored(stored, store).map_err(HandlerError::EventDecode)?;
                     let metadata_converted: P::Metadata = metadata.clone().into();
                     ApplyProjection::apply_projection(proj, agg_id, &event, &metadata_converted);
                     Ok(())
@@ -222,7 +214,7 @@ where
     pub fn event_for<A, E>(mut self, aggregate_id: &S::Id) -> Self
     where
         A: Aggregate<Id = S::Id>,
-        E: DomainEvent,
+        E: DomainEvent + serde::de::DeserializeOwned,
         P: ApplyProjection<E>,
         S::Metadata: Clone + Into<P::Metadata>,
     {
@@ -233,8 +225,8 @@ where
         ));
         self.handlers.insert(
             E::KIND.to_string(),
-            Box::new(|proj, agg_id, data, metadata, codec| {
-                let event: E = codec.deserialize(data)?;
+            Box::new(|proj, agg_id, stored, metadata, store| {
+                let event: E = store.decode_event(stored)?;
                 let metadata_converted: P::Metadata = metadata.clone().into();
                 ApplyProjection::apply_projection(proj, agg_id, &event, &metadata_converted);
                 Ok(())
@@ -272,8 +264,8 @@ where
             ));
             self.handlers.insert(
                 kind.to_string(),
-                Box::new(move |proj, agg_id, data, metadata, codec| {
-                    let event = <A::Event as ProjectionEvent>::from_stored(kind, data, codec)
+                Box::new(move |proj, agg_id, stored, metadata, store| {
+                    let event = <A::Event as ProjectionEvent>::from_stored(stored, store)
                         .map_err(HandlerError::EventDecode)?;
                     let metadata_converted: P::Metadata = metadata.clone().into();
                     ApplyProjection::apply_projection(proj, agg_id, &event, &metadata_converted);
@@ -289,6 +281,7 @@ impl<'a, S, P, SS> ProjectionBuilder<'a, S, P, SS, NoSnapshot>
 where
     S: EventStore,
     P: Projection<Id = S::Id>,
+    P::InstanceId: Sync,
     SS: SnapshotStore<P::InstanceId, Position = S::Position>,
 {
     /// Enable snapshot loading/saving for this projection.
@@ -317,7 +310,7 @@ where
             handler_count = self.handlers.len()
         )
     )]
-    pub async fn load(self) -> Result<P, ProjectionError<S::Error, <S::Codec as Codec>::Error>>
+    pub async fn load(self) -> Result<P, ProjectionError<S::Error>>
     where
         P: Projection<InstanceId = ()>,
     {
@@ -341,7 +334,7 @@ where
     pub async fn load_for(
         self,
         instance_id: &P::InstanceId,
-    ) -> Result<P, ProjectionError<S::Error, <S::Codec as Codec>::Error>> {
+    ) -> Result<P, ProjectionError<S::Error>> {
         tracing::debug!("loading projection");
 
         let events = self
@@ -349,7 +342,6 @@ where
             .load_events(&self.filters)
             .await
             .map_err(ProjectionError::Store)?;
-        let codec = self.store.codec();
         let mut projection = P::default();
 
         let event_count = events.len();
@@ -358,23 +350,18 @@ where
             "replaying events into projection"
         );
 
-        for stored in events {
-            let StoredEvent {
-                aggregate_id,
-                kind,
-                data,
-                metadata,
-                ..
-            } = stored;
+        for stored in &events {
+            let aggregate_id = stored.aggregate_id();
+            let kind = stored.kind();
+            let metadata = stored.metadata();
 
             // O(1) handler lookup instead of O(n) linear scan
-            if let Some(handler) = self.handlers.get(&kind) {
-                (handler)(&mut projection, &aggregate_id, &data, &metadata, codec).map_err(
+            if let Some(handler) = self.handlers.get(kind) {
+                (handler)(&mut projection, aggregate_id, stored, metadata, self.store).map_err(
                     |error| match error {
-                        HandlerError::Codec(error) => ProjectionError::Codec {
-                            event_kind: kind.clone(),
-                            error,
-                        },
+                        HandlerError::Store(error) => {
+                            ProjectionError::EventDecode(EventDecodeError::Store(error))
+                        }
                         HandlerError::EventDecode(error) => ProjectionError::EventDecode(error),
                     },
                 )?;
@@ -390,10 +377,10 @@ where
 impl<S, P, SS> ProjectionBuilder<'_, S, P, SS, WithSnapshot>
 where
     S: EventStore + GloballyOrderedStore,
-    P: Projection<Id = S::Id> + serde::Serialize + serde::de::DeserializeOwned,
+    P: Projection<Id = S::Id> + serde::Serialize + serde::de::DeserializeOwned + Sync,
     SS: SnapshotStore<P::InstanceId, Position = S::Position>,
     S::Position: Ord,
-    P::InstanceId: Send + Sync + 'static,
+    P::InstanceId: Sync,
 {
     /// Replays the configured events and materializes the projection.
     ///
@@ -409,7 +396,7 @@ where
             handler_count = self.handlers.len()
         )
     )]
-    pub async fn load(self) -> Result<P, ProjectionError<S::Error, <S::Codec as Codec>::Error>>
+    pub async fn load(self) -> Result<P, ProjectionError<S::Error>>
     where
         P: Projection<InstanceId = ()>,
     {
@@ -434,12 +421,12 @@ where
     pub async fn load_for(
         self,
         instance_id: &P::InstanceId,
-    ) -> Result<P, ProjectionError<S::Error, <S::Codec as Codec>::Error>> {
+    ) -> Result<P, ProjectionError<S::Error>> {
         tracing::debug!("loading projection");
 
         let snapshot_result = self
             .snapshots
-            .load(P::KIND, instance_id)
+            .load::<P>(P::KIND, instance_id)
             .await
             .inspect_err(|e| {
                 tracing::error!(error = %e, "failed to load projection snapshot");
@@ -447,12 +434,8 @@ where
             .ok()
             .flatten();
 
-        let codec = self.store.codec();
         let (mut projection, snapshot_position) = if let Some(snapshot) = snapshot_result {
-            let restored: P = codec
-                .deserialize(&snapshot.data)
-                .map_err(ProjectionError::SnapshotDeserialize)?;
-            (restored, Some(snapshot.position))
+            (snapshot.data, Some(snapshot.position))
         } else {
             (P::default(), None)
         };
@@ -460,7 +443,7 @@ where
         let filters = if let Some(position) = snapshot_position {
             self.filters
                 .into_iter()
-                .map(|filter| filter.after(position))
+                .map(|filter| filter.after(position.clone()))
                 .collect::<Vec<_>>()
         } else {
             self.filters
@@ -475,23 +458,18 @@ where
         let event_count = events.len();
         let mut last_position = None;
 
-        for stored in events {
-            let StoredEvent {
-                aggregate_id,
-                kind,
-                data,
-                metadata,
-                position,
-                ..
-            } = stored;
+        for stored in &events {
+            let aggregate_id = stored.aggregate_id();
+            let kind = stored.kind();
+            let metadata = stored.metadata();
+            let position = stored.position();
 
-            if let Some(handler) = self.handlers.get(&kind) {
-                (handler)(&mut projection, &aggregate_id, &data, &metadata, codec).map_err(
+            if let Some(handler) = self.handlers.get(kind) {
+                (handler)(&mut projection, aggregate_id, stored, metadata, self.store).map_err(
                     |error| match error {
-                        HandlerError::Codec(error) => ProjectionError::Codec {
-                            event_kind: kind.clone(),
-                            error,
-                        },
+                        HandlerError::Store(error) => {
+                            ProjectionError::EventDecode(EventDecodeError::Store(error))
+                        }
                         HandlerError::EventDecode(error) => ProjectionError::EventDecode(error),
                     },
                 )?;
@@ -502,16 +480,15 @@ where
         if event_count > 0
             && let Some(position) = last_position
         {
-            let codec = codec.clone();
             let projection_ref = &projection;
             let offer = self.snapshots.offer_snapshot(
                 P::KIND,
                 instance_id,
                 event_count as u64,
-                move || -> Result<Snapshot<S::Position>, <S::Codec as Codec>::Error> {
+                move || -> Result<Snapshot<S::Position, &P>, std::convert::Infallible> {
                     Ok(Snapshot {
                         position,
-                        data: codec.serialize(projection_ref)?,
+                        data: projection_ref,
                     })
                 },
             );
@@ -534,21 +511,10 @@ mod tests {
 
     #[test]
     fn projection_error_display_store_mentions_loading() {
-        let error: ProjectionError<io::Error, io::Error> =
+        let error: ProjectionError<io::Error> =
             ProjectionError::Store(io::Error::new(io::ErrorKind::NotFound, "not found"));
         let msg = error.to_string();
         assert!(msg.contains("failed to load events"));
-        assert!(error.source().is_some());
-    }
-
-    #[test]
-    fn projection_error_display_codec_includes_event_kind() {
-        let error: ProjectionError<io::Error, io::Error> = ProjectionError::Codec {
-            event_kind: "test-event".to_string(),
-            error: io::Error::new(io::ErrorKind::InvalidData, "bad data"),
-        };
-        let msg = error.to_string();
-        assert!(msg.contains("failed to decode event kind `test-event`"));
         assert!(error.source().is_some());
     }
 }

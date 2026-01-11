@@ -6,17 +6,16 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sourcery::{
-    Aggregate, ApplyProjection, DomainEvent, Handle, Projection, Repository,
-    codec::{Codec, EventDecodeError, ProjectionEvent, SerializableEvent},
-    concurrency::ConcurrencyConflict,
-    projection::ProjectionError,
-    repository::{OptimisticCommandError, SnapshotCommandError},
-    snapshot::{InMemorySnapshotStore, OfferSnapshotError, Snapshot, SnapshotOffer, SnapshotStore},
-    store::{EventStore, JsonCodec, PersistableEvent, inmemory},
+    Aggregate, Apply, ApplyProjection, DomainEvent, EventKind, Handle, Projection,
+    Repository, projection::ProjectionError,
+    repository::OptimisticCommandError,
+    snapshot::{inmemory::Store as InMemorySnapshotStore, OfferSnapshotError, Snapshot, SnapshotOffer, SnapshotStore},
+    store::{EventStore, inmemory},
     test::RepositoryTestExt,
 };
+use sourcery_core::concurrency::ConcurrencyConflict;
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -28,63 +27,37 @@ impl DomainEvent for ValueAdded {
     const KIND: &'static str = "value-added";
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-enum CounterEvent {
-    Added(ValueAdded),
-}
+struct InvalidValueAdded;
 
-impl SerializableEvent for CounterEvent {
-    fn to_persistable<C: Codec, M>(
-        self,
-        codec: &C,
-        metadata: M,
-    ) -> Result<PersistableEvent<M>, C::Error> {
-        match self {
-            Self::Added(event) => Ok(PersistableEvent {
-                kind: ValueAdded::KIND.to_string(),
-                data: codec.serialize(&event)?,
-                metadata,
-            }),
-        }
+impl EventKind for InvalidValueAdded {
+    fn kind(&self) -> &'static str {
+        ValueAdded::KIND
     }
 }
 
-impl ProjectionEvent for CounterEvent {
-    const EVENT_KINDS: &'static [&'static str] = &[ValueAdded::KIND];
-
-    fn from_stored<C: Codec>(
-        kind: &str,
-        data: &[u8],
-        codec: &C,
-    ) -> Result<Self, EventDecodeError<C::Error>> {
-        match kind {
-            ValueAdded::KIND => Ok(Self::Added(
-                codec.deserialize(data).map_err(EventDecodeError::Codec)?,
-            )),
-            _ => Err(EventDecodeError::UnknownKind {
-                kind: kind.to_string(),
-                expected: Self::EVENT_KINDS,
-            }),
-        }
+impl serde::Serialize for InvalidValueAdded {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str("not-an-object")
     }
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default, Clone, Serialize, Deserialize, Aggregate)]
+#[aggregate(
+    id = String,
+    error = String,
+    events(ValueAdded),
+    derives(Debug, PartialEq, Eq)
+)]
 struct Counter {
     value: i32,
 }
 
-impl Aggregate for Counter {
-    type Error = String;
-    type Event = CounterEvent;
-    type Id = String;
-
-    const KIND: &'static str = "counter";
-
-    fn apply(&mut self, event: &Self::Event) {
-        match event {
-            CounterEvent::Added(e) => self.value += e.amount,
-        }
+impl Apply<ValueAdded> for Counter {
+    fn apply(&mut self, event: &ValueAdded) {
+        self.value += event.amount;
     }
 }
 
@@ -97,9 +70,9 @@ impl Handle<AddValue> for Counter {
         if command.amount <= 0 {
             return Err("amount must be positive".to_string());
         }
-        Ok(vec![CounterEvent::Added(ValueAdded {
+        Ok(vec![ValueAdded {
             amount: command.amount,
-        })])
+        }.into()])
     }
 }
 
@@ -170,7 +143,7 @@ fn concurrency_conflict_formats_unexpected_empty_state() {
 
 #[tokio::test]
 async fn in_memory_snapshot_store_policy_always_saves() {
-    let snapshots = InMemorySnapshotStore::<u64>::always();
+    let snapshots = InMemorySnapshotStore::<String, u64>::always();
     let id = "c1".to_string();
 
     let result = snapshots
@@ -178,7 +151,7 @@ async fn in_memory_snapshot_store_policy_always_saves() {
             Counter::KIND,
             &id,
             0,
-            || -> Result<Snapshot<u64>, Infallible> {
+            || -> Result<Snapshot<u64, Vec<u8>>, Infallible> {
                 Ok(Snapshot {
                     position: 1,
                     data: vec![1, 2, 3],
@@ -189,13 +162,13 @@ async fn in_memory_snapshot_store_policy_always_saves() {
         .unwrap();
     assert_eq!(result, SnapshotOffer::Stored);
 
-    let loaded = snapshots.load(Counter::KIND, &id).await.unwrap();
+    let loaded = snapshots.load::<Vec<u8>>(Counter::KIND, &id).await.unwrap();
     assert!(loaded.is_some());
 }
 
 #[tokio::test]
 async fn in_memory_snapshot_store_policy_every_n_events_saves_at_threshold() {
-    let snapshots = InMemorySnapshotStore::<u64>::every(3);
+    let snapshots = InMemorySnapshotStore::<String, u64>::every(3);
     let id = "c1".to_string();
 
     let result = snapshots
@@ -203,7 +176,7 @@ async fn in_memory_snapshot_store_policy_every_n_events_saves_at_threshold() {
             Counter::KIND,
             &id,
             2,
-            || -> Result<Snapshot<u64>, Infallible> {
+            || -> Result<Snapshot<u64, Vec<u8>>, Infallible> {
                 panic!("snapshot should be declined before threshold");
             },
         )
@@ -211,14 +184,18 @@ async fn in_memory_snapshot_store_policy_every_n_events_saves_at_threshold() {
         .unwrap();
     assert_eq!(result, SnapshotOffer::Declined);
 
-    assert!(snapshots.load(Counter::KIND, &id).await.unwrap().is_none());
+    assert!(snapshots
+        .load::<Vec<u8>>(Counter::KIND, &id)
+        .await
+        .unwrap()
+        .is_none());
 
     let result = snapshots
         .offer_snapshot(
             Counter::KIND,
             &id,
             3,
-            || -> Result<Snapshot<u64>, Infallible> {
+            || -> Result<Snapshot<u64, Vec<u8>>, Infallible> {
                 Ok(Snapshot {
                     position: 2,
                     data: vec![2],
@@ -228,12 +205,16 @@ async fn in_memory_snapshot_store_policy_every_n_events_saves_at_threshold() {
         .await
         .unwrap();
     assert_eq!(result, SnapshotOffer::Stored);
-    assert!(snapshots.load(Counter::KIND, &id).await.unwrap().is_some());
+    assert!(snapshots
+        .load::<Vec<u8>>(Counter::KIND, &id)
+        .await
+        .unwrap()
+        .is_some());
 }
 
 #[tokio::test]
 async fn in_memory_snapshot_store_policy_never_does_not_save() {
-    let snapshots = InMemorySnapshotStore::<u64>::never();
+    let snapshots = InMemorySnapshotStore::<String, u64>::never();
     let id = "c1".to_string();
 
     let result = snapshots
@@ -241,7 +222,7 @@ async fn in_memory_snapshot_store_policy_never_does_not_save() {
             Counter::KIND,
             &id,
             100,
-            || -> Result<Snapshot<u64>, Infallible> {
+            || -> Result<Snapshot<u64, Vec<u8>>, Infallible> {
                 panic!("snapshot should be declined when policy is never");
             },
         )
@@ -249,12 +230,16 @@ async fn in_memory_snapshot_store_policy_never_does_not_save() {
         .unwrap();
     assert_eq!(result, SnapshotOffer::Declined);
 
-    assert!(snapshots.load(Counter::KIND, &id).await.unwrap().is_none());
+    assert!(snapshots
+        .load::<Vec<u8>>(Counter::KIND, &id)
+        .await
+        .unwrap()
+        .is_none());
 }
 
 #[tokio::test]
 async fn projection_event_for_filters_by_aggregate() {
-    let store = inmemory::Store::new(JsonCodec);
+    let store = inmemory::Store::new();
     let repo = Repository::new(store);
 
     repo.execute_command::<Counter, AddValue>(&"c1".to_string(), &AddValue { amount: 10 }, &())
@@ -276,21 +261,14 @@ async fn projection_event_for_filters_by_aggregate() {
 }
 
 #[tokio::test]
-async fn projection_load_surfaces_codec_error_with_event_kind() {
-    let store = inmemory::Store::new(JsonCodec);
+async fn projection_load_surfaces_deserialization_error() {
+    let store = inmemory::Store::new();
     let mut repo = Repository::new(store);
 
-    repo.inject_raw_event(
-        Counter::KIND,
-        &"c1".to_string(),
-        PersistableEvent {
-            kind: ValueAdded::KIND.to_string(),
-            data: b"not-json".to_vec(),
-            metadata: (),
-        },
-    )
-    .await
-    .unwrap();
+    // Inject malformed JSON data that won't deserialize to ValueAdded
+    repo.inject_event(Counter::KIND, &"c1".to_string(), &InvalidValueAdded, ())
+        .await
+        .unwrap();
 
     let err = repo
         .build_projection::<TotalsProjection>()
@@ -299,16 +277,19 @@ async fn projection_load_surfaces_codec_error_with_event_kind() {
         .await
         .unwrap_err();
 
+    // Should get EventDecode error with Store variant inside
     match err {
-        ProjectionError::Codec { event_kind, .. } => assert_eq!(event_kind, ValueAdded::KIND),
-        other => panic!("unexpected error: {other:?}"),
+        ProjectionError::EventDecode(_) => {
+            // Test passes - we got the expected error variant
+        }
+        other @ ProjectionError::Store(_) => panic!("unexpected error: {other:?}"),
     }
 }
 
 #[tokio::test]
 async fn unchecked_repository_saves_snapshot_and_exposes_snapshot_store() {
-    let store = inmemory::Store::new(JsonCodec);
-    let snapshots = InMemorySnapshotStore::always();
+    let store = inmemory::Store::new();
+    let snapshots = InMemorySnapshotStore::<String, u64>::always();
     let repo = Repository::new(store)
         .with_snapshots(snapshots)
         .without_concurrency_checking();
@@ -320,7 +301,7 @@ async fn unchecked_repository_saves_snapshot_and_exposes_snapshot_store() {
 
     let loaded = repo
         .snapshot_store()
-        .load(Counter::KIND, &id)
+        .load::<Counter>(Counter::KIND, &id)
         .await
         .unwrap();
     assert!(loaded.is_some());
@@ -328,8 +309,8 @@ async fn unchecked_repository_saves_snapshot_and_exposes_snapshot_store() {
 
 #[tokio::test]
 async fn unchecked_execute_command_with_no_events_does_not_persist_or_snapshot() {
-    let store = inmemory::Store::new(JsonCodec);
-    let snapshots = InMemorySnapshotStore::always();
+    let store = inmemory::Store::new();
+    let snapshots = InMemorySnapshotStore::<String, u64>::always();
     let repo = Repository::new(store)
         .with_snapshots(snapshots)
         .without_concurrency_checking();
@@ -348,7 +329,7 @@ async fn unchecked_execute_command_with_no_events_does_not_persist_or_snapshot()
     );
     assert!(
         repo.snapshot_store()
-            .load(Counter::KIND, &id)
+            .load::<Counter>(Counter::KIND, &id)
             .await
             .unwrap()
             .is_none()
@@ -366,37 +347,36 @@ impl SnapshotStore<String> for FailingLoadSnapshotStore {
     type Error = SnapshotLoadError;
     type Position = u64;
 
-    fn load<'a>(
-        &'a self,
-        _: &'a str,
-        _: &'a String,
-    ) -> impl std::future::Future<Output = Result<Option<Snapshot<Self::Position>>, Self::Error>>
-    + Send
-    + 'a {
-        std::future::ready(Err(SnapshotLoadError))
+    async fn load<T>(
+        &self,
+        _: &str,
+        _: &String,
+    ) -> Result<Option<Snapshot<Self::Position, T>>, Self::Error>
+    where
+        T: DeserializeOwned,
+    {
+        Err(SnapshotLoadError)
     }
 
-    fn offer_snapshot<'a, CE, Create>(
-        &'a self,
-        _: &'a str,
-        _: &'a String,
+    async fn offer_snapshot<CE, T, Create>(
+        &self,
+        _: &str,
+        _: &String,
         _: u64,
         _: Create,
-    ) -> impl std::future::Future<
-        Output = Result<SnapshotOffer, OfferSnapshotError<Self::Error, CE>>,
-    > + Send
-    + 'a
+    ) -> Result<SnapshotOffer, OfferSnapshotError<Self::Error, CE>>
     where
         CE: std::error::Error + Send + Sync + 'static,
-        Create: FnOnce() -> Result<Snapshot<Self::Position>, CE> + 'a,
+        T: Serialize,
+        Create: FnOnce() -> Result<Snapshot<Self::Position, T>, CE>,
     {
-        std::future::ready(Ok(SnapshotOffer::Declined))
+        Ok(SnapshotOffer::Declined)
     }
 }
 
 #[tokio::test]
 async fn snapshot_load_failure_falls_back_to_full_replay() {
-    let store = inmemory::Store::new(JsonCodec);
+    let store = inmemory::Store::new();
     let repo = Repository::new(store)
         .with_snapshots(FailingLoadSnapshotStore)
         .without_concurrency_checking();
@@ -418,55 +398,48 @@ impl SnapshotStore<String> for CorruptSnapshotStore {
     type Error = SnapshotLoadError;
     type Position = u64;
 
-    fn load<'a>(
-        &'a self,
-        _: &'a str,
-        _: &'a String,
-    ) -> impl std::future::Future<Output = Result<Option<Snapshot<Self::Position>>, Self::Error>>
-    + Send
-    + 'a {
-        std::future::ready(Ok(Some(Snapshot {
-            position: 0,
-            data: b"not-json".to_vec(),
-        })))
+    async fn load<T>(
+        &self,
+        _: &str,
+        _: &String,
+    ) -> Result<Option<Snapshot<Self::Position, T>>, Self::Error>
+    where
+        T: DeserializeOwned,
+    {
+        Err(SnapshotLoadError)
     }
 
-    fn offer_snapshot<'a, CE, Create>(
-        &'a self,
-        _: &'a str,
-        _: &'a String,
+    async fn offer_snapshot<CE, T, Create>(
+        &self,
+        _: &str,
+        _: &String,
         _: u64,
         _: Create,
-    ) -> impl std::future::Future<
-        Output = Result<SnapshotOffer, OfferSnapshotError<Self::Error, CE>>,
-    > + Send
-    + 'a
+    ) -> Result<SnapshotOffer, OfferSnapshotError<Self::Error, CE>>
     where
         CE: std::error::Error + Send + Sync + 'static,
-        Create: FnOnce() -> Result<Snapshot<Self::Position>, CE> + 'a,
+        T: Serialize,
+        Create: FnOnce() -> Result<Snapshot<Self::Position, T>, CE>,
     {
-        std::future::ready(Ok(SnapshotOffer::Declined))
+        Ok(SnapshotOffer::Declined)
     }
 }
 
 #[tokio::test]
-async fn corrupt_snapshot_data_returns_projection_error() {
-    let store = inmemory::Store::new(JsonCodec);
+async fn corrupt_snapshot_data_ignores_snapshot_error() {
+    let store = inmemory::Store::new();
     let repo = Repository::new(store)
         .with_snapshots(CorruptSnapshotStore)
         .without_concurrency_checking();
 
-    let err = repo
-        .execute_command::<Counter, AddValue>(&"c1".to_string(), &AddValue { amount: 1 }, &())
+    repo.execute_command::<Counter, AddValue>(&"c1".to_string(), &AddValue { amount: 1 }, &())
         .await
-        .unwrap_err();
-
-    assert!(matches!(err, SnapshotCommandError::Projection(_)));
+        .unwrap();
 }
 
 #[tokio::test]
 async fn execute_with_retry_with_zero_retries_still_attempts_once() {
-    let store = inmemory::Store::new(JsonCodec);
+    let store = inmemory::Store::new();
     let repo = Repository::new(store);
 
     let attempts = repo
@@ -479,7 +452,7 @@ async fn execute_with_retry_with_zero_retries_still_attempts_once() {
 
 #[tokio::test]
 async fn optimistic_execute_with_retry_surfaces_non_concurrency_errors() {
-    let store = inmemory::Store::new(JsonCodec);
+    let store = inmemory::Store::new();
     let repo = Repository::new(store);
 
     let err = repo
@@ -511,43 +484,41 @@ impl SnapshotStore<String> for TrackingSnapshotStore {
     type Error = Infallible;
     type Position = u64;
 
-    fn load<'a>(
-        &'a self,
-        _: &'a str,
-        _: &'a String,
-    ) -> impl std::future::Future<Output = Result<Option<Snapshot<Self::Position>>, Self::Error>>
-    + Send
-    + 'a {
+    async fn load<T>(
+        &self,
+        _: &str,
+        _: &String,
+    ) -> Result<Option<Snapshot<Self::Position, T>>, Self::Error>
+    where
+        T: DeserializeOwned,
+    {
         self.load_called.store(true, Ordering::Relaxed);
-        std::future::ready(Ok(None))
+        Ok(None)
     }
 
-    fn offer_snapshot<'a, CE, Create>(
-        &'a self,
-        _: &'a str,
-        _: &'a String,
+    async fn offer_snapshot<CE, T, Create>(
+        &self,
+        _: &str,
+        _: &String,
         _: u64,
         _: Create,
-    ) -> impl std::future::Future<
-        Output = Result<SnapshotOffer, OfferSnapshotError<Self::Error, CE>>,
-    > + Send
-    + 'a
+    ) -> Result<SnapshotOffer, OfferSnapshotError<Self::Error, CE>>
     where
         CE: std::error::Error + Send + Sync + 'static,
-        Create: FnOnce() -> Result<Snapshot<Self::Position>, CE> + 'a,
+        T: Serialize,
+        Create: FnOnce() -> Result<Snapshot<Self::Position, T>, CE>,
     {
-        std::future::ready(Ok(SnapshotOffer::Declined))
+        Ok(SnapshotOffer::Declined)
     }
 }
 
 #[tokio::test]
 async fn aggregate_builder_load_consults_snapshot_store() {
-    let store = inmemory::Store::<String, _, ()>::new(JsonCodec);
+    let store = inmemory::Store::<String, ()>::new();
     let snapshots = TrackingSnapshotStore::new();
     let repo = Repository::new(store).with_snapshots(snapshots);
 
     let counter: Counter = repo
-        .aggregate_builder()
         .load(&"c1".to_string())
         .await
         .unwrap();

@@ -1,17 +1,89 @@
 use std::{
     collections::HashMap,
-    convert::Infallible,
     sync::{Arc, RwLock},
 };
 
 use crate::{
-    codec::Codec,
     concurrency::{ConcurrencyConflict, ConcurrencyStrategy},
     store::{
         AppendError, AppendResult, EventFilter, EventStore, GloballyOrderedStore, NonEmpty,
-        PersistableEvent, StoredEvent, StreamKey, Transaction,
+        StoredEventView, StreamKey, Transaction,
     },
 };
+
+/// Stored event with position and metadata.
+///
+/// This type represents an event that has been persisted to the in-memory store
+/// and can be loaded back. It contains all the information needed to deserialize
+/// the event data and metadata, along with the aggregate identifiers and position.
+///
+/// # Type Parameters
+///
+/// - `Id`: The aggregate ID type (must be `Clone + Eq + Hash + Send + Sync`)
+/// - `M`: The metadata type (must be `Clone + Send + Sync`)
+///
+/// # Fields
+///
+/// All fields are accessible through the [`StoredEventView`](super::StoredEventView)
+/// trait implementation. Use the trait methods rather than accessing fields
+/// directly to maintain compatibility across store implementations.
+#[derive(Clone)]
+pub struct StoredEvent<Id, M> {
+    aggregate_kind: String,
+    aggregate_id: Id,
+    kind: String,
+    position: u64,
+    data: serde_json::Value,
+    metadata: M,
+}
+
+impl<Id, M> StoredEventView for StoredEvent<Id, M> {
+    type Id = Id;
+    type Pos = u64;
+    type Metadata = M;
+
+    fn aggregate_kind(&self) -> &str {
+        &self.aggregate_kind
+    }
+
+    fn aggregate_id(&self) -> &Self::Id {
+        &self.aggregate_id
+    }
+
+    fn kind(&self) -> &str {
+        &self.kind
+    }
+
+    fn position(&self) -> Self::Pos {
+        self.position
+    }
+
+    fn metadata(&self) -> &Self::Metadata {
+        &self.metadata
+    }
+}
+
+/// Staged event awaiting persistence.
+///
+/// This type represents an event that has been serialized and prepared for
+/// persistence but not yet written to the in-memory store. The repository creates
+/// these from domain events, then batches them together for atomic appending.
+///
+/// # Type Parameters
+///
+/// - `M`: The metadata type (must be `Clone + Send + Sync`)
+///
+/// # Internal Use
+///
+/// This type is primarily used by the [`Store`] implementation. Users typically
+/// interact with domain events directly and don't need to create `StagedEvent`
+/// instances manually.
+#[derive(Clone)]
+pub struct StagedEvent<M> {
+    kind: String,
+    data: serde_json::Value,
+    metadata: M,
+}
 
 /// In-memory event store that keeps streams in a hash map.
 ///
@@ -21,30 +93,21 @@ use crate::{
 ///
 /// Generic over:
 /// - `Id`: Aggregate identifier type (must be hashable/equatable for map keys)
-/// - `C`: Serialization codec
 /// - `M`: Metadata type (use `()` when not needed)
 #[derive(Clone)]
-pub struct Store<Id, C, M>
-where
-    C: Codec,
-{
-    codec: C,
+pub struct Store<Id, M> {
     inner: Arc<RwLock<Inner<Id, M>>>,
 }
 
 struct Inner<Id, M> {
-    streams: HashMap<StreamKey<Id>, Vec<StoredEvent<Id, u64, M>>>,
+    streams: HashMap<StreamKey<Id>, Vec<StoredEvent<Id, M>>>,
     next_position: u64,
 }
 
-impl<Id, C, M> Store<Id, C, M>
-where
-    C: Codec,
-{
+impl<Id, M> Store<Id, M> {
     #[must_use]
-    pub fn new(codec: C) -> Self {
+    pub fn new() -> Self {
         Self {
-            codec,
             inner: Arc::new(RwLock::new(Inner {
                 streams: HashMap::new(),
                 next_position: 0,
@@ -53,34 +116,52 @@ where
     }
 }
 
-/// Infallible error type that implements `std::error::Error`.
-///
-/// Used by [`InMemoryEventStore`] which cannot fail.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("infallible")]
-pub enum InMemoryError {}
-
-impl From<Infallible> for InMemoryError {
-    fn from(x: Infallible) -> Self {
-        match x {}
+impl<Id, M> Default for Store<Id, M> {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
-impl<Id, C, M> EventStore for Store<Id, C, M>
+/// Error type for in-memory store.
+#[derive(Debug, thiserror::Error)]
+pub enum InMemoryError {
+    #[error("serialization error: {0}")]
+    Serialization(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
+    #[error("deserialization error: {0}")]
+    Deserialization(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
+}
+
+impl<Id, M> EventStore for Store<Id, M>
 where
     Id: Clone + Eq + std::hash::Hash + Send + Sync + 'static,
-    C: Codec + Clone + Send + Sync + 'static,
     M: Clone + Send + Sync + 'static,
 {
-    type Codec = C;
-    // Global sequence for chronological ordering
     type Error = InMemoryError;
     type Id = Id;
     type Metadata = M;
     type Position = u64;
+    type StoredEvent = StoredEvent<Id, M>;
+    type StagedEvent = StagedEvent<M>;
 
-    fn codec(&self) -> &Self::Codec {
-        &self.codec
+    fn stage_event<E>(&self, event: &E, metadata: Self::Metadata) -> Result<Self::StagedEvent, Self::Error>
+    where
+        E: crate::event::EventKind + serde::Serialize,
+    {
+        let data = serde_json::to_value(event)
+            .map_err(|e| InMemoryError::Serialization(Box::new(e)))?;
+        Ok(StagedEvent {
+            kind: event.kind().to_string(),
+            data,
+            metadata,
+        })
+    }
+
+    fn decode_event<E>(&self, stored: &Self::StoredEvent) -> Result<E, Self::Error>
+    where
+        E: crate::event::DomainEvent + serde::de::DeserializeOwned,
+    {
+        serde_json::from_value(stored.data.clone())
+            .map_err(|e| InMemoryError::Deserialization(Box::new(e)))
     }
 
     #[tracing::instrument(skip(self, aggregate_id))]
@@ -121,7 +202,7 @@ where
         aggregate_kind: &'a str,
         aggregate_id: &'a Self::Id,
         expected_version: Option<u64>,
-        events: NonEmpty<PersistableEvent<Self::Metadata>>,
+        events: NonEmpty<Self::StagedEvent>,
     ) -> impl Future<Output = Result<AppendResult<u64>, AppendError<u64, Self::Error>>> + Send + 'a
     {
         let event_count = events.len();
@@ -147,22 +228,25 @@ where
 
             let stream_key = StreamKey::new(aggregate_kind, aggregate_id.clone());
             let mut last_position = None;
-            let stored: Vec<StoredEvent<Id, u64, M>> = events
-                .into_iter()
-                .map(|e| {
-                    let position = inner.next_position;
-                    inner.next_position += 1;
-                    last_position = Some(position);
-                    StoredEvent {
-                        aggregate_kind: aggregate_kind.to_string(),
-                        aggregate_id: aggregate_id.clone(),
-                        kind: e.kind,
-                        position,
-                        data: e.data,
-                        metadata: e.metadata,
-                    }
-                })
-                .collect();
+            let mut stored = Vec::with_capacity(events.len());
+            for e in events {
+                let position = inner.next_position;
+                inner.next_position += 1;
+                last_position = Some(position);
+                let StagedEvent {
+                    kind,
+                    data,
+                    metadata,
+                } = e;
+                stored.push(StoredEvent {
+                    aggregate_kind: aggregate_kind.to_string(),
+                    aggregate_id: aggregate_id.clone(),
+                    kind,
+                    position,
+                    data,
+                    metadata,
+                });
+            }
 
             inner.streams.entry(stream_key).or_default().extend(stored);
             drop(inner);
@@ -180,7 +264,7 @@ where
         &'a self,
         aggregate_kind: &'a str,
         aggregate_id: &'a Self::Id,
-        events: NonEmpty<PersistableEvent<Self::Metadata>>,
+        events: NonEmpty<Self::StagedEvent>,
     ) -> impl Future<Output = Result<AppendResult<u64>, AppendError<u64, Self::Error>>> + Send + 'a
     {
         let event_count = events.len();
@@ -210,22 +294,25 @@ where
             // Stream is empty, proceed with append (no further version check needed)
             let stream_key = StreamKey::new(aggregate_kind, aggregate_id.clone());
             let mut last_position = None;
-            let stored: Vec<StoredEvent<Id, u64, M>> = events
-                .into_iter()
-                .map(|e| {
-                    let position = inner.next_position;
-                    inner.next_position += 1;
-                    last_position = Some(position);
-                    StoredEvent {
-                        aggregate_kind: aggregate_kind.to_string(),
-                        aggregate_id: aggregate_id.clone(),
-                        kind: e.kind,
-                        position,
-                        data: e.data,
-                        metadata: e.metadata,
-                    }
-                })
-                .collect();
+            let mut stored = Vec::with_capacity(events.len());
+            for e in events {
+                let position = inner.next_position;
+                inner.next_position += 1;
+                last_position = Some(position);
+                let StagedEvent {
+                    kind,
+                    data,
+                    metadata,
+                } = e;
+                stored.push(StoredEvent {
+                    aggregate_kind: aggregate_kind.to_string(),
+                    aggregate_id: aggregate_id.clone(),
+                    kind,
+                    position,
+                    data,
+                    metadata,
+                });
+            }
 
             inner.streams.entry(stream_key).or_default().extend(stored);
             drop(inner);
@@ -245,7 +332,7 @@ where
     fn load_events<'a>(
         &'a self,
         filters: &'a [EventFilter<Self::Id, Self::Position>],
-    ) -> impl Future<Output = Result<Vec<StoredEvent<Id, u64, M>>, Self::Error>> + Send + 'a {
+    ) -> impl Future<Output = Result<Vec<Self::StoredEvent>, Self::Error>> + Send + 'a {
         use std::collections::HashSet;
 
         let inner = self.inner.read().expect("in-memory store lock poisoned");
@@ -270,7 +357,7 @@ where
 
         // Helper to check position filter for a specific after_position constraint
         let passes_position_filter =
-            |event: &StoredEvent<Id, u64, M>, after_position: Option<u64>| -> bool {
+            |event: &StoredEvent<Id, M>, after_position: Option<u64>| -> bool {
                 after_position.is_none_or(|after| event.position > after)
             };
 
@@ -328,10 +415,9 @@ where
     }
 }
 
-impl<Id, C, M> GloballyOrderedStore for Store<Id, C, M>
+impl<Id, M> GloballyOrderedStore for Store<Id, M>
 where
     Id: Clone + Eq + std::hash::Hash + Send + Sync + 'static,
-    C: Codec + Clone + Send + Sync + 'static,
     M: Clone + Send + Sync + 'static,
 {
 }

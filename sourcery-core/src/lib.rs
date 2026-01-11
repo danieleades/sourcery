@@ -1,5 +1,4 @@
 pub mod aggregate;
-pub mod codec;
 pub mod concurrency;
 pub mod event;
 pub mod projection;

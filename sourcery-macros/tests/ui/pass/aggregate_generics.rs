@@ -1,20 +1,22 @@
 extern crate self as sourcery;
+extern crate serde_json;
 
 #[path = "../common.rs"]
 mod support;
 
-pub use support::{codec, store, Aggregate, Apply, Projection};
+pub use support::{codec, event, store, Aggregate, Apply, ProjectionEvent, Projection};
 
+use event::DomainEvent;
 use serde::{Deserialize, Serialize};
 use sourcery_macros::Aggregate;
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FundsDeposited {
     pub amount: i64,
 }
 
-impl FundsDeposited {
-    pub const KIND: &'static str = "funds-deposited";
+impl DomainEvent for FundsDeposited {
+    const KIND: &'static str = "funds-deposited";
 }
 
 pub struct AggregateError;

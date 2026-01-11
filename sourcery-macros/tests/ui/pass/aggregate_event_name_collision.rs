@@ -1,32 +1,34 @@
 extern crate self as sourcery;
+extern crate serde_json;
 
 #[path = "../common.rs"]
 mod support;
 
-pub use support::{codec, store, Aggregate, Apply, Projection};
+pub use support::{codec, event, store, Aggregate, Apply, ProjectionEvent, Projection};
 
+use event::DomainEvent;
 use serde::{Deserialize, Serialize};
 use sourcery_macros::Aggregate;
 
 mod foo {
-    use super::{Deserialize, Serialize};
+    use super::{DomainEvent, Deserialize, Serialize};
 
-    #[derive(Clone, Serialize, Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
     pub struct Event;
 
-    impl Event {
-        pub const KIND: &'static str = "foo-event";
+    impl DomainEvent for Event {
+        const KIND: &'static str = "foo-event";
     }
 }
 
 mod bar {
-    use super::{Deserialize, Serialize};
+    use super::{DomainEvent, Deserialize, Serialize};
 
-    #[derive(Clone, Serialize, Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
     pub struct Event;
 
-    impl Event {
-        pub const KIND: &'static str = "bar-event";
+    impl DomainEvent for Event {
+        const KIND: &'static str = "bar-event";
     }
 }
 

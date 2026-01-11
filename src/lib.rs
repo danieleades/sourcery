@@ -5,12 +5,12 @@ pub use sourcery_core::test;
 pub use sourcery_core::{
     aggregate,
     aggregate::{Aggregate, Apply, Handle},
-    codec, concurrency,
-    event::DomainEvent,
+    event,
+    event::{DomainEvent, EventDecodeError, EventKind, ProjectionEvent},
     projection,
     projection::{ApplyProjection, Projection},
     repository,
-    repository::Repository,
+    repository::{DefaultRepository, Repository, SnapshotRepository, UncheckedRepository},
 };
 // Re-export proc macro derives so consumers only depend on `sourcery`.
 pub use sourcery_macros::{Aggregate, Projection};
@@ -18,8 +18,8 @@ pub use sourcery_macros::{Aggregate, Projection};
 pub mod store {
 
     pub use sourcery_core::store::{
-        AppendError, AppendResult, EventFilter, EventStore, GloballyOrderedStore, JsonCodec,
-        NonEmpty, PersistableEvent, StoredEvent, Transaction,
+        AppendError, AppendResult, EventFilter, EventStore, GloballyOrderedStore,
+        NonEmpty, StoredEventView, Transaction,
     };
 
     #[cfg(feature = "postgres")]
@@ -34,9 +34,11 @@ pub mod store {
 pub mod snapshot {
 
     pub use sourcery_core::snapshot::{
-        InMemorySnapshotStore, NoSnapshots, OfferSnapshotError, Snapshot, SnapshotOffer,
+        NoSnapshots, OfferSnapshotError, Snapshot, SnapshotOffer,
         SnapshotStore,
     };
+
+    pub use sourcery_core::snapshot::inmemory;
 
     #[cfg(feature = "postgres")]
     #[cfg_attr(docsrs, doc(cfg(feature = "postgres")))]

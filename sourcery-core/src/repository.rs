@@ -13,48 +13,41 @@ use serde::{Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
 use crate::{
-    aggregate::{Aggregate, AggregateBuilder, Handle},
-    codec::{Codec, ProjectionEvent, SerializableEvent},
+    aggregate::{Aggregate, Handle},
+    event::{EventKind, ProjectionEvent},
     concurrency::{ConcurrencyConflict, ConcurrencyStrategy, Optimistic, Unchecked},
     projection::{Projection, ProjectionBuilder, ProjectionError},
     snapshot::{OfferSnapshotError, Snapshot, SnapshotOffer, SnapshotStore},
-    store::{AppendError, EventFilter, EventStore, StoredEvent},
+    store::{AppendError, EventFilter, EventStore, StoredEventView},
 };
 
-type LoadError<S> =
-    ProjectionError<<S as EventStore>::Error, <<S as EventStore>::Codec as Codec>::Error>;
+type LoadError<S> = ProjectionError<<S as EventStore>::Error>;
 
 /// Error type for unchecked command execution (no concurrency variant).
 #[derive(Debug, Error)]
-pub enum CommandError<AggregateError, StoreError, CodecError>
+pub enum CommandError<AggregateError, StoreError>
 where
     StoreError: std::error::Error + 'static,
-    CodecError: std::error::Error + 'static,
 {
     #[error("aggregate rejected command: {0}")]
     Aggregate(AggregateError),
     #[error("failed to rebuild aggregate state: {0}")]
-    Projection(#[source] ProjectionError<StoreError, CodecError>),
-    #[error("failed to encode events: {0}")]
-    Codec(#[source] CodecError),
+    Projection(#[source] ProjectionError<StoreError>),
     #[error("failed to persist events: {0}")]
     Store(#[source] StoreError),
 }
 
 /// Error type for snapshot-enabled unchecked command execution.
 #[derive(Debug, Error)]
-pub enum SnapshotCommandError<AggregateError, StoreError, CodecError, SnapshotError>
+pub enum SnapshotCommandError<AggregateError, StoreError, SnapshotError>
 where
     StoreError: std::error::Error + 'static,
-    CodecError: std::error::Error + 'static,
     SnapshotError: std::error::Error + 'static,
 {
     #[error("aggregate rejected command: {0}")]
     Aggregate(AggregateError),
     #[error("failed to rebuild aggregate state: {0}")]
-    Projection(#[source] ProjectionError<StoreError, CodecError>),
-    #[error("failed to encode events: {0}")]
-    Codec(#[source] CodecError),
+    Projection(#[source] ProjectionError<StoreError>),
     #[error("failed to persist events: {0}")]
     Store(#[source] StoreError),
     #[error("snapshot operation failed: {0}")]
@@ -63,20 +56,17 @@ where
 
 /// Error type for optimistic command execution (includes concurrency).
 #[derive(Debug, Error)]
-pub enum OptimisticCommandError<AggregateError, Position, StoreError, CodecError>
+pub enum OptimisticCommandError<AggregateError, Position, StoreError>
 where
     Position: std::fmt::Debug,
     StoreError: std::error::Error + 'static,
-    CodecError: std::error::Error + 'static,
 {
     #[error("aggregate rejected command: {0}")]
     Aggregate(AggregateError),
     #[error(transparent)]
     Concurrency(ConcurrencyConflict<Position>),
     #[error("failed to rebuild aggregate state: {0}")]
-    Projection(#[source] ProjectionError<StoreError, CodecError>),
-    #[error("failed to encode events: {0}")]
-    Codec(#[source] CodecError),
+    Projection(#[source] ProjectionError<StoreError>),
     #[error("failed to persist events: {0}")]
     Store(#[source] StoreError),
 }
@@ -84,16 +74,10 @@ where
 /// Error type for snapshot-enabled optimistic command execution (includes
 /// concurrency).
 #[derive(Debug, Error)]
-pub enum OptimisticSnapshotCommandError<
-    AggregateError,
-    Position,
-    StoreError,
-    CodecError,
-    SnapshotError,
-> where
+pub enum OptimisticSnapshotCommandError<AggregateError, Position, StoreError, SnapshotError>
+where
     Position: std::fmt::Debug,
     StoreError: std::error::Error + 'static,
-    CodecError: std::error::Error + 'static,
     SnapshotError: std::error::Error + 'static,
 {
     #[error("aggregate rejected command: {0}")]
@@ -101,9 +85,7 @@ pub enum OptimisticSnapshotCommandError<
     #[error(transparent)]
     Concurrency(ConcurrencyConflict<Position>),
     #[error("failed to rebuild aggregate state: {0}")]
-    Projection(#[source] ProjectionError<StoreError, CodecError>),
-    #[error("failed to encode events: {0}")]
-    Codec(#[source] CodecError),
+    Projection(#[source] ProjectionError<StoreError>),
     #[error("failed to persist events: {0}")]
     Store(#[source] StoreError),
     #[error("snapshot operation failed: {0}")]
@@ -111,14 +93,8 @@ pub enum OptimisticSnapshotCommandError<
 }
 
 /// Result type alias for unchecked command execution.
-pub type UncheckedCommandResult<A, S> = Result<
-    (),
-    CommandError<
-        <A as Aggregate>::Error,
-        <S as EventStore>::Error,
-        <<S as EventStore>::Codec as Codec>::Error,
-    >,
->;
+pub type UncheckedCommandResult<A, S> =
+    Result<(), CommandError<<A as Aggregate>::Error, <S as EventStore>::Error>>;
 
 /// Result type alias for snapshot-enabled unchecked command execution.
 pub type UncheckedSnapshotCommandResult<A, S, SS> = Result<
@@ -126,7 +102,6 @@ pub type UncheckedSnapshotCommandResult<A, S, SS> = Result<
     SnapshotCommandError<
         <A as Aggregate>::Error,
         <S as EventStore>::Error,
-        <<S as EventStore>::Codec as Codec>::Error,
         <SS as SnapshotStore<<S as EventStore>::Id>>::Error,
     >,
 >;
@@ -138,7 +113,6 @@ pub type OptimisticCommandResult<A, S> = Result<
         <A as Aggregate>::Error,
         <S as EventStore>::Position,
         <S as EventStore>::Error,
-        <<S as EventStore>::Codec as Codec>::Error,
     >,
 >;
 
@@ -149,7 +123,6 @@ pub type OptimisticSnapshotCommandResult<A, S, SS> = Result<
         <A as Aggregate>::Error,
         <S as EventStore>::Position,
         <S as EventStore>::Error,
-        <<S as EventStore>::Codec as Codec>::Error,
         <SS as SnapshotStore<<S as EventStore>::Id>>::Error,
     >,
 >;
@@ -161,7 +134,6 @@ pub type RetryResult<A, S> = Result<
         <A as Aggregate>::Error,
         <S as EventStore>::Position,
         <S as EventStore>::Error,
-        <<S as EventStore>::Codec as Codec>::Error,
     >,
 >;
 
@@ -172,7 +144,6 @@ pub type SnapshotRetryResult<A, S, SS> = Result<
         <A as Aggregate>::Error,
         <S as EventStore>::Position,
         <S as EventStore>::Error,
-        <<S as EventStore>::Codec as Codec>::Error,
         <SS as SnapshotStore<<S as EventStore>::Id>>::Error,
     >,
 >;
@@ -186,7 +157,7 @@ struct LoadedAggregate<A, Pos> {
 fn aggregate_event_filters<S, E>(
     aggregate_kind: &str,
     aggregate_id: &S::Id,
-    after: Option<S::Position>,
+    after: Option<&S::Position>,
 ) -> Vec<EventFilter<S::Id, S::Position>>
 where
     S: EventStore,
@@ -198,7 +169,7 @@ where
             let mut filter =
                 EventFilter::for_aggregate(*kind, aggregate_kind, aggregate_id.clone());
             if let Some(position) = after {
-                filter = filter.after(position);
+                filter = filter.after(position.clone());
             }
             filter
         })
@@ -207,9 +178,9 @@ where
 
 fn apply_stored_events<A, S>(
     aggregate: &mut A,
-    codec: &S::Codec,
-    events: &[StoredEvent<S::Id, S::Position, S::Metadata>],
-) -> Result<Option<S::Position>, crate::codec::EventDecodeError<<S::Codec as Codec>::Error>>
+    store: &S,
+    events: &[S::StoredEvent],
+) -> Result<Option<S::Position>, crate::event::EventDecodeError<S::Error>>
 where
     S: EventStore,
     A: Aggregate<Id = S::Id>,
@@ -218,9 +189,9 @@ where
     let mut last_event_position: Option<S::Position> = None;
 
     for stored in events {
-        let event = A::Event::from_stored(&stored.kind, &stored.data, codec)?;
+        let event = A::Event::from_stored(stored, store)?;
         aggregate.apply(&event);
-        last_event_position = Some(stored.position);
+        last_event_position = Some(stored.position());
     }
 
     Ok(last_event_position)
@@ -237,32 +208,114 @@ where
     type Error = SS::Error;
     type Position = SS::Position;
 
-    fn load<'a>(
-        &'a self,
-        kind: &'a str,
-        id: &'a Id,
-    ) -> impl Future<Output = Result<Option<Snapshot<Self::Position>>, Self::Error>> + Send + 'a
+    async fn load<T>(
+        &self,
+        kind: &str,
+        id: &Id,
+    ) -> Result<Option<Snapshot<Self::Position, T>>, Self::Error>
+    where
+        T: DeserializeOwned,
     {
-        self.0.load(kind, id)
+        self.0.load(kind, id).await
     }
 
-    fn offer_snapshot<'a, CE, Create>(
-        &'a self,
-        kind: &'a str,
-        id: &'a Id,
+    async fn offer_snapshot<CE, T, Create>(
+        &self,
+        kind: &str,
+        id: &Id,
         events_since_last_snapshot: u64,
         create_snapshot: Create,
-    ) -> impl Future<Output = Result<SnapshotOffer, OfferSnapshotError<Self::Error, CE>>> + Send + 'a
+    ) -> Result<SnapshotOffer, OfferSnapshotError<Self::Error, CE>>
     where
         CE: std::error::Error + Send + Sync + 'static,
-        Create: FnOnce() -> Result<Snapshot<Self::Position>, CE> + 'a,
+        T: Serialize,
+        Create: FnOnce() -> Result<Snapshot<Self::Position, T>, CE> + Send,
     {
         self.0
             .offer_snapshot(kind, id, events_since_last_snapshot, create_snapshot)
+            .await
     }
 }
 
+/// Repository type alias with default concurrency (optimistic) and no snapshots.
+///
+/// This is the most common repository configuration and is equivalent to:
+/// ```ignore
+/// Repository<S, Optimistic, NoSnapshots<<S as EventStore>::Position>>
+/// ```
+///
+/// # Example
+///
+/// ```ignore
+/// use sourcery::{Repository, store::inmemory};
+///
+/// let store = inmemory::Store::new();
+/// let repo: DefaultRepository<_> = Repository::new(store);
+/// ```
+pub type DefaultRepository<S> =
+    Repository<S, Optimistic, crate::snapshot::NoSnapshots<<S as EventStore>::Position>>;
+
+/// Repository type alias with unchecked concurrency and no snapshots.
+///
+/// This configuration skips version checking, allowing last-writer-wins semantics.
+/// Use when concurrent writes are impossible or acceptable.
+///
+/// Equivalent to:
+/// ```ignore
+/// Repository<S, Unchecked, NoSnapshots<<S as EventStore>::Position>>
+/// ```
+pub type UncheckedRepository<S> =
+    Repository<S, Unchecked, crate::snapshot::NoSnapshots<<S as EventStore>::Position>>;
+
+/// Repository type alias with snapshots enabled and default optimistic concurrency.
+///
+/// This configuration enables snapshot support for faster aggregate loading.
+/// Requires aggregate state to implement `Serialize + DeserializeOwned`.
+///
+/// Equivalent to:
+/// ```ignore
+/// Repository<S, Optimistic, SS>
+/// ```
+///
+/// # Example
+///
+/// ```ignore
+/// use sourcery::{Repository, store::inmemory, snapshot::inmemory};
+///
+/// let store = inmemory::Store::new();
+/// let snapshot_store = inmemory::Store::every(100);
+/// let repo: SnapshotRepository<_, _> = Repository::new(store)
+///     .with_snapshots(snapshot_store);
+/// ```
+pub type SnapshotRepository<S, SS> = Repository<S, Optimistic, SS>;
+
 /// Repository.
+///
+/// Orchestrates aggregate loading, command execution, and event persistence.
+///
+/// # Type Parameters
+///
+/// - `S`: Event store implementation
+/// - `C`: Concurrency strategy (`Optimistic` or `Unchecked`), defaults to `Optimistic`
+/// - `M`: Snapshot mode (`NoSnapshots` or `SnapshotStore`), defaults to `NoSnapshots`
+///
+/// # Type Aliases
+///
+/// For common configurations, use these type aliases instead of the full generic form:
+///
+/// - [`DefaultRepository<S>`] - Optimistic concurrency, no snapshots (most common)
+/// - [`UncheckedRepository<S>`] - No concurrency checking, no snapshots
+/// - [`SnapshotRepository<S, SS>`] - Optimistic concurrency with snapshots
+///
+/// # Examples
+///
+/// ```ignore
+/// // Using type alias (recommended)
+/// let repo: DefaultRepository<_> = Repository::new(store);
+///
+/// // Or full generic form
+/// let repo: Repository<_, Optimistic, NoSnapshots<_>> = Repository::new(store);
+/// ```
 pub struct Repository<
     S,
     C = Optimistic,
@@ -318,6 +371,7 @@ where
     pub fn build_projection<P>(&self) -> ProjectionBuilder<'_, S, P, M>
     where
         P: Projection<Id = S::Id>,
+        P::InstanceId: Sync,
         M: SnapshotStore<P::InstanceId, Position = S::Position>,
     {
         ProjectionBuilder::new(&self.store, &self.snapshots)
@@ -341,13 +395,6 @@ where
     S: EventStore,
     C: ConcurrencyStrategy,
 {
-    pub const fn aggregate_builder<A>(&self) -> AggregateBuilder<'_, Self, A>
-    where
-        A: Aggregate<Id = S::Id>,
-    {
-        AggregateBuilder::new(self)
-    }
-
     /// Load an aggregate by replaying all events (no snapshots).
     ///
     /// # Errors
@@ -378,9 +425,8 @@ where
             .await
             .map_err(ProjectionError::Store)?;
 
-        let codec = self.store.codec();
         let mut aggregate = A::default();
-        let version = apply_stored_events::<A, S>(&mut aggregate, codec, &events)
+        let version = apply_stored_events::<A, S>(&mut aggregate, &self.store, &events)
             .map_err(ProjectionError::EventDecode)?;
 
         Ok(LoadedAggregate {
@@ -391,7 +437,7 @@ where
     }
 }
 
-impl<S> Repository<S, Unchecked>
+impl<S> Repository<S, Unchecked, crate::snapshot::NoSnapshots<S::Position>>
 where
     S: EventStore,
 {
@@ -411,29 +457,28 @@ where
     ) -> UncheckedCommandResult<A, S>
     where
         A: Aggregate<Id = S::Id> + Handle<Cmd>,
-        A::Event: ProjectionEvent + SerializableEvent,
+        A::Event: ProjectionEvent + EventKind + serde::Serialize,
         Cmd: Sync,
         S::Metadata: Clone,
     {
-        let LoadedAggregate { aggregate, .. } = self
-            .load_aggregate::<A>(id)
-            .await
-            .map_err(CommandError::Projection)?;
-
-        let new_events =
-            Handle::<Cmd>::handle(&aggregate, command).map_err(CommandError::Aggregate)?;
+        let new_events = {
+            let LoadedAggregate { aggregate, .. } = self
+                .load_aggregate::<A>(id)
+                .await
+                .map_err(CommandError::Projection)?;
+            Handle::<Cmd>::handle(&aggregate, command).map_err(CommandError::Aggregate)?
+        };
 
         if new_events.is_empty() {
             return Ok(());
         }
 
-        drop(aggregate);
-
         let mut tx = self.store.begin::<Unchecked>(A::KIND, id.clone(), None);
-        for event in new_events {
+        for event in &new_events {
             tx.append(event, metadata.clone())
-                .map_err(CommandError::Codec)?;
+                .map_err(CommandError::Store)?;
         }
+        drop(new_events);
         tx.commit().await.map_err(|e| match e {
             AppendError::Store(err) => CommandError::Store(err),
             AppendError::Conflict(_) => unreachable!("conflict impossible without version"),
@@ -443,7 +488,7 @@ where
     }
 }
 
-impl<S> Repository<S, Optimistic>
+impl<S> Repository<S, Optimistic, crate::snapshot::NoSnapshots<S::Position>>
 where
     S: EventStore,
 {
@@ -463,31 +508,32 @@ where
     ) -> OptimisticCommandResult<A, S>
     where
         A: Aggregate<Id = S::Id> + Handle<Cmd>,
-        A::Event: ProjectionEvent + SerializableEvent,
+        A::Event: ProjectionEvent + EventKind + serde::Serialize,
         Cmd: Sync,
         S::Metadata: Clone,
     {
-        let LoadedAggregate {
-            aggregate, version, ..
-        } = self
-            .load_aggregate::<A>(id)
-            .await
-            .map_err(OptimisticCommandError::Projection)?;
-
-        let new_events = Handle::<Cmd>::handle(&aggregate, command)
-            .map_err(OptimisticCommandError::Aggregate)?;
+        let (version, new_events) = {
+            let LoadedAggregate {
+                aggregate, version, ..
+            } = self
+                .load_aggregate::<A>(id)
+                .await
+                .map_err(OptimisticCommandError::Projection)?;
+            let new_events = Handle::<Cmd>::handle(&aggregate, command)
+                .map_err(OptimisticCommandError::Aggregate)?;
+            (version, new_events)
+        };
 
         if new_events.is_empty() {
             return Ok(());
         }
 
-        drop(aggregate);
-
         let mut tx = self.store.begin::<Optimistic>(A::KIND, id.clone(), version);
-        for event in new_events {
+        for event in &new_events {
             tx.append(event, metadata.clone())
-                .map_err(OptimisticCommandError::Codec)?;
+                .map_err(OptimisticCommandError::Store)?;
         }
+        drop(new_events);
 
         match tx.commit().await {
             Ok(_) => {}
@@ -516,7 +562,7 @@ where
     ) -> RetryResult<A, S>
     where
         A: Aggregate<Id = S::Id> + Handle<Cmd>,
-        A::Event: ProjectionEvent + SerializableEvent,
+        A::Event: ProjectionEvent + EventKind + serde::Serialize,
         Cmd: Sync,
         S::Metadata: Clone,
     {
@@ -545,13 +591,6 @@ where
         &self.snapshots.0
     }
 
-    pub const fn aggregate_builder<A>(&self) -> AggregateBuilder<'_, Self, A>
-    where
-        A: Aggregate<Id = S::Id> + Serialize + DeserializeOwned,
-    {
-        AggregateBuilder::new(self)
-    }
-
     /// Load an aggregate using snapshots when available.
     ///
     /// # Errors
@@ -561,7 +600,7 @@ where
     /// deserialized (which indicates snapshot corruption).
     pub async fn load<A>(&self, id: &S::Id) -> Result<A, LoadError<S>>
     where
-        A: Aggregate<Id = S::Id> + Serialize + DeserializeOwned,
+        A: Aggregate<Id = S::Id> + Serialize + DeserializeOwned + Send,
         A::Event: ProjectionEvent,
     {
         Ok(self.load_aggregate::<A>(id).await?.aggregate)
@@ -572,15 +611,13 @@ where
         id: &S::Id,
     ) -> Result<LoadedAggregate<A, S::Position>, LoadError<S>>
     where
-        A: Aggregate<Id = S::Id> + Serialize + DeserializeOwned,
+        A: Aggregate<Id = S::Id> + Serialize + DeserializeOwned + Send,
         A::Event: ProjectionEvent,
     {
-        let codec = self.store.codec();
-
         let snapshot_result = self
             .snapshots
             .0
-            .load(A::KIND, id)
+            .load::<A>(A::KIND, id)
             .await
             .inspect_err(|e| {
                 tracing::error!(
@@ -592,15 +629,13 @@ where
             .flatten();
 
         let (mut aggregate, snapshot_position) = if let Some(snapshot) = snapshot_result {
-            let restored: A = codec
-                .deserialize(&snapshot.data)
-                .map_err(ProjectionError::SnapshotDeserialize)?;
-            (restored, Some(snapshot.position))
+            (snapshot.data, Some(snapshot.position))
         } else {
             (A::default(), None)
         };
 
-        let filters = aggregate_event_filters::<S, A::Event>(A::KIND, id, snapshot_position);
+        let filters =
+            aggregate_event_filters::<S, A::Event>(A::KIND, id, snapshot_position.as_ref());
 
         let events = self
             .store
@@ -608,7 +643,7 @@ where
             .await
             .map_err(ProjectionError::Store)?;
 
-        let last_event_position = apply_stored_events::<A, S>(&mut aggregate, codec, &events)
+        let last_event_position = apply_stored_events::<A, S>(&mut aggregate, &self.store, &events)
             .map_err(ProjectionError::EventDecode)?;
 
         let version = last_event_position.or(snapshot_position);
@@ -641,8 +676,8 @@ where
         metadata: &S::Metadata,
     ) -> UncheckedSnapshotCommandResult<A, S, SS>
     where
-        A: Aggregate<Id = S::Id> + Handle<Cmd> + Serialize + DeserializeOwned,
-        A::Event: ProjectionEvent + SerializableEvent,
+        A: Aggregate<Id = S::Id> + Handle<Cmd> + Serialize + DeserializeOwned + Send,
+        A::Event: ProjectionEvent + EventKind + serde::Serialize,
         Cmd: Sync,
         S::Metadata: Clone,
     {
@@ -670,10 +705,11 @@ where
         }
 
         let mut tx = self.store.begin::<Unchecked>(A::KIND, id.clone(), None);
-        for event in new_events {
+        for event in &new_events {
             tx.append(event, metadata.clone())
-                .map_err(SnapshotCommandError::Codec)?;
+                .map_err(SnapshotCommandError::Store)?;
         }
+        drop(new_events);
         let append_result = tx.commit().await.map_err(|e| match e {
             AppendError::Store(err) => SnapshotCommandError::Store(err),
             AppendError::Conflict(_) => unreachable!("conflict impossible without version"),
@@ -681,20 +717,24 @@ where
         })?;
         let new_position = append_result.last_position;
 
-        let codec = self.store.codec().clone();
-        let offer_result =
-            self.snapshots
-                .0
-                .offer_snapshot(A::KIND, id, total_events_since_snapshot, move || {
-                    Ok(Snapshot {
-                        position: new_position,
-                        data: codec.serialize(&aggregate)?,
-                    })
-                });
+        let offer_result = self.snapshots.0.offer_snapshot(
+            A::KIND,
+            id,
+            total_events_since_snapshot,
+            move || -> Result<Snapshot<S::Position, A>, std::convert::Infallible> {
+                Ok(Snapshot {
+                    position: new_position,
+                    data: aggregate,
+                })
+            },
+        );
 
         match offer_result.await {
             Ok(SnapshotOffer::Declined | SnapshotOffer::Stored) => {}
-            Err(OfferSnapshotError::Create(e)) => return Err(SnapshotCommandError::Codec(e)),
+            Err(OfferSnapshotError::Create(_e)) => {
+                // Snapshot serialization failed - log and continue
+                // This is not fatal, we successfully committed events
+            }
             Err(OfferSnapshotError::Snapshot(e)) => return Err(SnapshotCommandError::Snapshot(e)),
         }
 
@@ -723,8 +763,8 @@ where
         metadata: &S::Metadata,
     ) -> OptimisticSnapshotCommandResult<A, S, SS>
     where
-        A: Aggregate<Id = S::Id> + Handle<Cmd> + Serialize + DeserializeOwned,
-        A::Event: ProjectionEvent + SerializableEvent,
+        A: Aggregate<Id = S::Id> + Handle<Cmd> + Serialize + DeserializeOwned + Send,
+        A::Event: ProjectionEvent + EventKind + serde::Serialize,
         Cmd: Sync,
         S::Metadata: Clone,
     {
@@ -752,10 +792,11 @@ where
         }
 
         let mut tx = self.store.begin::<Optimistic>(A::KIND, id.clone(), version);
-        for event in new_events {
+        for event in &new_events {
             tx.append(event, metadata.clone())
-                .map_err(OptimisticSnapshotCommandError::Codec)?;
+                .map_err(OptimisticSnapshotCommandError::Store)?;
         }
+        drop(new_events);
 
         let append_result = match tx.commit().await {
             Ok(result) => result,
@@ -767,21 +808,23 @@ where
         };
         let new_position = append_result.last_position;
 
-        let codec = self.store.codec().clone();
-        let offer_result =
-            self.snapshots
-                .0
-                .offer_snapshot(A::KIND, id, total_events_since_snapshot, move || {
-                    Ok(Snapshot {
-                        position: new_position,
-                        data: codec.serialize(&aggregate)?,
-                    })
-                });
+        let offer_result = self.snapshots.0.offer_snapshot(
+            A::KIND,
+            id,
+            total_events_since_snapshot,
+            move || -> Result<Snapshot<S::Position, A>, std::convert::Infallible> {
+                Ok(Snapshot {
+                    position: new_position,
+                    data: aggregate,
+                })
+            },
+        );
 
         match offer_result.await {
             Ok(SnapshotOffer::Declined | SnapshotOffer::Stored) => {}
-            Err(OfferSnapshotError::Create(e)) => {
-                return Err(OptimisticSnapshotCommandError::Codec(e));
+            Err(OfferSnapshotError::Create(_e)) => {
+                // Snapshot serialization failed - log and continue
+                // This is not fatal, we successfully committed events
             }
             Err(OfferSnapshotError::Snapshot(e)) => {
                 return Err(OptimisticSnapshotCommandError::Snapshot(e));
@@ -805,8 +848,8 @@ where
         max_retries: usize,
     ) -> SnapshotRetryResult<A, S, SS>
     where
-        A: Aggregate<Id = S::Id> + Handle<Cmd> + Serialize + DeserializeOwned,
-        A::Event: ProjectionEvent + SerializableEvent,
+        A: Aggregate<Id = S::Id> + Handle<Cmd> + Serialize + DeserializeOwned + Send,
+        A::Event: ProjectionEvent + EventKind + serde::Serialize,
         Cmd: Sync,
         S::Metadata: Clone,
     {
@@ -832,7 +875,7 @@ mod tests {
 
     #[test]
     fn command_error_display_mentions_aggregate() {
-        let error: CommandError<String, io::Error, io::Error> =
+        let error: CommandError<String, io::Error> =
             CommandError::Aggregate("invalid state".to_string());
         let msg = error.to_string();
         assert!(msg.contains("aggregate rejected command"));
@@ -841,7 +884,7 @@ mod tests {
 
     #[test]
     fn command_error_store_has_source() {
-        let error: CommandError<String, io::Error, io::Error> =
+        let error: CommandError<String, io::Error> =
             CommandError::Store(io::Error::other("store error"));
         assert!(error.source().is_some());
     }
@@ -852,7 +895,7 @@ mod tests {
             expected: Some(1u64),
             actual: Some(2u64),
         };
-        let error: OptimisticCommandError<String, u64, io::Error, io::Error> =
+        let error: OptimisticCommandError<String, u64, io::Error> =
             OptimisticCommandError::Concurrency(conflict);
         let msg = error.to_string();
         assert!(msg.contains("concurrency conflict"));

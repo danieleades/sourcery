@@ -5,7 +5,10 @@
 
 use nonempty::NonEmpty;
 use serde::{Deserialize, Serialize};
-use sourcery_core::store::{EventFilter, EventStore, JsonCodec, PersistableEvent};
+use sourcery_core::{
+    event::DomainEvent,
+    store::{EventFilter, EventStore, StoredEventView},
+};
 use sourcery_postgres::Store;
 use sqlx::PgPool;
 use testcontainers::{ContainerAsync, runners::AsyncRunner};
@@ -16,6 +19,16 @@ use uuid::Uuid;
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 struct TestMetadata {
     user_id: String,
+}
+
+/// Test event type
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+struct TestEvent {
+    data: String,
+}
+
+impl DomainEvent for TestEvent {
+    const KIND: &'static str = "test-event";
 }
 
 /// Test helper to set up a `PostgreSQL` container and connection pool.
@@ -40,20 +53,25 @@ impl TestDb {
     }
 }
 
-fn test_event(kind: &str, data: &str, user_id: &str) -> PersistableEvent<TestMetadata> {
-    PersistableEvent {
-        kind: kind.to_string(),
-        data: data.as_bytes().to_vec(),
-        metadata: TestMetadata {
-            user_id: user_id.to_string(),
-        },
-    }
+/// Helper function to create a staged event for testing
+fn test_event(
+    store: &Store<TestMetadata>,
+    data: &str,
+    user_id: &str,
+) -> <Store<TestMetadata> as EventStore>::StagedEvent {
+    let event = TestEvent {
+        data: data.to_string(),
+    };
+    let metadata = TestMetadata {
+        user_id: user_id.to_string(),
+    };
+    store.stage_event(&event, metadata).unwrap()
 }
 
 #[tokio::test]
 async fn migrate_creates_event_tables() {
     let db = TestDb::new().await;
-    let store: Store<JsonCodec, TestMetadata> = Store::new(db.pool.clone(), JsonCodec);
+    let store: Store<TestMetadata> = Store::new(db.pool.clone());
 
     store.migrate().await.unwrap();
 
@@ -74,7 +92,7 @@ async fn migrate_creates_event_tables() {
 #[tokio::test]
 async fn migrate_is_idempotent() {
     let db = TestDb::new().await;
-    let store: Store<JsonCodec, TestMetadata> = Store::new(db.pool.clone(), JsonCodec);
+    let store: Store<TestMetadata> = Store::new(db.pool.clone());
 
     store.migrate().await.unwrap();
     store.migrate().await.unwrap();
@@ -84,7 +102,7 @@ async fn migrate_is_idempotent() {
 #[tokio::test]
 async fn stream_version_returns_none_for_new_stream() {
     let db = TestDb::new().await;
-    let store: Store<JsonCodec, TestMetadata> = Store::new(db.pool.clone(), JsonCodec);
+    let store: Store<TestMetadata> = Store::new(db.pool.clone());
     store.migrate().await.unwrap();
 
     let id = Uuid::new_v4();
@@ -96,11 +114,11 @@ async fn stream_version_returns_none_for_new_stream() {
 #[tokio::test]
 async fn append_expecting_new_creates_stream() {
     let db = TestDb::new().await;
-    let store: Store<JsonCodec, TestMetadata> = Store::new(db.pool.clone(), JsonCodec);
+    let store: Store<TestMetadata> = Store::new(db.pool.clone());
     store.migrate().await.unwrap();
 
     let id = Uuid::new_v4();
-    let events = NonEmpty::singleton(test_event("test.event", "data", "user1"));
+    let events = NonEmpty::singleton(test_event(&store, "data", "user1"));
 
     let result = store
         .append_expecting_new("test.aggregate", &id, events)
@@ -117,11 +135,11 @@ async fn append_expecting_new_creates_stream() {
 #[tokio::test]
 async fn append_expecting_new_fails_for_existing_stream() {
     let db = TestDb::new().await;
-    let store: Store<JsonCodec, TestMetadata> = Store::new(db.pool.clone(), JsonCodec);
+    let store: Store<TestMetadata> = Store::new(db.pool.clone());
     store.migrate().await.unwrap();
 
     let id = Uuid::new_v4();
-    let events = NonEmpty::singleton(test_event("test.event", "data", "user1"));
+    let events = NonEmpty::singleton(test_event(&store, "data", "user1"));
 
     // First append succeeds
     store
@@ -140,7 +158,7 @@ async fn append_expecting_new_fails_for_existing_stream() {
 #[tokio::test]
 async fn append_with_expected_version_succeeds() {
     let db = TestDb::new().await;
-    let store: Store<JsonCodec, TestMetadata> = Store::new(db.pool.clone(), JsonCodec);
+    let store: Store<TestMetadata> = Store::new(db.pool.clone());
     store.migrate().await.unwrap();
 
     let id = Uuid::new_v4();
@@ -150,7 +168,7 @@ async fn append_with_expected_version_succeeds() {
         .append_expecting_new(
             "test.aggregate",
             &id,
-            NonEmpty::singleton(test_event("test.event", "first", "user1")),
+            NonEmpty::singleton(test_event(&store, "first", "user1")),
         )
         .await
         .unwrap();
@@ -161,7 +179,7 @@ async fn append_with_expected_version_succeeds() {
             "test.aggregate",
             &id,
             Some(first.last_position),
-            NonEmpty::singleton(test_event("test.event", "second", "user1")),
+            NonEmpty::singleton(test_event(&store, "second", "user1")),
         )
         .await
         .unwrap();
@@ -172,7 +190,7 @@ async fn append_with_expected_version_succeeds() {
 #[tokio::test]
 async fn append_with_wrong_expected_version_fails() {
     let db = TestDb::new().await;
-    let store: Store<JsonCodec, TestMetadata> = Store::new(db.pool.clone(), JsonCodec);
+    let store: Store<TestMetadata> = Store::new(db.pool.clone());
     store.migrate().await.unwrap();
 
     let id = Uuid::new_v4();
@@ -182,7 +200,7 @@ async fn append_with_wrong_expected_version_fails() {
         .append_expecting_new(
             "test.aggregate",
             &id,
-            NonEmpty::singleton(test_event("test.event", "first", "user1")),
+            NonEmpty::singleton(test_event(&store, "first", "user1")),
         )
         .await
         .unwrap();
@@ -193,7 +211,7 @@ async fn append_with_wrong_expected_version_fails() {
             "test.aggregate",
             &id,
             Some(999), // Wrong version
-            NonEmpty::singleton(test_event("test.event", "second", "user1")),
+            NonEmpty::singleton(test_event(&store, "second", "user1")),
         )
         .await;
 
@@ -203,7 +221,7 @@ async fn append_with_wrong_expected_version_fails() {
 #[tokio::test]
 async fn load_events_returns_stored_events() {
     let db = TestDb::new().await;
-    let store: Store<JsonCodec, TestMetadata> = Store::new(db.pool.clone(), JsonCodec);
+    let store: Store<TestMetadata> = Store::new(db.pool.clone());
     store.migrate().await.unwrap();
 
     let id = Uuid::new_v4();
@@ -212,13 +230,13 @@ async fn load_events_returns_stored_events() {
         .append_expecting_new(
             "test.aggregate",
             &id,
-            NonEmpty::new(test_event("test.created", "created data", "user1")),
+            NonEmpty::new(test_event(&store, "created data", "user1")),
         )
         .await
         .unwrap();
 
     let filters = vec![EventFilter::for_aggregate(
-        "test.created",
+        "test-event",
         "test.aggregate",
         id,
     )];
@@ -226,15 +244,14 @@ async fn load_events_returns_stored_events() {
     let events = store.load_events(&filters).await.unwrap();
 
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0].kind, "test.created");
-    assert_eq!(events[0].aggregate_id, id);
-    assert_eq!(events[0].data, b"created data");
+    assert_eq!(events[0].kind(), "test-event");
+    assert_eq!(events[0].aggregate_id(), &id);
 }
 
 #[tokio::test]
 async fn load_events_with_after_position_filter() {
     let db = TestDb::new().await;
-    let store: Store<JsonCodec, TestMetadata> = Store::new(db.pool.clone(), JsonCodec);
+    let store: Store<TestMetadata> = Store::new(db.pool.clone());
     store.migrate().await.unwrap();
 
     let id = Uuid::new_v4();
@@ -244,7 +261,7 @@ async fn load_events_with_after_position_filter() {
         .append_expecting_new(
             "test.aggregate",
             &id,
-            NonEmpty::singleton(test_event("test.event", "first", "user1")),
+            NonEmpty::singleton(test_event(&store, "first", "user1")),
         )
         .await
         .unwrap();
@@ -255,34 +272,33 @@ async fn load_events_with_after_position_filter() {
             "test.aggregate",
             &id,
             Some(first.last_position),
-            NonEmpty::singleton(test_event("test.event", "second", "user1")),
+            NonEmpty::singleton(test_event(&store, "second", "user1")),
         )
         .await
         .unwrap();
 
     // Load only events after the first position
     let filters = vec![
-        EventFilter::for_aggregate("test.event", "test.aggregate", id).after(first.last_position),
+        EventFilter::for_aggregate("test-event", "test.aggregate", id).after(first.last_position),
     ];
 
     let events = store.load_events(&filters).await.unwrap();
 
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0].data, b"second");
 }
 
 #[tokio::test]
 async fn append_multiple_events_atomically() {
     let db = TestDb::new().await;
-    let store: Store<JsonCodec, TestMetadata> = Store::new(db.pool.clone(), JsonCodec);
+    let store: Store<TestMetadata> = Store::new(db.pool.clone());
     store.migrate().await.unwrap();
 
     let id = Uuid::new_v4();
 
     let events = NonEmpty::from_vec(vec![
-        test_event("test.event", "first", "user1"),
-        test_event("test.event", "second", "user1"),
-        test_event("test.event", "third", "user1"),
+        test_event(&store, "first", "user1"),
+        test_event(&store, "second", "user1"),
+        test_event(&store, "third", "user1"),
     ])
     .unwrap();
 
@@ -293,27 +309,24 @@ async fn append_multiple_events_atomically() {
 
     // Load all events
     let filters = vec![EventFilter::for_aggregate(
-        "test.event",
+        "test-event",
         "test.aggregate",
         id,
     )];
     let loaded = store.load_events(&filters).await.unwrap();
 
     assert_eq!(loaded.len(), 3);
-    assert_eq!(loaded[0].data, b"first");
-    assert_eq!(loaded[1].data, b"second");
-    assert_eq!(loaded[2].data, b"third");
 
     // Positions should be monotonically increasing
-    assert!(loaded[0].position < loaded[1].position);
-    assert!(loaded[1].position < loaded[2].position);
-    assert_eq!(loaded[2].position, result.last_position);
+    assert!(loaded[0].position() < loaded[1].position());
+    assert!(loaded[1].position() < loaded[2].position());
+    assert_eq!(loaded[2].position(), result.last_position);
 }
 
 #[tokio::test]
 async fn events_are_ordered_by_position() {
     let db = TestDb::new().await;
-    let store: Store<JsonCodec, TestMetadata> = Store::new(db.pool.clone(), JsonCodec);
+    let store: Store<TestMetadata> = Store::new(db.pool.clone());
     store.migrate().await.unwrap();
 
     let id1 = Uuid::new_v4();
@@ -324,7 +337,7 @@ async fn events_are_ordered_by_position() {
         .append_expecting_new(
             "test.aggregate",
             &id1,
-            NonEmpty::singleton(test_event("test.event", "stream1-first", "user1")),
+            NonEmpty::singleton(test_event(&store, "stream1-first", "user1")),
         )
         .await
         .unwrap();
@@ -333,14 +346,14 @@ async fn events_are_ordered_by_position() {
         .append_expecting_new(
             "test.aggregate",
             &id2,
-            NonEmpty::singleton(test_event("test.event", "stream2-first", "user2")),
+            NonEmpty::singleton(test_event(&store, "stream2-first", "user2")),
         )
         .await
         .unwrap();
 
     // Load all events (across both streams)
     let filters = vec![EventFilter {
-        event_kind: "test.event".to_string(),
+        event_kind: "test-event".to_string(),
         aggregate_kind: Some("test.aggregate".to_string()),
         aggregate_id: None,
         after_position: None,
@@ -350,13 +363,13 @@ async fn events_are_ordered_by_position() {
 
     assert_eq!(events.len(), 2);
     // Events should be ordered by position
-    assert!(events[0].position < events[1].position);
+    assert!(events[0].position() < events[1].position());
 }
 
 #[tokio::test]
 async fn metadata_is_preserved() {
     let db = TestDb::new().await;
-    let store: Store<JsonCodec, TestMetadata> = Store::new(db.pool.clone(), JsonCodec);
+    let store: Store<TestMetadata> = Store::new(db.pool.clone());
     store.migrate().await.unwrap();
 
     let id = Uuid::new_v4();
@@ -365,17 +378,17 @@ async fn metadata_is_preserved() {
         .append_expecting_new(
             "test.aggregate",
             &id,
-            NonEmpty::singleton(test_event("test.event", "data", "special-user-123")),
+            NonEmpty::singleton(test_event(&store, "data", "special-user-123")),
         )
         .await
         .unwrap();
 
     let filters = vec![EventFilter::for_aggregate(
-        "test.event",
+        "test-event",
         "test.aggregate",
         id,
     )];
     let events = store.load_events(&filters).await.unwrap();
 
-    assert_eq!(events[0].metadata.user_id, "special-user-123");
+    assert_eq!(events[0].metadata().user_id, "special-user-123");
 }

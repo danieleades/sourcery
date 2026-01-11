@@ -8,7 +8,7 @@
 use serde::{Deserialize, Serialize};
 use sourcery::{
     Apply, ApplyProjection, DomainEvent, Handle, Repository,
-    store::{JsonCodec, inmemory},
+    store::inmemory,
 };
 
 // ANCHOR: events
@@ -30,8 +30,13 @@ pub struct Deposit {
 // ANCHOR_END: commands
 
 // ANCHOR: aggregate
-#[derive(Debug, Default, Serialize, Deserialize, sourcery::Aggregate)]
-#[aggregate(id = String, error = String, events(FundsDeposited))]
+#[derive(Default, Serialize, Deserialize, sourcery::Aggregate)]
+#[aggregate(
+    id = String,
+    error = String,
+    events(FundsDeposited),
+    derives(Debug, PartialEq, Eq)
+)]
 pub struct Account {
     balance: i64,
 }
@@ -70,7 +75,7 @@ impl ApplyProjection<FundsDeposited> for TotalDeposits {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create an in-memory store
-    let store = inmemory::Store::new(JsonCodec);
+    let store = inmemory::Store::new();
     let repository = Repository::new(store);
 
     // Execute a command

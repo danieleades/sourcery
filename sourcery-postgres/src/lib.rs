@@ -15,11 +15,11 @@ use std::marker::PhantomData;
 
 use serde::{Serialize, de::DeserializeOwned};
 use sourcery_core::{
-    codec::Codec,
     concurrency::{ConcurrencyConflict, ConcurrencyStrategy},
+    event::DomainEvent,
     store::{
-        AppendError, AppendResult, EventFilter, EventStore, GloballyOrderedStore, LoadEventsResult,
-        NonEmpty, PersistableEvent, StoredEvent, Transaction,
+        AppendError, AppendResult, EventFilter, EventStore, GloballyOrderedStore,
+        NonEmpty, StoredEventView, Transaction,
     },
 };
 use sqlx::{PgPool, Postgres, QueryBuilder, Row};
@@ -34,6 +34,83 @@ pub enum Error {
     InvalidPosition(i64),
     #[error("database did not return an inserted position")]
     MissingReturnedPosition,
+    #[error("serialization error: {0}")]
+    Serialization(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
+    #[error("deserialization error: {0}")]
+    Deserialization(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
+}
+
+/// Stored event with position and metadata.
+///
+/// This type represents an event that has been persisted to `PostgreSQL` and loaded
+/// back. It contains all the information needed to deserialize the event data and
+/// metadata, along with the aggregate identifiers and global position.
+///
+/// # Type Parameters
+///
+/// - `M`: The metadata type (must be `Serialize + DeserializeOwned`)
+///
+/// # Fields
+///
+/// All fields are accessible through the [`StoredEventView`] trait implementation.
+/// Use the trait methods rather than accessing fields directly to maintain
+/// compatibility across store implementations.
+#[derive(Clone)]
+pub struct StoredEvent<M> {
+    aggregate_kind: String,
+    aggregate_id: uuid::Uuid,
+    kind: String,
+    position: i64,
+    data: serde_json::Value,
+    metadata: M,
+}
+
+/// Staged event awaiting persistence.
+///
+/// This type represents an event that has been serialized and prepared for
+/// persistence but not yet written to `PostgreSQL`. The repository creates these
+/// from domain events, then batches them together for atomic appending.
+///
+/// # Type Parameters
+///
+/// - `M`: The metadata type (must be `Serialize + DeserializeOwned`)
+///
+/// # Internal Use
+///
+/// This type is primarily used by the [`Store`] implementation. Users typically
+/// interact with domain events directly and don't need to create `StagedEvent`
+/// instances manually.
+#[derive(Clone)]
+pub struct StagedEvent<M> {
+    kind: String,
+    data: serde_json::Value,
+    metadata: M,
+}
+
+impl<M> StoredEventView for StoredEvent<M> {
+    type Id = uuid::Uuid;
+    type Pos = i64;
+    type Metadata = M;
+
+    fn aggregate_kind(&self) -> &str {
+        &self.aggregate_kind
+    }
+
+    fn aggregate_id(&self) -> &Self::Id {
+        &self.aggregate_id
+    }
+
+    fn kind(&self) -> &str {
+        &self.kind
+    }
+
+    fn position(&self) -> Self::Pos {
+        self.position
+    }
+
+    fn metadata(&self) -> &Self::Metadata {
+        &self.metadata
+    }
 }
 
 /// A PostgreSQL-backed [`EventStore`].
@@ -41,27 +118,27 @@ pub enum Error {
 /// Defaults are intentionally conservative:
 /// - Positions are global and monotonic (`i64`, backed by `BIGSERIAL`).
 /// - Metadata is stored as `jsonb` (`M: Serialize + DeserializeOwned`).
+/// - Event data is stored as `jsonb`.
 #[derive(Clone)]
-pub struct Store<C, M> {
+pub struct Store<M> {
     pool: PgPool,
-    codec: C,
     _phantom: PhantomData<M>,
 }
 
-impl<C, M> Store<C, M>
-where
-    C: Sync,
-    M: Sync,
-{
+impl<M> Store<M> {
     #[must_use]
-    pub const fn new(pool: PgPool, codec: C) -> Self {
+    pub const fn new(pool: PgPool) -> Self {
         Self {
             pool,
-            codec,
             _phantom: PhantomData,
         }
     }
+}
 
+impl<M> Store<M>
+where
+    M: Sync,
+{
     /// Apply the initial schema (idempotent).
     ///
     /// This uses `CREATE TABLE IF NOT EXISTS` style DDL so it can be run on
@@ -93,7 +170,7 @@ where
                 aggregate_kind TEXT NOT NULL,
                 aggregate_id   UUID NOT NULL,
                 event_kind     TEXT NOT NULL,
-                data           BYTEA NOT NULL,
+                data           JSONB NOT NULL,
                 metadata       JSONB NOT NULL,
                 created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
             )
@@ -118,19 +195,36 @@ where
     }
 }
 
-impl<C, M> EventStore for Store<C, M>
+impl<M> EventStore for Store<M>
 where
-    C: Codec + Clone + Send + Sync + 'static,
-    M: Serialize + DeserializeOwned + Send + Sync + 'static,
+    M: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
-    type Codec = C;
     type Error = Error;
     type Id = uuid::Uuid;
     type Metadata = M;
     type Position = i64;
+    type StoredEvent = StoredEvent<M>;
+    type StagedEvent = StagedEvent<M>;
 
-    fn codec(&self) -> &Self::Codec {
-        &self.codec
+    fn stage_event<E>(&self, event: &E, metadata: Self::Metadata) -> Result<Self::StagedEvent, Self::Error>
+    where
+        E: sourcery_core::event::EventKind + serde::Serialize,
+    {
+        let data = serde_json::to_value(event)
+            .map_err(|e| Error::Serialization(Box::new(e)))?;
+        Ok(StagedEvent {
+            kind: event.kind().to_string(),
+            data,
+            metadata,
+        })
+    }
+
+    fn decode_event<E>(&self, stored: &Self::StoredEvent) -> Result<E, Self::Error>
+    where
+        E: DomainEvent + serde::de::DeserializeOwned,
+    {
+        serde_json::from_value(stored.data.clone())
+            .map_err(|e| Error::Deserialization(Box::new(e)))
     }
 
     async fn stream_version<'a>(
@@ -178,7 +272,7 @@ where
         aggregate_kind: &'a str,
         aggregate_id: &'a Self::Id,
         expected_version: Option<Self::Position>,
-        events: NonEmpty<PersistableEvent<Self::Metadata>>,
+        events: NonEmpty<Self::StagedEvent>,
     ) -> AppendOutcome {
         let mut tx = self
             .pool
@@ -222,15 +316,25 @@ where
             }));
         }
 
+        let mut prepared = Vec::with_capacity(events.len());
+        for event in events {
+            let StagedEvent {
+                kind,
+                data,
+                metadata,
+            } = event;
+            prepared.push((kind, data, metadata));
+        }
+
         let mut qb = QueryBuilder::<Postgres>::new(
             "INSERT INTO es_events (aggregate_kind, aggregate_id, event_kind, data, metadata) ",
         );
-        qb.push_values(events.into_iter(), |mut b, event| {
+        qb.push_values(prepared.into_iter(), |mut b, (kind, data, metadata)| {
             b.push_bind(aggregate_kind);
             b.push_bind(aggregate_id);
-            b.push_bind(event.kind);
-            b.push_bind(event.data);
-            b.push_bind(sqlx::types::Json(event.metadata));
+            b.push_bind(kind);
+            b.push_bind(sqlx::types::Json(data));
+            b.push_bind(sqlx::types::Json(metadata));
         });
         qb.push(" RETURNING position");
 
@@ -271,7 +375,7 @@ where
     async fn load_events<'a>(
         &'a self,
         filters: &'a [EventFilter<Self::Id, Self::Position>],
-    ) -> LoadEventsResult<Self::Id, Self::Position, Self::Metadata, Self::Error> {
+    ) -> Result<Vec<Self::StoredEvent>, Self::Error> {
         if filters.is_empty() {
             return Ok(Vec::new());
         }
@@ -317,7 +421,7 @@ where
             let aggregate_id: uuid::Uuid = row.try_get("aggregate_id")?;
             let event_kind: String = row.try_get("event_kind")?;
             let position: i64 = row.try_get("position")?;
-            let data: Vec<u8> = row.try_get("data")?;
+            let data: sqlx::types::Json<serde_json::Value> = row.try_get("data")?;
             let metadata: sqlx::types::Json<M> = row.try_get("metadata")?;
 
             out.push(StoredEvent {
@@ -325,7 +429,7 @@ where
                 aggregate_id,
                 kind: event_kind,
                 position,
-                data,
+                data: data.0,
                 metadata: metadata.0,
             });
         }
@@ -341,7 +445,7 @@ where
         &'a self,
         aggregate_kind: &'a str,
         aggregate_id: &'a Self::Id,
-        events: NonEmpty<PersistableEvent<Self::Metadata>>,
+        events: NonEmpty<Self::StagedEvent>,
     ) -> AppendOutcome {
         let mut tx = self
             .pool
@@ -383,15 +487,25 @@ where
             }));
         }
 
+        let mut prepared = Vec::with_capacity(events.len());
+        for event in events {
+            let StagedEvent {
+                kind,
+                data,
+                metadata,
+            } = event;
+            prepared.push((kind, data, metadata));
+        }
+
         let mut qb = QueryBuilder::<Postgres>::new(
             "INSERT INTO es_events (aggregate_kind, aggregate_id, event_kind, data, metadata) ",
         );
-        qb.push_values(events.into_iter(), |mut b, event| {
+        qb.push_values(prepared.into_iter(), |mut b, (kind, data, metadata)| {
             b.push_bind(aggregate_kind);
             b.push_bind(aggregate_id);
-            b.push_bind(event.kind);
-            b.push_bind(event.data);
-            b.push_bind(sqlx::types::Json(event.metadata));
+            b.push_bind(kind);
+            b.push_bind(sqlx::types::Json(data));
+            b.push_bind(sqlx::types::Json(metadata));
         });
         qb.push(" RETURNING position");
 
@@ -429,9 +543,8 @@ where
     }
 }
 
-impl<C, M> GloballyOrderedStore for Store<C, M>
+impl<M> GloballyOrderedStore for Store<M>
 where
-    C: Codec + Clone + Send + Sync + 'static,
-    M: Serialize + DeserializeOwned + Send + Sync + 'static,
+    M: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
 }

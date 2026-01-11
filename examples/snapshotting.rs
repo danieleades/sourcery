@@ -18,15 +18,15 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use sourcery::{
     Aggregate, Apply, ApplyProjection, DomainEvent, Handle, Repository,
-    snapshot::InMemorySnapshotStore,
-    store::{JsonCodec, inmemory},
+    snapshot::inmemory::Store as InMemorySnapshotStore,
+    store::inmemory,
 };
 
 // =============================================================================
 // Domain Events
 // =============================================================================
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PointsEarned {
     pub amount: u64,
     pub reason: String,
@@ -36,7 +36,7 @@ impl DomainEvent for PointsEarned {
     const KIND: &'static str = "loyalty.points.earned";
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PointsRedeemed {
     pub amount: u64,
     pub reward: String,
@@ -56,8 +56,13 @@ impl DomainEvent for PointsRedeemed {
 /// - Long-lived (customers stay for years)
 /// - Many events (every purchase earns points)
 /// - Simple state (just a balance)
-#[derive(Debug, Default, Serialize, Deserialize, Aggregate)]
-#[aggregate(id = String, error = String, events(PointsEarned, PointsRedeemed))]
+#[derive(Default, Serialize, Deserialize, Aggregate)]
+#[aggregate(
+    id = String,
+    error = String,
+    events(PointsEarned, PointsRedeemed),
+    derives(Debug, PartialEq, Eq)
+)]
 pub struct LoyaltyAccount {
     points: u64,
     lifetime_earned: u64,
@@ -147,7 +152,7 @@ impl Handle<RedeemPoints> for LoyaltyAccount {
 // =============================================================================
 
 #[derive(Debug, Default, Serialize, Deserialize, sourcery::Projection)]
-#[projection(id = String, kind = "loyalty.summary")]
+#[projection(id = String, instance_id = String, kind = "loyalty.summary")]
 pub struct LoyaltySummary {
     total_earned: u64,
     total_redeemed: u64,
@@ -184,7 +189,7 @@ type ExampleResult = Result<(), Box<dyn std::error::Error>>;
 async fn run_repository_without_snapshots() -> ExampleResult {
     println!("1. Repository without snapshots (default behavior)");
 
-    let event_store = inmemory::Store::new(JsonCodec);
+    let event_store = inmemory::Store::new();
     let repo = Repository::new(event_store);
     let customer_id = "CUST-001".to_string();
 
@@ -200,7 +205,7 @@ async fn run_repository_without_snapshots() -> ExampleResult {
         .await?;
     }
 
-    let account: LoyaltyAccount = repo.aggregate_builder().load(&customer_id).await?;
+    let account: LoyaltyAccount = repo.load(&customer_id).await?;
     println!(
         "   Points balance: {} (replayed 10 events)",
         account.points()
@@ -213,8 +218,8 @@ async fn run_repository_without_snapshots() -> ExampleResult {
 async fn run_always_snapshot_policy() -> ExampleResult {
     println!("2. Repository with always-snapshot policy");
 
-    let event_store = inmemory::Store::new(JsonCodec);
-    let snapshot_store = InMemorySnapshotStore::always();
+    let event_store = inmemory::Store::new();
+    let snapshot_store = InMemorySnapshotStore::<String, u64>::always();
     let repo = Repository::new(event_store).with_snapshots(snapshot_store);
     let customer_id = "CUST-002".to_string();
 
@@ -231,7 +236,7 @@ async fn run_always_snapshot_policy() -> ExampleResult {
         println!("   After purchase #{i}: snapshot saved");
     }
 
-    let account: LoyaltyAccount = repo.aggregate_builder().load(&customer_id).await?;
+    let account: LoyaltyAccount = repo.load(&customer_id).await?;
     println!(
         "   Final points: {} (loaded from snapshot + 0 events)",
         account.points()
@@ -244,8 +249,8 @@ async fn run_always_snapshot_policy() -> ExampleResult {
 async fn run_every_n_snapshot_policy() -> ExampleResult {
     println!("3. Repository with every-5-events policy");
 
-    let event_store = inmemory::Store::new(JsonCodec);
-    let snapshot_store = InMemorySnapshotStore::every(5);
+    let event_store = inmemory::Store::new();
+    let snapshot_store = InMemorySnapshotStore::<String, u64>::every(5);
     let repo = Repository::new(event_store).with_snapshots(snapshot_store);
     let customer_id = "CUST-003".to_string();
 
@@ -264,7 +269,7 @@ async fn run_every_n_snapshot_policy() -> ExampleResult {
     // With 12 events and snapshots every 5:
     // - Snapshot at position ~5 or ~10 (depending on when threshold triggered)
     // - Remaining events replayed
-    let account: LoyaltyAccount = repo.aggregate_builder().load(&customer_id).await?;
+    let account: LoyaltyAccount = repo.load(&customer_id).await?;
     println!(
         "   Points balance: {} (12 events, snapshots every 5)",
         account.points()
@@ -278,8 +283,8 @@ async fn run_every_n_snapshot_policy() -> ExampleResult {
 async fn run_snapshot_restoration() -> ExampleResult {
     println!("4. Snapshot restoration after more activity");
 
-    let event_store = inmemory::Store::new(JsonCodec);
-    let snapshot_store = InMemorySnapshotStore::every(3);
+    let event_store = inmemory::Store::new();
+    let snapshot_store = InMemorySnapshotStore::<String, u64>::every(3);
     let repo = Repository::new(event_store).with_snapshots(snapshot_store);
     let customer_id = "CUST-004".to_string();
 
@@ -295,7 +300,7 @@ async fn run_snapshot_restoration() -> ExampleResult {
         .await?;
     }
 
-    let account: LoyaltyAccount = repo.aggregate_builder().load(&customer_id).await?;
+    let account: LoyaltyAccount = repo.load(&customer_id).await?;
     println!("   After 5 earnings: {} points", account.points());
 
     repo.execute_command::<LoyaltyAccount, RedeemPoints>(
@@ -308,7 +313,7 @@ async fn run_snapshot_restoration() -> ExampleResult {
     )
     .await?;
 
-    let account: LoyaltyAccount = repo.aggregate_builder().load(&customer_id).await?;
+    let account: LoyaltyAccount = repo.load(&customer_id).await?;
     println!("   After redemption: {} points", account.points());
     println!("   Lifetime earned: {}", account.lifetime_earned());
     println!("   Lifetime redeemed: {}", account.lifetime_redeemed());
@@ -320,8 +325,8 @@ async fn run_snapshot_restoration() -> ExampleResult {
 async fn run_never_snapshot_policy() -> ExampleResult {
     println!("5. Never-snapshot policy (load-only mode)");
 
-    let event_store = inmemory::Store::new(JsonCodec);
-    let snapshot_store = InMemorySnapshotStore::never();
+    let event_store = inmemory::Store::new();
+    let snapshot_store = InMemorySnapshotStore::<String, u64>::never();
     let repo = Repository::new(event_store).with_snapshots(snapshot_store);
     let customer_id = "CUST-005".to_string();
 
@@ -337,7 +342,7 @@ async fn run_never_snapshot_policy() -> ExampleResult {
         .await?;
     }
 
-    let account: LoyaltyAccount = repo.aggregate_builder().load(&customer_id).await?;
+    let account: LoyaltyAccount = repo.load(&customer_id).await?;
     println!(
         "   Points: {} (full replay, no snapshots saved)",
         account.points()
@@ -350,9 +355,10 @@ async fn run_never_snapshot_policy() -> ExampleResult {
 async fn run_projection_snapshotting() -> ExampleResult {
     println!("6. Projection snapshotting (global ordering required)");
 
-    let event_store = inmemory::Store::new(JsonCodec);
-    let snapshot_store = InMemorySnapshotStore::every(2);
+    let event_store = inmemory::Store::new();
+    let snapshot_store = InMemorySnapshotStore::<String, u64>::every(2);
     let repo = Repository::new(event_store).with_snapshots(snapshot_store);
+    let instance_id = "loyalty-summary".to_string();
 
     let customer_a = "CUST-P1".to_string();
     let customer_b = "CUST-P2".to_string();
@@ -390,7 +396,7 @@ async fn run_projection_snapshotting() -> ExampleResult {
         .event::<PointsEarned>()
         .event::<PointsRedeemed>()
         .with_snapshot()
-        .load()
+        .load_for(&instance_id)
         .await?;
 
     println!(

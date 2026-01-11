@@ -1,14 +1,12 @@
-//! Integration tests for aggregate behavior using the [`TestFramework`].
+//! Integration tests for aggregate behavior using the test utilities.
 //! Run with `cargo test --features test-util`.
 
 #[cfg(feature = "test-util")]
 mod with_test_util {
     use serde::{Deserialize, Serialize};
     use sourcery::{
-        Aggregate, DomainEvent, Handle,
-        codec::{Codec, EventDecodeError, ProjectionEvent, SerializableEvent},
-        store::PersistableEvent,
-        test::TestFramework,
+        Aggregate, Apply, DomainEvent, Handle,
+        test::TestExecutor,
     };
 
     // ============================================================================
@@ -42,97 +40,34 @@ mod with_test_util {
         const KIND: &'static str = "account-opened";
     }
 
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    enum BankAccountEvent {
-        Opened(AccountOpened),
-        Deposited(MoneyDeposited),
-        Withdrawn(MoneyWithdrawn),
-    }
-
-    impl SerializableEvent for BankAccountEvent {
-        fn to_persistable<C: Codec, M>(
-            self,
-            codec: &C,
-            metadata: M,
-        ) -> Result<PersistableEvent<M>, C::Error> {
-            match self {
-                Self::Opened(e) => Ok(PersistableEvent {
-                    kind: AccountOpened::KIND.to_string(),
-                    data: codec.serialize(&e)?,
-                    metadata,
-                }),
-                Self::Deposited(e) => Ok(PersistableEvent {
-                    kind: MoneyDeposited::KIND.to_string(),
-                    data: codec.serialize(&e)?,
-                    metadata,
-                }),
-                Self::Withdrawn(e) => Ok(PersistableEvent {
-                    kind: MoneyWithdrawn::KIND.to_string(),
-                    data: codec.serialize(&e)?,
-                    metadata,
-                }),
-            }
-        }
-    }
-
-    impl ProjectionEvent for BankAccountEvent {
-        const EVENT_KINDS: &'static [&'static str] = &[
-            AccountOpened::KIND,
-            MoneyDeposited::KIND,
-            MoneyWithdrawn::KIND,
-        ];
-
-        fn from_stored<C: Codec>(
-            kind: &str,
-            data: &[u8],
-            codec: &C,
-        ) -> Result<Self, EventDecodeError<C::Error>> {
-            match kind {
-                "account-opened" => Ok(Self::Opened(
-                    codec.deserialize(data).map_err(EventDecodeError::Codec)?,
-                )),
-                "money-deposited" => Ok(Self::Deposited(
-                    codec.deserialize(data).map_err(EventDecodeError::Codec)?,
-                )),
-                "money-withdrawn" => Ok(Self::Withdrawn(
-                    codec.deserialize(data).map_err(EventDecodeError::Codec)?,
-                )),
-                _ => Err(EventDecodeError::UnknownKind {
-                    kind: kind.to_string(),
-                    expected: Self::EVENT_KINDS,
-                }),
-            }
-        }
-    }
-
-    #[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+    #[derive(Default, Serialize, Deserialize, Aggregate)]
+    #[aggregate(
+        id = String,
+        error = String,
+        events(AccountOpened, MoneyDeposited, MoneyWithdrawn),
+        derives(Debug, PartialEq)
+    )]
     struct BankAccount {
         balance: u64,
         is_open: bool,
     }
 
-    // Hand-written aggregates only need to implement Aggregate::apply directly.
-    // The Apply<E> trait is only required when using #[derive(Aggregate)].
-    impl Aggregate for BankAccount {
-        type Error = String;
-        type Event = BankAccountEvent;
-        type Id = String;
+    impl Apply<AccountOpened> for BankAccount {
+        fn apply(&mut self, event: &AccountOpened) {
+            self.is_open = true;
+            self.balance = event.initial_balance;
+        }
+    }
 
-        const KIND: &'static str = "bank-account";
+    impl Apply<MoneyDeposited> for BankAccount {
+        fn apply(&mut self, event: &MoneyDeposited) {
+            self.balance += event.amount;
+        }
+    }
 
-        fn apply(&mut self, event: &Self::Event) {
-            match event {
-                BankAccountEvent::Opened(e) => {
-                    self.is_open = true;
-                    self.balance = e.initial_balance;
-                }
-                BankAccountEvent::Deposited(e) => {
-                    self.balance += e.amount;
-                }
-                BankAccountEvent::Withdrawn(e) => {
-                    self.balance -= e.amount;
-                }
-            }
+    impl Apply<MoneyWithdrawn> for BankAccount {
+        fn apply(&mut self, event: &MoneyWithdrawn) {
+            self.balance -= event.amount;
         }
     }
 
@@ -154,9 +89,9 @@ mod with_test_util {
             if self.is_open {
                 return Err("account already open".to_string());
             }
-            Ok(vec![BankAccountEvent::Opened(AccountOpened {
+            Ok(vec![AccountOpened {
                 initial_balance: command.initial_balance,
-            })])
+            }.into()])
         }
     }
 
@@ -168,9 +103,9 @@ mod with_test_util {
             if command.amount == 0 {
                 return Err("amount must be positive".to_string());
             }
-            Ok(vec![BankAccountEvent::Deposited(MoneyDeposited {
+            Ok(vec![MoneyDeposited {
                 amount: command.amount,
-            })])
+            }.into()])
         }
     }
 
@@ -185,9 +120,9 @@ mod with_test_util {
             if command.amount > self.balance {
                 return Err("insufficient funds".to_string());
             }
-            Ok(vec![BankAccountEvent::Withdrawn(MoneyWithdrawn {
+            Ok(vec![MoneyWithdrawn {
                 amount: command.amount,
-            })])
+            }.into()])
         }
     }
 
@@ -195,74 +130,65 @@ mod with_test_util {
     // Tests
     // ============================================================================
 
-    type AccountTest = TestFramework<BankAccount>;
-
     #[test]
     fn open_account_produces_event() {
-        AccountTest::new()
-            .given_no_previous_events()
+        TestExecutor::<BankAccount>::given(&[])
             .when(&OpenAccount {
                 initial_balance: 100,
             })
-            .then_expect_events(&[BankAccountEvent::Opened(AccountOpened {
+            .then_expect_events(&[AccountOpened {
                 initial_balance: 100,
-            })]);
+            }.into()]);
     }
 
     #[test]
     fn cannot_open_already_open_account() {
-        AccountTest::new()
-            .given(&[BankAccountEvent::Opened(AccountOpened {
-                initial_balance: 0,
-            })])
-            .when(&OpenAccount {
-                initial_balance: 100,
-            })
-            .then_expect_error_message("already open");
+        TestExecutor::<BankAccount>::given(&[AccountOpened {
+            initial_balance: 0,
+        }.into()])
+        .when(&OpenAccount {
+            initial_balance: 100,
+        })
+        .then_expect_error_message("already open");
     }
 
     #[test]
     fn deposit_increases_balance() {
-        AccountTest::new()
-            .given(&[BankAccountEvent::Opened(AccountOpened {
-                initial_balance: 100,
-            })])
-            .when(&Deposit { amount: 50 })
-            .then_expect_events(&[BankAccountEvent::Deposited(MoneyDeposited { amount: 50 })]);
+        TestExecutor::<BankAccount>::given(&[AccountOpened {
+            initial_balance: 100,
+        }.into()])
+        .when(&Deposit { amount: 50 })
+        .then_expect_events(&[MoneyDeposited { amount: 50 }.into()]);
     }
 
     #[test]
     fn cannot_deposit_to_closed_account() {
-        AccountTest::new()
-            .given_no_previous_events()
+        TestExecutor::<BankAccount>::given(&[])
             .when(&Deposit { amount: 50 })
             .then_expect_error_message("not open");
     }
 
     #[test]
     fn withdraw_decreases_balance() {
-        AccountTest::new()
-            .given(&[BankAccountEvent::Opened(AccountOpened {
-                initial_balance: 100,
-            })])
-            .when(&Withdraw { amount: 30 })
-            .then_expect_events(&[BankAccountEvent::Withdrawn(MoneyWithdrawn { amount: 30 })]);
+        TestExecutor::<BankAccount>::given(&[AccountOpened {
+            initial_balance: 100,
+        }.into()])
+        .when(&Withdraw { amount: 30 })
+        .then_expect_events(&[MoneyWithdrawn { amount: 30 }.into()]);
     }
 
     #[test]
     fn cannot_withdraw_more_than_balance() {
-        AccountTest::new()
-            .given(&[BankAccountEvent::Opened(AccountOpened {
-                initial_balance: 100,
-            })])
-            .when(&Withdraw { amount: 150 })
-            .then_expect_error_message("insufficient funds");
+        TestExecutor::<BankAccount>::given(&[AccountOpened {
+            initial_balance: 100,
+        }.into()])
+        .when(&Withdraw { amount: 150 })
+        .then_expect_error_message("insufficient funds");
     }
 
     #[test]
     fn cannot_withdraw_from_closed_account() {
-        AccountTest::new()
-            .given_no_previous_events()
+        TestExecutor::<BankAccount>::given(&[])
             .when(&Withdraw { amount: 50 })
             .then_expect_error_message("not open");
     }
@@ -270,52 +196,51 @@ mod with_test_util {
     #[test]
     fn state_is_rebuilt_from_event_history() {
         // Verify that given() properly rebuilds state from events
-        AccountTest::new()
-            .given(&[
-                BankAccountEvent::Opened(AccountOpened {
-                    initial_balance: 100,
-                }),
-                BankAccountEvent::Deposited(MoneyDeposited { amount: 50 }),
-                BankAccountEvent::Withdrawn(MoneyWithdrawn { amount: 30 }),
-            ])
-            // Balance should be 100 + 50 - 30 = 120
-            // Withdrawing 120 should succeed
-            .when(&Withdraw { amount: 120 })
-            .then_expect_events(&[BankAccountEvent::Withdrawn(MoneyWithdrawn { amount: 120 })]);
+        TestExecutor::<BankAccount>::given(&[
+            AccountOpened {
+                initial_balance: 100,
+            }.into(),
+            MoneyDeposited { amount: 50 }.into(),
+            MoneyWithdrawn { amount: 30 }.into(),
+        ])
+        // Balance should be 100 + 50 - 30 = 120
+        // Withdrawing 120 should succeed
+        .when(&Withdraw { amount: 120 })
+        .then_expect_events(&[MoneyWithdrawn { amount: 120 }.into()]);
     }
 
     #[test]
     fn and_allows_building_complex_state() {
-        AccountTest::new()
-            .given(&[BankAccountEvent::Opened(AccountOpened {
-                initial_balance: 100,
-            })])
-            .and(vec![BankAccountEvent::Deposited(MoneyDeposited {
-                amount: 200,
-            })])
-            .and(vec![BankAccountEvent::Withdrawn(MoneyWithdrawn {
-                amount: 50,
-            })])
-            // Balance: 100 + 200 - 50 = 250
-            .when(&Withdraw { amount: 250 })
-            .then_expect_events(&[BankAccountEvent::Withdrawn(MoneyWithdrawn { amount: 250 })]);
+        TestExecutor::<BankAccount>::given(&[AccountOpened {
+            initial_balance: 100,
+        }.into()])
+        .and(vec![MoneyDeposited {
+            amount: 200,
+        }.into()])
+        .and(vec![MoneyWithdrawn {
+            amount: 50,
+        }.into()])
+        // Balance: 100 + 200 - 50 = 250
+        .when(&Withdraw { amount: 250 })
+        .then_expect_events(&[MoneyWithdrawn { amount: 250 }.into()]);
     }
 
     #[test]
     fn inspect_result_allows_custom_assertions() {
-        let result = AccountTest::new()
-            .given(&[BankAccountEvent::Opened(AccountOpened {
-                initial_balance: 100,
-            })])
-            .when(&Deposit { amount: 50 })
-            .inspect_result();
+        let result = TestExecutor::<BankAccount>::given(&[AccountOpened {
+            initial_balance: 100,
+        }.into()])
+        .when(&Deposit { amount: 50 })
+        .inspect_result();
 
         assert!(result.is_ok());
         let events = result.unwrap();
         assert_eq!(events.len(), 1);
+        // The generated event enum uses PascalCase variant names derived from the event type
+        // For example: MoneyDeposited becomes the MoneyDeposited variant
         match &events[0] {
-            BankAccountEvent::Deposited(e) => assert_eq!(e.amount, 50),
-            _ => panic!("Expected Deposited event"),
+            BankAccountEvent::MoneyDeposited(e) => assert_eq!(e.amount, 50),
+            _ => panic!("Expected MoneyDeposited event"),
         }
     }
 }

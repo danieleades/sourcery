@@ -11,8 +11,11 @@
 //!
 //! Key architectural points:
 //! - **Pure events**: Domain events contain no persistence metadata
-//! - **Composite IDs**: Sale aggregate IDs encode the product SKU in
-//!   `aggregate_id`
+//! - **Composite IDs**: `SaleId` is a type-safe domain type that serializes to
+//!   string for storage
+//! - **Shared ID type**: All aggregates in a store must share the same ID type
+//!   (`String`), but domain code can use stronger types like `SaleId` that
+//!   convert to/from the storage format
 //! - **`ApplyProjection` + builder**: Projections access `aggregate_kind`,
 //!   `aggregate_id`, and metadata
 //! - **External IDs**: Aggregates treat IDs as infrastructure metadata supplied
@@ -23,7 +26,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use sourcery::{
     Aggregate, Apply, ApplyProjection, DomainEvent, Handle, Repository,
-    store::{JsonCodec, inmemory},
+    store::{inmemory},
 };
 
 // =============================================================================
@@ -43,7 +46,7 @@ pub struct AdjustInventory {
     pub reason: String,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize, Aggregate)]
+#[derive(Default, Serialize, Deserialize, Aggregate)]
 #[aggregate(id = String, error = String, events(ProductRestocked, InventoryAdjusted))]
 pub struct Product {
     // No SKU field! The ID is external metadata
@@ -52,13 +55,13 @@ pub struct Product {
 }
 
 // Pure domain events - no infrastructure data
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProductRestocked {
     pub quantity: i64,
     pub unit_price_cents: i64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InventoryAdjusted {
     pub quantity_delta: i64,
     pub reason: String,
@@ -128,7 +131,10 @@ impl Handle<AdjustInventory> for Product {
 /// Encodes both the product SKU and sale number. The product SKU embedded in
 /// the ID allows projections to correlate sale events with product inventory
 /// without polluting the event data with cross-aggregate references.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// The ID is serialized as `"{product_sku}::{sale_number}"` for storage.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(into = "String", try_from = "String")]
 pub struct SaleId {
     pub product_sku: String,
     pub sale_number: String,
@@ -137,6 +143,27 @@ pub struct SaleId {
 impl std::fmt::Display for SaleId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}::{}", self.product_sku, self.sale_number)
+    }
+}
+
+impl From<SaleId> for String {
+    fn from(id: SaleId) -> Self {
+        format!("{}::{}", id.product_sku, id.sale_number)
+    }
+}
+
+impl TryFrom<String> for SaleId {
+    type Error = String;
+
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        let parts: Vec<&str> = s.split("::").collect();
+        if parts.len() != 2 {
+            return Err(format!("Invalid SaleId format: expected 'sku::number', got '{s}'"));
+        }
+        Ok(Self {
+            product_sku: parts[0].to_string(),
+            sale_number: parts[1].to_string(),
+        })
     }
 }
 
@@ -152,19 +179,19 @@ pub struct RefundSale {
     pub amount_cents: i64,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize, Aggregate)]
+#[derive(Default, Serialize, Deserialize, Aggregate)]
 #[aggregate(id = String, error = String, events(SaleCompleted, SaleRefunded))]
 pub struct Sale {
     total_cents: i64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SaleCompleted {
     pub quantity: i64,
     pub sale_price_cents: i64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SaleRefunded {
     pub amount_cents: i64,
 }
@@ -284,7 +311,7 @@ impl ApplyProjection<InventoryAdjusted> for InventoryReport {
     }
 }
 
-// ApplyProjection implementation - needs aggregate_id to extract product SKU
+// ApplyProjection implementation - extract product SKU from composite ID
 impl ApplyProjection<SaleCompleted> for InventoryReport {
     fn apply_projection(
         &mut self,
@@ -292,9 +319,11 @@ impl ApplyProjection<SaleCompleted> for InventoryReport {
         event: &SaleCompleted,
         _metadata: &Self::Metadata,
     ) {
-        // Extract product SKU from aggregate_id format: "{product_sku}::{sale_number}"
-        // (the "sale::" kind prefix has already been stripped)
-        let sku = aggregate_id.split("::").next().unwrap_or(aggregate_id);
+        // Parse the composite ID to extract product SKU
+        // Format: "{product_sku}::{sale_number}"
+        let sale_id = SaleId::try_from(aggregate_id.clone())
+            .expect("aggregate_id should be valid SaleId format");
+        let sku = &sale_id.product_sku;
 
         self.total_sales_completed += 1;
         let sale_amount = event.quantity * event.sale_price_cents;
@@ -329,7 +358,7 @@ impl ApplyProjection<SaleRefunded> for InventoryReport {
 #[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let store = inmemory::Store::new(JsonCodec);
+    let store = inmemory::Store::new();
     let repository = Repository::new(store);
 
     println!("=== Inventory Management System ===\n");
@@ -358,22 +387,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?;
 
-    // Make sales - using composite SaleId that encodes product reference
+    // Make sales - using type-safe composite SaleId that encodes product reference
     println!("2. Processing sales...");
+
+    // Create typed SaleIds for type safety and clarity in domain code
     let sale1_id = SaleId {
         product_sku: "WIDGET-001".to_string(),
         sale_number: "001".to_string(),
-    }
-    .to_string();
+    };
     let sale2_id = SaleId {
         product_sku: "GADGET-002".to_string(),
         sale_number: "002".to_string(),
-    }
-    .to_string();
+    };
 
+    // Convert to String for storage (via Display impl)
     repository
         .execute_command::<Sale, CompleteSale>(
-            &sale1_id,
+            &sale1_id.to_string(),
             &CompleteSale {
                 quantity: 10,
                 sale_price_cents: 2500,
@@ -384,7 +414,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     repository
         .execute_command::<Sale, CompleteSale>(
-            &sale2_id,
+            &sale2_id.to_string(),
             &CompleteSale {
                 quantity: 5,
                 sale_price_cents: 5000,
@@ -409,7 +439,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Process refund
     println!("4. Processing refund...");
     repository
-        .execute_command::<Sale, RefundSale>(&sale1_id, &RefundSale { amount_cents: 5000 }, &())
+        .execute_command::<Sale, RefundSale>(
+            &sale1_id.to_string(),
+            &RefundSale { amount_cents: 5000 },
+            &(),
+        )
         .await?;
 
     // Additional restocking

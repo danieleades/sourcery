@@ -40,7 +40,7 @@ pub struct Optimistic;
 ///
 /// This trait cannot be implemented outside this crate, ensuring only
 /// [`Unchecked`] and [`Optimistic`] can be used as concurrency strategies.
-pub trait ConcurrencyStrategy: private::Sealed + Default + Send + Sync + 'static {
+pub trait ConcurrencyStrategy: private::Sealed + Default + Send + Sync {
     /// Whether this strategy checks versions before appending.
     const CHECK_VERSION: bool;
 }
