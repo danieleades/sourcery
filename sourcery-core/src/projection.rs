@@ -102,16 +102,27 @@ where
     P::InstanceId: Sync,
     SS: SnapshotStore<P::InstanceId, Position = S::Position>,
 {
-    pub(super) store: &'a S,
-    pub(super) snapshots: &'a SS,
+    store: &'a S,
+    snapshots: &'a SS,
     /// Event kind -> handler mapping for O(1) dispatch
     handlers: HashMap<String, EventHandler<P, S>>,
     /// Filters for loading events from the store
     filters: Vec<EventFilter<S::Id, S::Position>>,
-    pub(super) _phantom: PhantomData<fn() -> (P, Snap)>,
+    _phantom: PhantomData<fn() -> (P, Snap)>,
 }
 
+/// Type-level marker indicating no snapshot support.
+///
+/// This is an implementation detail of [`ProjectionBuilder`]'s type-state pattern.
+/// You should never need to name this type directly - use the builder methods instead.
+#[doc(hidden)]
 pub struct NoSnapshot;
+
+/// Type-level marker indicating snapshot support is enabled.
+///
+/// This is an implementation detail of [`ProjectionBuilder`]'s type-state pattern.
+/// You should never need to name this type directly - use the builder methods instead.
+#[doc(hidden)]
 pub struct WithSnapshot;
 
 impl<'a, S, P, SS, Snap> ProjectionBuilder<'a, S, P, SS, Snap>
@@ -510,7 +521,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn projection_error_display_store_mentions_loading() {
+    fn error_display_store_mentions_loading() {
         let error: ProjectionError<io::Error> =
             ProjectionError::Store(io::Error::new(io::ErrorKind::NotFound, "not found"));
         let msg = error.to_string();

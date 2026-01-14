@@ -267,3 +267,110 @@ impl<Id> SnapshotKey<Id> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::convert::Infallible;
+
+    use super::*;
+
+    #[test]
+    fn always_should_snapshot() {
+        let policy = SnapshotPolicy::Always;
+        assert!(policy.should_snapshot(0));
+        assert!(policy.should_snapshot(1));
+        assert!(policy.should_snapshot(100));
+    }
+
+    #[test]
+    fn every_n_at_threshold() {
+        let policy = SnapshotPolicy::EveryNEvents(3);
+        assert!(policy.should_snapshot(3));
+        assert!(policy.should_snapshot(4));
+        assert!(policy.should_snapshot(100));
+    }
+
+    #[test]
+    fn every_n_below_threshold() {
+        let policy = SnapshotPolicy::EveryNEvents(3);
+        assert!(!policy.should_snapshot(0));
+        assert!(!policy.should_snapshot(1));
+        assert!(!policy.should_snapshot(2));
+    }
+
+    #[test]
+    fn never_should_snapshot() {
+        let policy = SnapshotPolicy::Never;
+        assert!(!policy.should_snapshot(0));
+        assert!(!policy.should_snapshot(1));
+        assert!(!policy.should_snapshot(100));
+    }
+
+    #[tokio::test]
+    async fn load_returns_none_for_missing() {
+        let store = Store::<String, u64>::always();
+        let result: Option<Snapshot<u64, String>> = store.load("test", &"id".to_string()).await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn load_returns_stored_snapshot() {
+        let store = Store::<String, u64>::always();
+        let id = "test-id".to_string();
+
+        store
+            .offer_snapshot::<Infallible, _, _>("test", &id, 1, || {
+                Ok(Snapshot {
+                    position: 5,
+                    data: "snapshot-data".to_string(),
+                })
+            })
+            .await
+            .unwrap();
+
+        let loaded: Snapshot<u64, String> = store.load("test", &id).await.unwrap().unwrap();
+        assert_eq!(loaded.position, 5);
+        assert_eq!(loaded.data, "snapshot-data");
+    }
+
+    #[tokio::test]
+    async fn offer_declines_older_position() {
+        let store = Store::<String, u64>::always();
+        let id = "test-id".to_string();
+
+        // Store initial snapshot at position 10
+        store
+            .offer_snapshot::<Infallible, _, _>("test", &id, 1, || {
+                Ok(Snapshot {
+                    position: 10,
+                    data: "first",
+                })
+            })
+            .await
+            .unwrap();
+
+        // Try to store older snapshot at position 5 - should be declined
+        let result = store
+            .offer_snapshot::<Infallible, _, _>("test", &id, 1, || {
+                Ok(Snapshot {
+                    position: 5,
+                    data: "older",
+                })
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result, SnapshotOffer::Declined);
+
+        // Verify original snapshot is still there
+        let loaded: Snapshot<u64, String> = store.load("test", &id).await.unwrap().unwrap();
+        assert_eq!(loaded.position, 10);
+        assert_eq!(loaded.data, "first");
+    }
+
+    #[test]
+    fn default_is_always() {
+        let store = Store::<String, u64>::default();
+        assert!(matches!(store.policy, SnapshotPolicy::Always));
+    }
+}

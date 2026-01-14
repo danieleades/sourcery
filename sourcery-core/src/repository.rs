@@ -1,11 +1,32 @@
-//! Application service orchestration.
+//! Command execution and aggregate lifecycle management.
 //!
-//! `Repository` coordinates loading aggregates, invoking command handlers, and
-//! appending resulting events to the store.
+//! The [`Repository`] orchestrates the core event sourcing workflow:
 //!
-//! Snapshot support is opt-in via `Repository<_, _, Snapshots<_>>`. This keeps
-//! the default repository lightweight: no snapshot load/serialize work and no
-//! serde bounds on aggregate state unless snapshots are enabled.
+//! 1. Load aggregate state by replaying events
+//! 2. Execute commands via [`Handle<C>`](crate::aggregate::Handle)
+//! 3. Persist resulting events transactionally
+//! 4. Build projections from event streams
+//!
+//! # Quick Example
+//!
+//! ```ignore
+//! let repo = Repository::new(store);
+//!
+//! // Execute a command
+//! repo.execute_command::<Account, Deposit>(&id, &cmd, &metadata).await?;
+//!
+//! // Load aggregate state
+//! let account: Account = repo.load(&id).await?;
+//!
+//! // Build a projection
+//! let report = repo.build_projection::<Report>()
+//!     .event::<ProductRestocked>()
+//!     .load()
+//!     .await?;
+//! ```
+//!
+//! See the [quickstart example](https://github.com/danieleades/sourcery/blob/main/examples/quickstart.rs)
+//! for a complete working example.
 
 use std::marker::PhantomData;
 
@@ -198,7 +219,26 @@ where
 }
 
 /// Snapshot-enabled repository mode wrapper.
-pub struct Snapshots<SS>(pub SS);
+///
+/// This is an implementation detail of [`Repository`]'s type-state pattern for
+/// snapshot support. You should never construct this type directly.
+///
+/// # Usage
+///
+/// Enable snapshots via [`Repository::with_snapshots()`]:
+///
+/// ```ignore
+/// let repo = Repository::new(store)
+///     .with_snapshots(snapshot_store);
+/// ```
+pub struct Snapshots<SS>(
+    /// The underlying snapshot store implementation.
+    ///
+    /// This field is public for trait implementation purposes only.
+    /// Do not access it directly.
+    #[doc(hidden)]
+    pub SS,
+);
 
 impl<Id, SS> SnapshotStore<Id> for Snapshots<SS>
 where
@@ -237,9 +277,10 @@ where
     }
 }
 
-/// Repository type alias with default concurrency (optimistic) and no snapshots.
+/// Repository type alias with optimistic concurrency and no snapshots.
 ///
-/// This is the most common repository configuration and is equivalent to:
+/// This configuration provides version-checked writes without snapshot support.
+/// It is equivalent to:
 /// ```ignore
 /// Repository<S, Optimistic, NoSnapshots<<S as EventStore>::Position>>
 /// ```
@@ -250,9 +291,9 @@ where
 /// use sourcery::{Repository, store::inmemory};
 ///
 /// let store = inmemory::Store::new();
-/// let repo: DefaultRepository<_> = Repository::new(store);
+/// let repo: OptimisticRepository<_> = Repository::new(store);
 /// ```
-pub type DefaultRepository<S> =
+pub type OptimisticRepository<S> =
     Repository<S, Optimistic, crate::snapshot::NoSnapshots<<S as EventStore>::Position>>;
 
 /// Repository type alias with unchecked concurrency and no snapshots.
@@ -267,10 +308,11 @@ pub type DefaultRepository<S> =
 pub type UncheckedRepository<S> =
     Repository<S, Unchecked, crate::snapshot::NoSnapshots<<S as EventStore>::Position>>;
 
-/// Repository type alias with snapshots enabled and default optimistic concurrency.
+/// Repository type alias with optimistic concurrency and snapshot support.
 ///
-/// This configuration enables snapshot support for faster aggregate loading.
-/// Requires aggregate state to implement `Serialize + DeserializeOwned`.
+/// This configuration enables snapshot support for faster aggregate loading
+/// with version-checked writes. Requires aggregate state to implement
+/// `Serialize + DeserializeOwned`.
 ///
 /// Equivalent to:
 /// ```ignore
@@ -284,38 +326,60 @@ pub type UncheckedRepository<S> =
 ///
 /// let store = inmemory::Store::new();
 /// let snapshot_store = inmemory::Store::every(100);
-/// let repo: SnapshotRepository<_, _> = Repository::new(store)
+/// let repo: OptimisticSnapshotRepository<_, _> = Repository::new(store)
 ///     .with_snapshots(snapshot_store);
 /// ```
-pub type SnapshotRepository<S, SS> = Repository<S, Optimistic, SS>;
+pub type OptimisticSnapshotRepository<S, SS> = Repository<S, Optimistic, SS>;
 
-/// Repository.
+/// Command execution and aggregate lifecycle orchestrator.
 ///
-/// Orchestrates aggregate loading, command execution, and event persistence.
+/// Repository manages the complete event sourcing workflow: loading aggregates
+/// by replaying events, executing commands through handlers, and persisting
+/// resulting events transactionally.
 ///
-/// # Type Parameters
+/// # Usage
 ///
-/// - `S`: Event store implementation
-/// - `C`: Concurrency strategy (`Optimistic` or `Unchecked`), defaults to `Optimistic`
-/// - `M`: Snapshot mode (`NoSnapshots` or `SnapshotStore`), defaults to `NoSnapshots`
+/// ```ignore
+/// // Create repository
+/// let repo = Repository::new(store);
+///
+/// // Execute commands
+/// repo.execute_command::<Account, Deposit>(&id, &cmd, &metadata).await?;
+///
+/// // Load aggregate state
+/// let account: Account = repo.load(&id).await?;
+///
+/// // Build projections
+/// let report = repo.build_projection::<InventoryReport>()
+///     .event::<ProductRestocked>()
+///     .load()
+///     .await?;
+///
+/// // Enable snapshots for faster loading
+/// let repo_with_snaps = repo.with_snapshots(snapshot_store);
+/// ```
 ///
 /// # Type Aliases
 ///
-/// For common configurations, use these type aliases instead of the full generic form:
+/// Use these type aliases for common configurations:
 ///
-/// - [`DefaultRepository<S>`] - Optimistic concurrency, no snapshots (most common)
-/// - [`UncheckedRepository<S>`] - No concurrency checking, no snapshots
-/// - [`SnapshotRepository<S, SS>`] - Optimistic concurrency with snapshots
+/// - [`OptimisticRepository<S>`] - Version-checked writes, no snapshots
+/// - [`UncheckedRepository<S>`] - Last-writer-wins, no snapshots
+/// - [`OptimisticSnapshotRepository<S, SS>`] - Version-checked writes with snapshots
 ///
-/// # Examples
+/// # Concurrency Strategies
 ///
-/// ```ignore
-/// // Using type alias (recommended)
-/// let repo: DefaultRepository<_> = Repository::new(store);
+/// - **Optimistic** (default): Detects conflicts via version checking. Use
+///   [`execute_with_retry()`](Self::execute_with_retry) to automatically retry on conflicts.
+/// - **Unchecked**: Last-writer-wins semantics. Use only when concurrent writes
+///   are impossible or acceptable.
 ///
-/// // Or full generic form
-/// let repo: Repository<_, Optimistic, NoSnapshots<_>> = Repository::new(store);
-/// ```
+/// # See Also
+///
+/// - [quickstart example](https://github.com/danieleades/sourcery/blob/main/examples/quickstart.rs) - Complete workflow
+/// - [`execute_command()`](Self::execute_command) - Command execution
+/// - [`load()`](Self::load) - Aggregate loading
+/// - [`build_projection()`](Self::build_projection) - Projection building
 pub struct Repository<
     S,
     C = Optimistic,

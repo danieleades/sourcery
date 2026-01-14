@@ -29,25 +29,25 @@ Instead of replaying 1050 events, you load the snapshot and replay only 50.
 Use `with_snapshots()` when creating the repository:
 
 ```rust,ignore
-use sourcery::{Repository, snapshot::InMemorySnapshotStore, store::{inmemory, JsonCodec}};
+use sourcery::{Repository, snapshot::inmemory, store::inmemory as event_store};
 
-let event_store = inmemory::Store::new(JsonCodec);
-let snapshot_store = InMemorySnapshotStore::always();
+let event_store = event_store::Store::new();
+let snapshot_store = inmemory::Store::every(100);
 
-let mut repository = Repository::new(event_store)
+let repository = Repository::new(event_store)
     .with_snapshots(snapshot_store);
 ```
 
 ## Snapshot Policies
 
-`InMemorySnapshotStore` provides three policies:
+`snapshot::inmemory::Store` provides three policies:
 
 ### Always
 
 Save a snapshot after every command:
 
 ```rust,ignore
-let snapshots = InMemorySnapshotStore::always();
+let snapshots = inmemory::Store::always();
 ```
 
 Use for: Aggregates with expensive replay, testing.
@@ -57,7 +57,7 @@ Use for: Aggregates with expensive replay, testing.
 Save after accumulating N events since the last snapshot:
 
 ```rust,ignore
-let snapshots = InMemorySnapshotStore::every(100);
+let snapshots = inmemory::Store::every(100);
 ```
 
 Use for: Production workloads balancing storage vs. replay cost.
@@ -67,7 +67,7 @@ Use for: Production workloads balancing storage vs. replay cost.
 Never save (load-only mode):
 
 ```rust,ignore
-let snapshots = InMemorySnapshotStore::never();
+let snapshots = inmemory::Store::never();
 ```
 
 Use for: Read-only replicas, debugging.
@@ -78,18 +78,18 @@ Use for: Read-only replicas, debugging.
 {{#include ../../../sourcery-core/src/snapshot.rs:snapshot_store_trait}}
 ```
 
-The repository calls `offer_snapshot` after successfully appending new events. Implementations may decline without invoking `create_snapshot`, avoiding unnecessary snapshot encoding work.
+The repository calls `offer_snapshot` after successfully appending new events. Implementations may decline without invoking `create_snapshot`, avoiding unnecessary snapshot serialization.
 
 ## The `Snapshot` Type
 
 ```rust,ignore
-pub struct Snapshot<Pos> {
+pub struct Snapshot<Pos, Data> {
     pub position: Pos,
-    pub data: Vec<u8>,
+    pub data: Data,
 }
 ```
 
-The `data` is the serialized aggregate state encoded using the repository's event codec.
+The `position` indicates which event this snapshot was taken after. When loading, only events after this position need to be replayed.
 
 ## Projection Snapshots
 
@@ -104,7 +104,7 @@ struct LoyaltySummary {
     total_earned: u64,
 }
 
-let repo = Repository::new(store).with_snapshots(InMemorySnapshotStore::every(100));
+let repo = Repository::new(store).with_snapshots(inmemory::Store::every(100));
 
 let summary: LoyaltySummary = repo
     .build_projection::<LoyaltySummary>()

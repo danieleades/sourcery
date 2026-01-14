@@ -124,6 +124,7 @@ pub type AppendOutcome<Pos, Err> = Result<AppendResult<Pos>, AppendError<Pos, Er
 /// The `C` type parameter determines the concurrency strategy:
 /// - [`Optimistic`]: Version checked on commit (default, recommended)
 /// - [`Unchecked`]: No version checking (last-writer-wins)
+#[must_use = "transactions do nothing unless committed"]
 pub struct Transaction<'a, S: EventStore, C: ConcurrencyStrategy = Optimistic> {
     store: &'a S,
     aggregate_kind: String,

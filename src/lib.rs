@@ -10,7 +10,7 @@ pub use sourcery_core::{
     projection,
     projection::{ApplyProjection, Projection},
     repository,
-    repository::{DefaultRepository, Repository, SnapshotRepository, UncheckedRepository},
+    repository::{OptimisticRepository, OptimisticSnapshotRepository, Repository, UncheckedRepository},
 };
 // Re-export proc macro derives so consumers only depend on `sourcery`.
 pub use sourcery_macros::{Aggregate, Projection};
@@ -18,9 +18,14 @@ pub use sourcery_macros::{Aggregate, Projection};
 pub mod store {
 
     pub use sourcery_core::store::{
-        AppendError, AppendResult, EventFilter, EventStore, GloballyOrderedStore,
-        NonEmpty, StoredEventView, Transaction,
+        EventFilter, EventStore, GloballyOrderedStore, NonEmpty, StoredEventView,
+        Transaction,
     };
+
+    // Re-export low-level append types for EventStore implementors only.
+    // Most users should interact with the Repository API instead.
+    #[doc(hidden)]
+    pub use sourcery_core::store::{AppendError, AppendResult};
 
     #[cfg(feature = "postgres")]
     #[cfg_attr(docsrs, doc(cfg(feature = "postgres")))]

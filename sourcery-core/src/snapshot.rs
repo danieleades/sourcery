@@ -183,3 +183,51 @@ where
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use std::{error::Error, io};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn no_snapshots_load_returns_none() {
+        let store = NoSnapshots::<u64>::new();
+        let result: Option<Snapshot<u64, String>> = store.load("test", &"id").await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn no_snapshots_offer_declines() {
+        let store = NoSnapshots::<u64>::new();
+        let result = store
+            .offer_snapshot::<io::Error, _, _>("test", &"id", 100, || {
+                Ok(Snapshot {
+                    position: 1,
+                    data: "data",
+                })
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result, SnapshotOffer::Declined);
+    }
+
+    #[test]
+    fn offer_error_create_displays_source() {
+        let err: OfferSnapshotError<io::Error, io::Error> =
+            OfferSnapshotError::Create(io::Error::other("create failed"));
+        let msg = err.to_string();
+        assert!(msg.contains("failed to create snapshot"));
+        assert!(err.source().is_some());
+    }
+
+    #[test]
+    fn offer_error_snapshot_displays_source() {
+        let err: OfferSnapshotError<io::Error, io::Error> =
+            OfferSnapshotError::Snapshot(io::Error::other("snapshot failed"));
+        let msg = err.to_string();
+        assert!(msg.contains("snapshot operation failed"));
+        assert!(err.source().is_some());
+    }
+}
+

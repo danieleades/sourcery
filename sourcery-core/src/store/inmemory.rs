@@ -1,3 +1,16 @@
+//! In-memory event store implementation for testing.
+//!
+//! This module provides [`Store`], a thread-safe in-memory implementation of
+//! [`EventStore`](super::EventStore) suitable for unit tests and examples.
+//!
+//! # Example
+//!
+//! ```
+//! use sourcery_core::store::inmemory;
+//!
+//! let store: inmemory::Store<String, ()> = inmemory::Store::new();
+//! ```
+
 use std::{
     collections::HashMap,
     sync::{Arc, RwLock},
@@ -420,4 +433,122 @@ where
     Id: Clone + Eq + std::hash::Hash + Send + Sync + 'static,
     M: Clone + Send + Sync + 'static,
 {
+}
+
+#[cfg(test)]
+mod tests {
+    use serde::{Deserialize, Serialize};
+
+    use super::*;
+    use crate::event::DomainEvent;
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    struct TestEvent {
+        value: i32,
+    }
+
+    impl DomainEvent for TestEvent {
+        const KIND: &'static str = "test-event";
+    }
+
+    #[test]
+    fn new_has_no_streams() {
+        let store = Store::<String, ()>::new();
+        let inner = store.inner.read().unwrap();
+        assert!(inner.streams.is_empty());
+        assert_eq!(inner.next_position, 0);
+        drop(inner);
+    }
+
+    #[test]
+    fn stage_event_captures_kind_and_data() {
+        let store = Store::<String, ()>::new();
+        let event = TestEvent { value: 42 };
+        let staged = store.stage_event(&event, ()).unwrap();
+
+        assert_eq!(staged.kind, "test-event");
+        assert_eq!(staged.data, serde_json::json!({"value": 42}));
+    }
+
+    #[test]
+    fn decode_event_deserializes() {
+        let store = Store::<String, ()>::new();
+        let event = TestEvent { value: 42 };
+        let staged = store.stage_event(&event, ()).unwrap();
+
+        // Create a stored event from the staged event
+        let stored = StoredEvent {
+            aggregate_kind: "test-agg".to_string(),
+            aggregate_id: "id".to_string(),
+            kind: staged.kind,
+            position: 0,
+            data: staged.data,
+            metadata: (),
+        };
+
+        let decoded: TestEvent = store.decode_event(&stored).unwrap();
+        assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn error_display_serialization() {
+        let err = InMemoryError::Serialization(Box::new(std::io::Error::other("test")));
+        assert!(err.to_string().contains("serialization error"));
+    }
+
+    #[test]
+    fn error_display_deserialization() {
+        let err = InMemoryError::Deserialization(Box::new(std::io::Error::other("test")));
+        assert!(err.to_string().contains("deserialization error"));
+    }
+
+    #[tokio::test]
+    async fn version_returns_none_for_new_stream() {
+        let store = Store::<String, ()>::new();
+        let version = store.stream_version("test-agg", &"id".to_string()).await.unwrap();
+        assert!(version.is_none());
+    }
+
+    #[tokio::test]
+    async fn version_returns_position_after_append() {
+        let store = Store::<String, ()>::new();
+        let id = "id".to_string();
+        let event = TestEvent { value: 1 };
+        let staged = store.stage_event(&event, ()).unwrap();
+
+        store
+            .append_expecting_new("test-agg", &id, NonEmpty::from_vec(vec![staged]).unwrap())
+            .await
+            .unwrap();
+
+        let version = store.stream_version("test-agg", &id).await.unwrap();
+        assert_eq!(version, Some(0));
+    }
+
+    #[tokio::test]
+    async fn append_with_wrong_version_returns_conflict() {
+        let store = Store::<String, ()>::new();
+        let id = "id".to_string();
+        let event = TestEvent { value: 1 };
+
+        // First, create the stream
+        let staged = store.stage_event(&event, ()).unwrap();
+        store
+            .append_expecting_new("test-agg", &id, NonEmpty::from_vec(vec![staged]).unwrap())
+            .await
+            .unwrap();
+
+        // Try to append with wrong expected version
+        let staged2 = store.stage_event(&TestEvent { value: 2 }, ()).unwrap();
+        let result = store
+            .append(
+                "test-agg",
+                &id,
+                Some(99), // wrong version
+                NonEmpty::from_vec(vec![staged2]).unwrap(),
+            )
+            .await;
+
+        assert!(matches!(result, Err(AppendError::Conflict(_))));
+    }
 }

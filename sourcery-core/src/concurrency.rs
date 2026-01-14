@@ -98,7 +98,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn concurrency_conflict_expected_new_stream_mentions_hint() {
+    fn conflict_expected_new_stream_mentions_hint() {
         let conflict: ConcurrencyConflict<u64> = ConcurrencyConflict {
             expected: None,
             actual: Some(42),
@@ -109,7 +109,7 @@ mod tests {
     }
 
     #[test]
-    fn concurrency_conflict_expected_version_includes_versions() {
+    fn conflict_expected_version_includes_versions() {
         let conflict: ConcurrencyConflict<u64> = ConcurrencyConflict {
             expected: Some(5),
             actual: Some(10),
@@ -121,7 +121,7 @@ mod tests {
     }
 
     #[test]
-    fn concurrency_conflict_unexpected_empty_state_formats() {
+    fn conflict_unexpected_empty_state_formats() {
         let conflict: ConcurrencyConflict<u64> = ConcurrencyConflict {
             expected: None,
             actual: None,
