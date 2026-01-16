@@ -96,7 +96,9 @@ pub trait SnapshotStore<Id: Sync>: Send + Sync {
         id: &Id,
         events_since_last_snapshot: u64,
         create_snapshot: Create,
-    ) -> impl std::future::Future<Output = Result<SnapshotOffer, OfferSnapshotError<Self::Error, CE>>> + Send
+    ) -> impl std::future::Future<
+        Output = Result<SnapshotOffer, OfferSnapshotError<Self::Error, CE>>,
+    > + Send
     where
         CE: std::error::Error + Send + Sync + 'static,
         T: Serialize,
@@ -156,11 +158,7 @@ where
     type Error = Infallible;
     type Position = Pos;
 
-    async fn load<T>(
-        &self,
-        _kind: &str,
-        _id: &Id,
-    ) -> Result<Option<Snapshot<Pos, T>>, Self::Error>
+    async fn load<T>(&self, _kind: &str, _id: &Id) -> Result<Option<Snapshot<Pos, T>>, Self::Error>
     where
         T: DeserializeOwned,
     {
@@ -230,4 +228,3 @@ mod tests {
         assert!(err.source().is_some());
     }
 }
-

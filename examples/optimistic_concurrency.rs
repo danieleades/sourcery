@@ -8,9 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 use sourcery::{
-    Apply, DomainEvent, Handle, Repository,
-    repository::OptimisticCommandError,
-    store::{inmemory},
+    Apply, DomainEvent, Handle, Repository, repository::OptimisticCommandError, store::inmemory,
     test::RepositoryTestExt,
 };
 

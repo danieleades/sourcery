@@ -25,8 +25,7 @@ use std::{collections::HashMap, fmt};
 
 use serde::{Deserialize, Serialize};
 use sourcery::{
-    Aggregate, Apply, ApplyProjection, DomainEvent, Handle, Repository,
-    store::{inmemory},
+    Aggregate, Apply, ApplyProjection, DomainEvent, Handle, Repository, store::inmemory,
 };
 
 // =============================================================================

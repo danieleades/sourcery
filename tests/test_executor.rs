@@ -4,10 +4,7 @@
 #[cfg(feature = "test-util")]
 mod with_test_util {
     use serde::{Deserialize, Serialize};
-    use sourcery::{
-        Aggregate, Apply, DomainEvent, Handle,
-        test::TestExecutor,
-    };
+    use sourcery::{Aggregate, Apply, DomainEvent, Handle, test::TestExecutor};
 
     // ============================================================================
     // Test Domain: Bank Account
@@ -89,9 +86,12 @@ mod with_test_util {
             if self.is_open {
                 return Err("account already open".to_string());
             }
-            Ok(vec![AccountOpened {
-                initial_balance: command.initial_balance,
-            }.into()])
+            Ok(vec![
+                AccountOpened {
+                    initial_balance: command.initial_balance,
+                }
+                .into(),
+            ])
         }
     }
 
@@ -103,9 +103,12 @@ mod with_test_util {
             if command.amount == 0 {
                 return Err("amount must be positive".to_string());
             }
-            Ok(vec![MoneyDeposited {
-                amount: command.amount,
-            }.into()])
+            Ok(vec![
+                MoneyDeposited {
+                    amount: command.amount,
+                }
+                .into(),
+            ])
         }
     }
 
@@ -120,9 +123,12 @@ mod with_test_util {
             if command.amount > self.balance {
                 return Err("insufficient funds".to_string());
             }
-            Ok(vec![MoneyWithdrawn {
-                amount: command.amount,
-            }.into()])
+            Ok(vec![
+                MoneyWithdrawn {
+                    amount: command.amount,
+                }
+                .into(),
+            ])
         }
     }
 
@@ -138,25 +144,25 @@ mod with_test_util {
             })
             .then_expect_events(&[AccountOpened {
                 initial_balance: 100,
-            }.into()]);
+            }
+            .into()]);
     }
 
     #[test]
     fn cannot_open_already_open_account() {
-        TestExecutor::<BankAccount>::given(&[AccountOpened {
-            initial_balance: 0,
-        }.into()])
-        .when(&OpenAccount {
-            initial_balance: 100,
-        })
-        .then_expect_error_message("already open");
+        TestExecutor::<BankAccount>::given(&[AccountOpened { initial_balance: 0 }.into()])
+            .when(&OpenAccount {
+                initial_balance: 100,
+            })
+            .then_expect_error_message("already open");
     }
 
     #[test]
     fn deposit_increases_balance() {
         TestExecutor::<BankAccount>::given(&[AccountOpened {
             initial_balance: 100,
-        }.into()])
+        }
+        .into()])
         .when(&Deposit { amount: 50 })
         .then_expect_events(&[MoneyDeposited { amount: 50 }.into()]);
     }
@@ -172,7 +178,8 @@ mod with_test_util {
     fn withdraw_decreases_balance() {
         TestExecutor::<BankAccount>::given(&[AccountOpened {
             initial_balance: 100,
-        }.into()])
+        }
+        .into()])
         .when(&Withdraw { amount: 30 })
         .then_expect_events(&[MoneyWithdrawn { amount: 30 }.into()]);
     }
@@ -181,7 +188,8 @@ mod with_test_util {
     fn cannot_withdraw_more_than_balance() {
         TestExecutor::<BankAccount>::given(&[AccountOpened {
             initial_balance: 100,
-        }.into()])
+        }
+        .into()])
         .when(&Withdraw { amount: 150 })
         .then_expect_error_message("insufficient funds");
     }
@@ -229,15 +237,16 @@ mod with_test_util {
     fn inspect_result_allows_custom_assertions() {
         let result = TestExecutor::<BankAccount>::given(&[AccountOpened {
             initial_balance: 100,
-        }.into()])
+        }
+        .into()])
         .when(&Deposit { amount: 50 })
         .inspect_result();
 
         assert!(result.is_ok());
         let events = result.unwrap();
         assert_eq!(events.len(), 1);
-        // The generated event enum uses PascalCase variant names derived from the event type
-        // For example: MoneyDeposited becomes the MoneyDeposited variant
+        // The generated event enum uses PascalCase variant names derived from the event
+        // type For example: MoneyDeposited becomes the MoneyDeposited variant
         match &events[0] {
             BankAccountEvent::MoneyDeposited(e) => assert_eq!(e.amount, 50),
             _ => panic!("Expected MoneyDeposited event"),

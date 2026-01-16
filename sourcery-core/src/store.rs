@@ -1,8 +1,8 @@
 //! Persistence layer abstractions.
 //!
 //! This module describes the storage contract (`EventStore`), wire formats,
-//! transactions, and a reference in-memory implementation. Filters and positions
-//! live here to keep storage concerns together.
+//! transactions, and a reference in-memory implementation. Filters and
+//! positions live here to keep storage concerns together.
 use std::{future::Future, marker::PhantomData};
 
 pub use nonempty::NonEmpty;
@@ -161,11 +161,7 @@ impl<'a, S: EventStore, C: ConcurrencyStrategy> Transaction<'a, S, C> {
     /// # Errors
     ///
     /// Returns a store error if serialization fails.
-    pub fn append<E>(
-        &mut self,
-        event: &E,
-        metadata: S::Metadata,
-    ) -> Result<(), S::Error>
+    pub fn append<E>(&mut self, event: &E, metadata: S::Metadata) -> Result<(), S::Error>
     where
         E: crate::event::EventKind + serde::Serialize,
     {
@@ -286,7 +282,8 @@ impl<S: EventStore, C: ConcurrencyStrategy> Drop for Transaction<'_, S, C> {
 /// - `Metadata`: Infrastructure metadata type (timestamps, causation tracking,
 ///   etc.)
 /// - `StoredEvent`: Store-specific stored event representation
-/// - `StagedEvent`: Store-specific staged event type (type-erased serialized form)
+/// - `StagedEvent`: Store-specific staged event type (type-erased serialized
+///   form)
 // ANCHOR: event_store_trait
 pub trait EventStore: Send + Sync {
     /// Aggregate identifier type.
@@ -318,7 +315,11 @@ pub trait EventStore: Send + Sync {
     /// # Errors
     ///
     /// Returns an error if serialization fails.
-    fn stage_event<E>(&self, event: &E, metadata: Self::Metadata) -> Result<Self::StagedEvent, Self::Error>
+    fn stage_event<E>(
+        &self,
+        event: &E,
+        metadata: Self::Metadata,
+    ) -> Result<Self::StagedEvent, Self::Error>
     where
         E: crate::event::EventKind + serde::Serialize;
 

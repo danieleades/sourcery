@@ -35,8 +35,8 @@ use thiserror::Error;
 
 use crate::{
     aggregate::{Aggregate, Handle},
-    event::{EventKind, ProjectionEvent},
     concurrency::{ConcurrencyConflict, ConcurrencyStrategy, Optimistic, Unchecked},
+    event::{EventKind, ProjectionEvent},
     projection::{Projection, ProjectionBuilder, ProjectionError},
     snapshot::{OfferSnapshotError, Snapshot, SnapshotOffer, SnapshotStore},
     store::{AppendError, EventFilter, EventStore, StoredEventView},
@@ -298,8 +298,8 @@ pub type OptimisticRepository<S> =
 
 /// Repository type alias with unchecked concurrency and no snapshots.
 ///
-/// This configuration skips version checking, allowing last-writer-wins semantics.
-/// Use when concurrent writes are impossible or acceptable.
+/// This configuration skips version checking, allowing last-writer-wins
+/// semantics. Use when concurrent writes are impossible or acceptable.
 ///
 /// Equivalent to:
 /// ```ignore
@@ -365,18 +365,21 @@ pub type OptimisticSnapshotRepository<S, SS> = Repository<S, Optimistic, SS>;
 ///
 /// - [`OptimisticRepository<S>`] - Version-checked writes, no snapshots
 /// - [`UncheckedRepository<S>`] - Last-writer-wins, no snapshots
-/// - [`OptimisticSnapshotRepository<S, SS>`] - Version-checked writes with snapshots
+/// - [`OptimisticSnapshotRepository<S, SS>`] - Version-checked writes with
+///   snapshots
 ///
 /// # Concurrency Strategies
 ///
 /// - **Optimistic** (default): Detects conflicts via version checking. Use
-///   [`execute_with_retry()`](Self::execute_with_retry) to automatically retry on conflicts.
+///   [`execute_with_retry()`](Self::execute_with_retry) to automatically retry
+///   on conflicts.
 /// - **Unchecked**: Last-writer-wins semantics. Use only when concurrent writes
 ///   are impossible or acceptable.
 ///
 /// # See Also
 ///
-/// - [quickstart example](https://github.com/danieleades/sourcery/blob/main/examples/quickstart.rs) - Complete workflow
+/// - [quickstart example](https://github.com/danieleades/sourcery/blob/main/examples/quickstart.rs)
+///   - Complete workflow
 /// - [`execute_command()`](Self::execute_command) - Command execution
 /// - [`load()`](Self::load) - Aggregate loading
 /// - [`build_projection()`](Self::build_projection) - Projection building

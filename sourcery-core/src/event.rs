@@ -64,9 +64,9 @@ impl<T: DomainEvent> EventKind for T {
 ///
 /// Implemented by event enums to deserialize stored events.
 ///
-/// Deriving [`Aggregate`](crate::aggregate::Aggregate) includes a `ProjectionEvent`
-/// implementation for the generated sum type. Custom enums can opt in manually
-/// using the pattern illustrated below.
+/// Deriving [`Aggregate`](crate::aggregate::Aggregate) includes a
+/// `ProjectionEvent` implementation for the generated sum type. Custom enums
+/// can opt in manually using the pattern illustrated below.
 pub trait ProjectionEvent: Sized {
     /// The list of event kinds this sum type can deserialize.
     ///

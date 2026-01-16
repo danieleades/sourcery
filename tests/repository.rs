@@ -11,7 +11,10 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sourcery::{
     Aggregate, Apply, DomainEvent, Handle, Repository,
     repository::OptimisticCommandError,
-    snapshot::{inmemory::Store as InMemorySnapshotStore, OfferSnapshotError, Snapshot, SnapshotOffer, SnapshotStore},
+    snapshot::{
+        OfferSnapshotError, Snapshot, SnapshotOffer, SnapshotStore,
+        inmemory::Store as InMemorySnapshotStore,
+    },
     store::{EventStore, inmemory},
 };
 use thiserror::Error;
@@ -55,9 +58,12 @@ impl Handle<AddValue> for Counter {
         if command.amount <= 0 {
             return Err("amount must be positive".to_string());
         }
-        Ok(vec![ValueAdded {
-            amount: command.amount,
-        }.into()])
+        Ok(vec![
+            ValueAdded {
+                amount: command.amount,
+            }
+            .into(),
+        ])
     }
 }
 
@@ -322,10 +328,7 @@ async fn load_consults_snapshot_store() {
     let snapshots = TrackingSnapshotStore::new();
     let repo = Repository::new(store).with_snapshots(snapshots);
 
-    let counter: Counter = repo
-        .load(&"c1".to_string())
-        .await
-        .unwrap();
+    let counter: Counter = repo.load(&"c1".to_string()).await.unwrap();
 
     assert_eq!(counter.value, 0);
     assert!(repo.snapshot_store().load_called());

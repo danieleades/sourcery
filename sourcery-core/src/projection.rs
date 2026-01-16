@@ -113,15 +113,17 @@ where
 
 /// Type-level marker indicating no snapshot support.
 ///
-/// This is an implementation detail of [`ProjectionBuilder`]'s type-state pattern.
-/// You should never need to name this type directly - use the builder methods instead.
+/// This is an implementation detail of [`ProjectionBuilder`]'s type-state
+/// pattern. You should never need to name this type directly - use the builder
+/// methods instead.
 #[doc(hidden)]
 pub struct NoSnapshot;
 
 /// Type-level marker indicating snapshot support is enabled.
 ///
-/// This is an implementation detail of [`ProjectionBuilder`]'s type-state pattern.
-/// You should never need to name this type directly - use the builder methods instead.
+/// This is an implementation detail of [`ProjectionBuilder`]'s type-state
+/// pattern. You should never need to name this type directly - use the builder
+/// methods instead.
 #[doc(hidden)]
 pub struct WithSnapshot;
 
@@ -199,8 +201,7 @@ where
             self.handlers.insert(
                 kind.to_string(),
                 Box::new(move |proj, agg_id, stored, metadata, store| {
-                    let event =
-                        E::from_stored(stored, store).map_err(HandlerError::EventDecode)?;
+                    let event = E::from_stored(stored, store).map_err(HandlerError::EventDecode)?;
                     let metadata_converted: P::Metadata = metadata.clone().into();
                     ApplyProjection::apply_projection(proj, agg_id, &event, &metadata_converted);
                     Ok(())

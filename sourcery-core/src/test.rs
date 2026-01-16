@@ -135,7 +135,8 @@ pub trait RepositoryTestExt: StoreAccess + Send {
     /// # Arguments
     ///
     /// * `id` - The aggregate instance identifier
-    /// * `events` - Events to append (must implement [`EventKind`] and [`serde::Serialize`])
+    /// * `events` - Events to append (must implement [`EventKind`] and
+    ///   [`serde::Serialize`])
     ///
     /// # Errors
     ///
@@ -589,9 +590,7 @@ mod tests {
 
     #[test]
     fn no_op_command_produces_no_events() {
-        CounterTest::given(&[])
-            .when(&NoOp)
-            .then_expect_no_events();
+        CounterTest::given(&[]).when(&NoOp).then_expect_no_events();
     }
 
     #[test]
@@ -652,7 +651,9 @@ mod repository_test_ext_tests {
         ) -> Result<Self, EventDecodeError<S::Error>> {
             match stored.kind() {
                 "points-added" => Ok(Self::Added(
-                    store.decode_event(stored).map_err(EventDecodeError::Store)?,
+                    store
+                        .decode_event(stored)
+                        .map_err(EventDecodeError::Store)?,
                 )),
                 _ => Err(EventDecodeError::UnknownKind {
                     kind: stored.kind().to_string(),
@@ -750,8 +751,8 @@ mod repository_test_ext_tests {
             &ScoreEvent::Added(PointsAdded { points: 42 }),
             (),
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
 
         // Verify event is loadable
         let loaded: Score = repo.load(&"s1".to_string()).await.unwrap();

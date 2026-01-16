@@ -13,8 +13,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use sourcery::{
-    Aggregate, Apply, ApplyProjection, DomainEvent, Repository,
-    store::{inmemory},
+    Aggregate, Apply, ApplyProjection, DomainEvent, Repository, store::inmemory,
     test::RepositoryTestExt,
 };
 

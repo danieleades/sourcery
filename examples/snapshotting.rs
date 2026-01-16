@@ -18,8 +18,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use sourcery::{
     Aggregate, Apply, ApplyProjection, DomainEvent, Handle, Repository,
-    snapshot::inmemory::Store as InMemorySnapshotStore,
-    store::inmemory,
+    snapshot::inmemory::Store as InMemorySnapshotStore, store::inmemory,
 };
 
 // =============================================================================

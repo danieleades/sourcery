@@ -4,7 +4,6 @@
 //! (`Apply`) and command handling (`Handle`). The `#[derive(Aggregate)]` macro
 //! lives here to keep domain ergonomics in one spot.
 
-
 /// Command-side entities that produce domain events.
 ///
 /// Aggregates rebuild their state from events (`Apply<E>`) and validate

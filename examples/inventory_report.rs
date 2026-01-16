@@ -25,8 +25,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use sourcery::{
-    Aggregate, Apply, ApplyProjection, DomainEvent, Handle, Repository,
-    store::{inmemory},
+    Aggregate, Apply, ApplyProjection, DomainEvent, Handle, Repository, store::inmemory,
 };
 
 // =============================================================================
@@ -158,7 +157,9 @@ impl TryFrom<String> for SaleId {
     fn try_from(s: String) -> Result<Self, Self::Error> {
         let parts: Vec<&str> = s.split("::").collect();
         if parts.len() != 2 {
-            return Err(format!("Invalid SaleId format: expected 'sku::number', got '{s}'"));
+            return Err(format!(
+                "Invalid SaleId format: expected 'sku::number', got '{s}'"
+            ));
         }
         Ok(Self {
             product_sku: parts[0].to_string(),

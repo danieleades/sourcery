@@ -7,9 +7,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use sourcery::{
     Aggregate, Apply, ApplyProjection, DomainEvent, EventKind, Handle, Projection, Repository,
-    projection::ProjectionError,
-    store::inmemory,
-    test::RepositoryTestExt,
+    projection::ProjectionError, store::inmemory, test::RepositoryTestExt,
 };
 
 // ============================================================================
@@ -25,8 +23,9 @@ impl DomainEvent for ValueAdded {
     const KIND: &'static str = "value-added";
 }
 
-/// Test helper that serializes to invalid JSON for testing deserialization error handling.
-/// Uses the same KIND as `ValueAdded` but serializes to a string instead of an object.
+/// Test helper that serializes to invalid JSON for testing deserialization
+/// error handling. Uses the same KIND as `ValueAdded` but serializes to a
+/// string instead of an object.
 struct InvalidValueAdded;
 
 impl EventKind for InvalidValueAdded {
@@ -70,9 +69,12 @@ impl Handle<AddValue> for Counter {
         if command.amount <= 0 {
             return Err("amount must be positive".to_string());
         }
-        Ok(vec![ValueAdded {
-            amount: command.amount,
-        }.into()])
+        Ok(vec![
+            ValueAdded {
+                amount: command.amount,
+            }
+            .into(),
+        ])
     }
 }
 

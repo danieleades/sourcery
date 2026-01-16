@@ -94,7 +94,11 @@ async fn offer_and_load_snapshot_roundtrip() {
     assert_eq!(result, SnapshotOffer::Stored);
 
     // Load the snapshot back
-    let loaded = store.load::<String>("test.aggregate", &id).await.unwrap().unwrap();
+    let loaded = store
+        .load::<String>("test.aggregate", &id)
+        .await
+        .unwrap()
+        .unwrap();
 
     assert_eq!(loaded.position, 42);
     assert_eq!(loaded.data, snapshot_data);
@@ -133,7 +137,11 @@ async fn offer_updates_existing_snapshot_with_higher_position() {
     assert_eq!(result, SnapshotOffer::Stored);
 
     // Verify the updated snapshot
-    let loaded = store.load::<String>("test.aggregate", &id).await.unwrap().unwrap();
+    let loaded = store
+        .load::<String>("test.aggregate", &id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(loaded.position, 20);
     assert_eq!(loaded.data, "second".to_string());
 }
@@ -172,7 +180,11 @@ async fn offer_declines_stale_snapshot_with_lower_position() {
     assert_eq!(result, SnapshotOffer::Declined);
 
     // Original snapshot should remain
-    let loaded = store.load::<String>("test.aggregate", &id).await.unwrap().unwrap();
+    let loaded = store
+        .load::<String>("test.aggregate", &id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(loaded.position, 20);
     assert_eq!(loaded.data, "newer".to_string());
 }
@@ -402,8 +414,16 @@ async fn different_aggregate_ids_are_isolated() {
         .unwrap();
 
     // Verify they are separate
-    let loaded1 = store.load::<String>("test.aggregate", &id1).await.unwrap().unwrap();
-    let loaded2 = store.load::<String>("test.aggregate", &id2).await.unwrap().unwrap();
+    let loaded1 = store
+        .load::<String>("test.aggregate", &id1)
+        .await
+        .unwrap()
+        .unwrap();
+    let loaded2 = store
+        .load::<String>("test.aggregate", &id2)
+        .await
+        .unwrap()
+        .unwrap();
 
     assert_eq!(loaded1.position, 10);
     assert_eq!(loaded1.data, "id1 data".to_string());
@@ -421,14 +441,9 @@ async fn create_snapshot_callback_not_called_when_policy_declines() {
 
     // The callback should never be invoked for "never" policy
     let result = store
-        .offer_snapshot::<std::convert::Infallible, String, _>(
-            "test.aggregate",
-            &id,
-            1000,
-            || {
+        .offer_snapshot::<std::convert::Infallible, String, _>("test.aggregate", &id, 1000, || {
             panic!("create_snapshot should not be called when policy declines");
-            },
-        )
+        })
         .await
         .unwrap();
 
@@ -453,9 +468,7 @@ async fn create_snapshot_error_is_propagated() {
     let id = Uuid::new_v4();
 
     let result = store
-        .offer_snapshot::<CreateError, String, _>("test.aggregate", &id, 0, || {
-            Err(CreateError)
-        })
+        .offer_snapshot::<CreateError, String, _>("test.aggregate", &id, 0, || Err(CreateError))
         .await;
 
     assert!(matches!(

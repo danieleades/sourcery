@@ -3,11 +3,13 @@
 //! This crate provides the foundational abstractions for event sourcing:
 //!
 //! - [`aggregate`] - Command-side primitives (`Aggregate`, `Apply`, `Handle`)
-//! - [`projection`] - Read-side primitives (`Projection`, `ApplyProjection`, `ProjectionBuilder`)
+//! - [`projection`] - Read-side primitives (`Projection`, `ApplyProjection`,
+//!   `ProjectionBuilder`)
 //! - [`repository`] - Command execution and aggregate lifecycle (`Repository`)
 //! - [`store`] - Event persistence abstraction (`EventStore`)
 //! - [`snapshot`] - Snapshot storage abstraction (`SnapshotStore`)
-//! - [`event`] - Event marker traits (`DomainEvent`, `EventKind`, `ProjectionEvent`)
+//! - [`event`] - Event marker traits (`DomainEvent`, `EventKind`,
+//!   `ProjectionEvent`)
 //! - [`concurrency`] - Concurrency strategy markers (`Optimistic`, `Unchecked`)
 //!
 //! # Example

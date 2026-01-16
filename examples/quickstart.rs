@@ -6,10 +6,7 @@
 
 // ANCHOR: full_example
 use serde::{Deserialize, Serialize};
-use sourcery::{
-    Apply, ApplyProjection, DomainEvent, Handle, Repository,
-    store::inmemory,
-};
+use sourcery::{Apply, ApplyProjection, DomainEvent, Handle, Repository, store::inmemory};
 
 // ANCHOR: events
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

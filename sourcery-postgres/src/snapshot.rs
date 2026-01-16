@@ -3,10 +3,10 @@
 //! This module provides [`Store`], an implementation of
 //! [`sourcery_core::snapshot::SnapshotStore`] for `PostgreSQL`.
 
-use sourcery_core::snapshot::{
-    inmemory::SnapshotPolicy, OfferSnapshotError, Snapshot, SnapshotOffer, SnapshotStore,
-};
 use serde::{Serialize, de::DeserializeOwned};
+use sourcery_core::snapshot::{
+    OfferSnapshotError, Snapshot, SnapshotOffer, SnapshotStore, inmemory::SnapshotPolicy,
+};
 use sqlx::{PgPool, Row};
 
 /// Error type for `PostgreSQL` snapshot operations.
@@ -173,7 +173,10 @@ impl SnapshotStore<uuid::Uuid> for Store {
                 let position: i64 = row.get("position");
                 let data: sqlx::types::Json<serde_json::Value> = row.get("data");
                 serde_json::from_value::<T>(data.0)
-                    .map(|decoded| Snapshot { position, data: decoded })
+                    .map(|decoded| Snapshot {
+                        position,
+                        data: decoded,
+                    })
                     .map_err(|e| Error::Deserialization(Box::new(e)))
             })
             .transpose()?;

@@ -62,12 +62,17 @@ fn bench_snapshot_load(c: &mut Criterion) {
     rt.block_on(async {
         for id in &ids {
             store
-                .offer_snapshot::<std::convert::Infallible, _, _>("bench.aggregate", id, 100, || {
-                    Ok(Snapshot {
-                        position: 1000,
-                        data: vec![0u8; 1024], // 1KB snapshot
-                    })
-                })
+                .offer_snapshot::<std::convert::Infallible, _, _>(
+                    "bench.aggregate",
+                    id,
+                    100,
+                    || {
+                        Ok(Snapshot {
+                            position: 1000,
+                            data: vec![0u8; 1024], // 1KB snapshot
+                        })
+                    },
+                )
                 .await
                 .unwrap();
         }
@@ -135,12 +140,17 @@ fn bench_snapshot_offer(c: &mut Criterion) {
         // Create initial snapshot
         rt.block_on(async {
             store
-                .offer_snapshot::<std::convert::Infallible, _, _>("bench.aggregate", &id, 100, || {
-                    Ok(Snapshot {
-                        position: 0,
-                        data: vec![0u8; 1024],
-                    })
-                })
+                .offer_snapshot::<std::convert::Infallible, _, _>(
+                    "bench.aggregate",
+                    &id,
+                    100,
+                    || {
+                        Ok(Snapshot {
+                            position: 0,
+                            data: vec![0u8; 1024],
+                        })
+                    },
+                )
                 .await
                 .unwrap()
         });
@@ -231,12 +241,17 @@ fn bench_snapshot_sizes(c: &mut Criterion) {
         let id = Uuid::new_v4();
         rt.block_on(async {
             store
-                .offer_snapshot::<std::convert::Infallible, _, _>("bench.aggregate", &id, 100, || {
-                    Ok(Snapshot {
-                        position: 1000,
-                        data: vec![0u8; size],
-                    })
-                })
+                .offer_snapshot::<std::convert::Infallible, _, _>(
+                    "bench.aggregate",
+                    &id,
+                    100,
+                    || {
+                        Ok(Snapshot {
+                            position: 1000,
+                            data: vec![0u8; size],
+                        })
+                    },
+                )
                 .await
                 .unwrap()
         });

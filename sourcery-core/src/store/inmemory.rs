@@ -27,8 +27,9 @@ use crate::{
 /// Stored event with position and metadata.
 ///
 /// This type represents an event that has been persisted to the in-memory store
-/// and can be loaded back. It contains all the information needed to deserialize
-/// the event data and metadata, along with the aggregate identifiers and position.
+/// and can be loaded back. It contains all the information needed to
+/// deserialize the event data and metadata, along with the aggregate
+/// identifiers and position.
 ///
 /// # Type Parameters
 ///
@@ -37,9 +38,10 @@ use crate::{
 ///
 /// # Fields
 ///
-/// All fields are accessible through the [`StoredEventView`](super::StoredEventView)
-/// trait implementation. Use the trait methods rather than accessing fields
-/// directly to maintain compatibility across store implementations.
+/// All fields are accessible through the
+/// [`StoredEventView`](super::StoredEventView) trait implementation. Use the
+/// trait methods rather than accessing fields directly to maintain
+/// compatibility across store implementations.
 #[derive(Clone)]
 pub struct StoredEvent<Id, M> {
     aggregate_kind: String,
@@ -52,8 +54,8 @@ pub struct StoredEvent<Id, M> {
 
 impl<Id, M> StoredEventView for StoredEvent<Id, M> {
     type Id = Id;
-    type Pos = u64;
     type Metadata = M;
+    type Pos = u64;
 
     fn aggregate_kind(&self) -> &str {
         &self.aggregate_kind
@@ -79,8 +81,9 @@ impl<Id, M> StoredEventView for StoredEvent<Id, M> {
 /// Staged event awaiting persistence.
 ///
 /// This type represents an event that has been serialized and prepared for
-/// persistence but not yet written to the in-memory store. The repository creates
-/// these from domain events, then batches them together for atomic appending.
+/// persistence but not yet written to the in-memory store. The repository
+/// creates these from domain events, then batches them together for atomic
+/// appending.
 ///
 /// # Type Parameters
 ///
@@ -153,15 +156,19 @@ where
     type Id = Id;
     type Metadata = M;
     type Position = u64;
-    type StoredEvent = StoredEvent<Id, M>;
     type StagedEvent = StagedEvent<M>;
+    type StoredEvent = StoredEvent<Id, M>;
 
-    fn stage_event<E>(&self, event: &E, metadata: Self::Metadata) -> Result<Self::StagedEvent, Self::Error>
+    fn stage_event<E>(
+        &self,
+        event: &E,
+        metadata: Self::Metadata,
+    ) -> Result<Self::StagedEvent, Self::Error>
     where
         E: crate::event::EventKind + serde::Serialize,
     {
-        let data = serde_json::to_value(event)
-            .map_err(|e| InMemoryError::Serialization(Box::new(e)))?;
+        let data =
+            serde_json::to_value(event).map_err(|e| InMemoryError::Serialization(Box::new(e)))?;
         Ok(StagedEvent {
             kind: event.kind().to_string(),
             data,
@@ -505,7 +512,10 @@ mod tests {
     #[tokio::test]
     async fn version_returns_none_for_new_stream() {
         let store = Store::<String, ()>::new();
-        let version = store.stream_version("test-agg", &"id".to_string()).await.unwrap();
+        let version = store
+            .stream_version("test-agg", &"id".to_string())
+            .await
+            .unwrap();
         assert!(version.is_none());
     }
 

@@ -309,7 +309,8 @@ mod tests {
     #[tokio::test]
     async fn load_returns_none_for_missing() {
         let store = Store::<String, u64>::always();
-        let result: Option<Snapshot<u64, String>> = store.load("test", &"id".to_string()).await.unwrap();
+        let result: Option<Snapshot<u64, String>> =
+            store.load("test", &"id".to_string()).await.unwrap();
         assert!(result.is_none());
     }
 

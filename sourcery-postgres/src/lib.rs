@@ -18,8 +18,8 @@ use sourcery_core::{
     concurrency::{ConcurrencyConflict, ConcurrencyStrategy},
     event::DomainEvent,
     store::{
-        AppendError, AppendResult, EventFilter, EventStore, GloballyOrderedStore,
-        NonEmpty, StoredEventView, Transaction,
+        AppendError, AppendResult, EventFilter, EventStore, GloballyOrderedStore, NonEmpty,
+        StoredEventView, Transaction,
     },
 };
 use sqlx::{PgPool, Postgres, QueryBuilder, Row};
@@ -42,9 +42,9 @@ pub enum Error {
 
 /// Stored event with position and metadata.
 ///
-/// This type represents an event that has been persisted to `PostgreSQL` and loaded
-/// back. It contains all the information needed to deserialize the event data and
-/// metadata, along with the aggregate identifiers and global position.
+/// This type represents an event that has been persisted to `PostgreSQL` and
+/// loaded back. It contains all the information needed to deserialize the event
+/// data and metadata, along with the aggregate identifiers and global position.
 ///
 /// # Type Parameters
 ///
@@ -52,9 +52,9 @@ pub enum Error {
 ///
 /// # Fields
 ///
-/// All fields are accessible through the [`StoredEventView`] trait implementation.
-/// Use the trait methods rather than accessing fields directly to maintain
-/// compatibility across store implementations.
+/// All fields are accessible through the [`StoredEventView`] trait
+/// implementation. Use the trait methods rather than accessing fields directly
+/// to maintain compatibility across store implementations.
 #[derive(Clone)]
 pub struct StoredEvent<M> {
     aggregate_kind: String,
@@ -68,8 +68,8 @@ pub struct StoredEvent<M> {
 /// Staged event awaiting persistence.
 ///
 /// This type represents an event that has been serialized and prepared for
-/// persistence but not yet written to `PostgreSQL`. The repository creates these
-/// from domain events, then batches them together for atomic appending.
+/// persistence but not yet written to `PostgreSQL`. The repository creates
+/// these from domain events, then batches them together for atomic appending.
 ///
 /// # Type Parameters
 ///
@@ -89,8 +89,8 @@ pub struct StagedEvent<M> {
 
 impl<M> StoredEventView for StoredEvent<M> {
     type Id = uuid::Uuid;
-    type Pos = i64;
     type Metadata = M;
+    type Pos = i64;
 
     fn aggregate_kind(&self) -> &str {
         &self.aggregate_kind
@@ -203,15 +203,18 @@ where
     type Id = uuid::Uuid;
     type Metadata = M;
     type Position = i64;
-    type StoredEvent = StoredEvent<M>;
     type StagedEvent = StagedEvent<M>;
+    type StoredEvent = StoredEvent<M>;
 
-    fn stage_event<E>(&self, event: &E, metadata: Self::Metadata) -> Result<Self::StagedEvent, Self::Error>
+    fn stage_event<E>(
+        &self,
+        event: &E,
+        metadata: Self::Metadata,
+    ) -> Result<Self::StagedEvent, Self::Error>
     where
         E: sourcery_core::event::EventKind + serde::Serialize,
     {
-        let data = serde_json::to_value(event)
-            .map_err(|e| Error::Serialization(Box::new(e)))?;
+        let data = serde_json::to_value(event).map_err(|e| Error::Serialization(Box::new(e)))?;
         Ok(StagedEvent {
             kind: event.kind().to_string(),
             data,
@@ -223,8 +226,7 @@ where
     where
         E: DomainEvent + serde::de::DeserializeOwned,
     {
-        serde_json::from_value(stored.data.clone())
-            .map_err(|e| Error::Deserialization(Box::new(e)))
+        serde_json::from_value(stored.data.clone()).map_err(|e| Error::Deserialization(Box::new(e)))
     }
 
     async fn stream_version<'a>(
@@ -543,8 +545,7 @@ where
     }
 }
 
-impl<M> GloballyOrderedStore for Store<M>
-where
-    M: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+impl<M> GloballyOrderedStore for Store<M> where
+    M: Serialize + DeserializeOwned + Clone + Send + Sync + 'static
 {
 }
