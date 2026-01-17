@@ -7,7 +7,7 @@ use nonempty::NonEmpty;
 use serde::{Deserialize, Serialize};
 use sourcery_core::{
     event::DomainEvent,
-    store::{EventFilter, EventStore, StagedEvent},
+    store::{EventFilter, EventStore},
 };
 use sourcery_postgres::Store;
 use sqlx::PgPool;
@@ -53,19 +53,18 @@ impl TestDb {
     }
 }
 
-/// Helper function to create a staged event for testing
-fn test_event(
-    store: &Store<TestMetadata>,
-    data: &str,
-    user_id: &str,
-) -> StagedEvent<serde_json::Value, TestMetadata> {
-    let event = TestEvent {
+/// Helper function to create a test event
+fn test_event(data: &str) -> TestEvent {
+    TestEvent {
         data: data.to_string(),
-    };
-    let metadata = TestMetadata {
+    }
+}
+
+/// Helper function to create test metadata
+fn test_metadata(user_id: &str) -> TestMetadata {
+    TestMetadata {
         user_id: user_id.to_string(),
-    };
-    store.stage_event(&event, metadata).unwrap()
+    }
 }
 
 #[tokio::test]
@@ -112,16 +111,17 @@ async fn stream_version_returns_none_for_new_stream() {
 }
 
 #[tokio::test]
-async fn append_expecting_new_creates_stream() {
+async fn commit_events_optimistic_new_creates_stream() {
     let db = TestDb::new().await;
     let store: Store<TestMetadata> = Store::new(db.pool.clone());
     store.migrate().await.unwrap();
 
     let id = Uuid::new_v4();
-    let events = NonEmpty::singleton(test_event(&store, "data", "user1"));
+    let events = NonEmpty::singleton(test_event("data"));
+    let metadata = test_metadata("user1");
 
     let result = store
-        .append_expecting_new("test.aggregate", &id, events)
+        .commit_events_optimistic("test.aggregate", &id, None, events, &metadata)
         .await
         .unwrap();
 
@@ -133,53 +133,69 @@ async fn append_expecting_new_creates_stream() {
 }
 
 #[tokio::test]
-async fn append_expecting_new_fails_for_existing_stream() {
+async fn commit_events_optimistic_new_fails_for_existing_stream() {
     let db = TestDb::new().await;
     let store: Store<TestMetadata> = Store::new(db.pool.clone());
     store.migrate().await.unwrap();
 
     let id = Uuid::new_v4();
-    let events = NonEmpty::singleton(test_event(&store, "data", "user1"));
+    let metadata = test_metadata("user1");
 
-    // First append succeeds
+    // First commit succeeds
     store
-        .append_expecting_new("test.aggregate", &id, events.clone())
+        .commit_events_optimistic(
+            "test.aggregate",
+            &id,
+            None,
+            NonEmpty::singleton(test_event("data")),
+            &metadata,
+        )
         .await
         .unwrap();
 
-    // Second append should fail
+    // Second commit expecting new stream should fail
     let result = store
-        .append_expecting_new("test.aggregate", &id, events)
+        .commit_events_optimistic(
+            "test.aggregate",
+            &id,
+            None,
+            NonEmpty::singleton(test_event("data")),
+            &metadata,
+        )
         .await;
 
     assert!(result.is_err());
 }
 
 #[tokio::test]
-async fn append_with_expected_version_succeeds() {
+async fn commit_events_optimistic_with_expected_version_succeeds() {
     let db = TestDb::new().await;
     let store: Store<TestMetadata> = Store::new(db.pool.clone());
     store.migrate().await.unwrap();
 
     let id = Uuid::new_v4();
+    let metadata = test_metadata("user1");
 
     // Create stream
     let first = store
-        .append_expecting_new(
+        .commit_events_optimistic(
             "test.aggregate",
             &id,
-            NonEmpty::singleton(test_event(&store, "first", "user1")),
+            None,
+            NonEmpty::singleton(test_event("first")),
+            &metadata,
         )
         .await
         .unwrap();
 
-    // Append with correct expected version
+    // Commit with correct expected version
     let second = store
-        .append(
+        .commit_events_optimistic(
             "test.aggregate",
             &id,
             Some(first.last_position),
-            NonEmpty::singleton(test_event(&store, "second", "user1")),
+            NonEmpty::singleton(test_event("second")),
+            &metadata,
         )
         .await
         .unwrap();
@@ -188,30 +204,34 @@ async fn append_with_expected_version_succeeds() {
 }
 
 #[tokio::test]
-async fn append_with_wrong_expected_version_fails() {
+async fn commit_events_optimistic_with_wrong_expected_version_fails() {
     let db = TestDb::new().await;
     let store: Store<TestMetadata> = Store::new(db.pool.clone());
     store.migrate().await.unwrap();
 
     let id = Uuid::new_v4();
+    let metadata = test_metadata("user1");
 
     // Create stream
     store
-        .append_expecting_new(
+        .commit_events_optimistic(
             "test.aggregate",
             &id,
-            NonEmpty::singleton(test_event(&store, "first", "user1")),
+            None,
+            NonEmpty::singleton(test_event("first")),
+            &metadata,
         )
         .await
         .unwrap();
 
-    // Append with wrong expected version
+    // Commit with wrong expected version
     let result = store
-        .append(
+        .commit_events_optimistic(
             "test.aggregate",
             &id,
             Some(999), // Wrong version
-            NonEmpty::singleton(test_event(&store, "second", "user1")),
+            NonEmpty::singleton(test_event("second")),
+            &metadata,
         )
         .await;
 
@@ -225,12 +245,15 @@ async fn load_events_returns_stored_events() {
     store.migrate().await.unwrap();
 
     let id = Uuid::new_v4();
+    let metadata = test_metadata("user1");
 
     store
-        .append_expecting_new(
+        .commit_events_optimistic(
             "test.aggregate",
             &id,
-            NonEmpty::new(test_event(&store, "created data", "user1")),
+            None,
+            NonEmpty::singleton(test_event("created data")),
+            &metadata,
         )
         .await
         .unwrap();
@@ -255,24 +278,28 @@ async fn load_events_with_after_position_filter() {
     store.migrate().await.unwrap();
 
     let id = Uuid::new_v4();
+    let metadata = test_metadata("user1");
 
-    // Append first event
+    // Commit first event
     let first = store
-        .append_expecting_new(
+        .commit_events_optimistic(
             "test.aggregate",
             &id,
-            NonEmpty::singleton(test_event(&store, "first", "user1")),
+            None,
+            NonEmpty::singleton(test_event("first")),
+            &metadata,
         )
         .await
         .unwrap();
 
-    // Append second event
+    // Commit second event
     store
-        .append(
+        .commit_events_optimistic(
             "test.aggregate",
             &id,
             Some(first.last_position),
-            NonEmpty::singleton(test_event(&store, "second", "user1")),
+            NonEmpty::singleton(test_event("second")),
+            &metadata,
         )
         .await
         .unwrap();
@@ -288,22 +315,23 @@ async fn load_events_with_after_position_filter() {
 }
 
 #[tokio::test]
-async fn append_multiple_events_atomically() {
+async fn commit_multiple_events_atomically() {
     let db = TestDb::new().await;
     let store: Store<TestMetadata> = Store::new(db.pool.clone());
     store.migrate().await.unwrap();
 
     let id = Uuid::new_v4();
+    let metadata = test_metadata("user1");
 
     let events = NonEmpty::from_vec(vec![
-        test_event(&store, "first", "user1"),
-        test_event(&store, "second", "user1"),
-        test_event(&store, "third", "user1"),
+        test_event("first"),
+        test_event("second"),
+        test_event("third"),
     ])
     .unwrap();
 
     let result = store
-        .append_expecting_new("test.aggregate", &id, events)
+        .commit_events_optimistic("test.aggregate", &id, None, events, &metadata)
         .await
         .unwrap();
 
@@ -331,22 +359,27 @@ async fn events_are_ordered_by_position() {
 
     let id1 = Uuid::new_v4();
     let id2 = Uuid::new_v4();
+    let metadata = test_metadata("user1");
 
     // Create events in different streams
     store
-        .append_expecting_new(
+        .commit_events_optimistic(
             "test.aggregate",
             &id1,
-            NonEmpty::singleton(test_event(&store, "stream1-first", "user1")),
+            None,
+            NonEmpty::singleton(test_event("stream1-first")),
+            &metadata,
         )
         .await
         .unwrap();
 
     store
-        .append_expecting_new(
+        .commit_events_optimistic(
             "test.aggregate",
             &id2,
-            NonEmpty::singleton(test_event(&store, "stream2-first", "user2")),
+            None,
+            NonEmpty::singleton(test_event("stream2-first")),
+            &test_metadata("user2"),
         )
         .await
         .unwrap();
@@ -373,12 +406,15 @@ async fn metadata_is_preserved() {
     store.migrate().await.unwrap();
 
     let id = Uuid::new_v4();
+    let metadata = test_metadata("special-user-123");
 
     store
-        .append_expecting_new(
+        .commit_events_optimistic(
             "test.aggregate",
             &id,
-            NonEmpty::singleton(test_event(&store, "data", "special-user-123")),
+            None,
+            NonEmpty::singleton(test_event("data")),
+            &metadata,
         )
         .await
         .unwrap();

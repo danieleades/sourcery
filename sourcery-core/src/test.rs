@@ -56,13 +56,14 @@
 
 use std::{fmt, future::Future};
 
+use nonempty::NonEmpty;
 use thiserror::Error;
 
 use crate::{
     aggregate::{Aggregate, Handle},
-    concurrency::{ConcurrencyStrategy, Unchecked},
+    concurrency::ConcurrencyStrategy,
     repository::Repository,
-    store::{AppendError, EventStore},
+    store::{CommitError, EventStore},
 };
 
 // =============================================================================
@@ -148,28 +149,25 @@ pub trait RepositoryTestExt: StoreAccess + Send {
     ) -> impl Future<Output = SeedResult<Self::Store>> + Send + 'a
     where
         A: Aggregate<Id = <Self::Store as EventStore>::Id>,
-        A::Event: crate::event::EventKind + serde::Serialize + Send + 'a,
-        <Self::Store as EventStore>::Metadata: Default,
+        A::Event: crate::event::EventKind + serde::Serialize + Send + Sync + 'a,
+        <Self::Store as EventStore>::Metadata: Default + Clone,
     {
         let id = id.clone();
         async move {
-            if events.is_empty() {
+            let Some(events) = NonEmpty::from_vec(events) else {
                 return Ok(());
-            }
+            };
 
-            let store = self.store();
-            let mut tx = store.begin::<Unchecked>(A::KIND, id, None);
-
-            for event in &events {
-                tx.append(event, <Self::Store as EventStore>::Metadata::default())
-                    .map_err(SeedError::Store)?;
-            }
-
-            tx.commit().await.map(|_| ()).map_err(|e| match e {
-                AppendError::Store(err) => SeedError::Store(err),
-                AppendError::Conflict(_) => unreachable!("conflict impossible without version"),
-                AppendError::EmptyAppend => unreachable!("empty append filtered above"),
-            })
+            let metadata = <Self::Store as EventStore>::Metadata::default();
+            self.store()
+                .commit_events(A::KIND, &id, events, &metadata)
+                .await
+                .map(|_| ())
+                .map_err(|e| match e {
+                    CommitError::Store(err) | CommitError::Serialization { source: err, .. } => {
+                        SeedError::Store(err)
+                    }
+                })
         }
     }
 
@@ -188,8 +186,7 @@ pub trait RepositoryTestExt: StoreAccess + Send {
     ///
     /// # Errors
     ///
-    /// Returns [`SeedError::Codec`] if serialization fails, or
-    /// [`SeedError::Store`] if persistence fails.
+    /// Returns [`SeedError::Store`] if persistence fails.
     fn inject_concurrent_event<'a, A>(
         &'a mut self,
         id: &<Self::Store as EventStore>::Id,
@@ -197,8 +194,8 @@ pub trait RepositoryTestExt: StoreAccess + Send {
     ) -> impl Future<Output = SeedResult<Self::Store>> + Send + 'a
     where
         A: Aggregate<Id = <Self::Store as EventStore>::Id>,
-        A::Event: crate::event::EventKind + serde::Serialize + Send + 'a,
-        <Self::Store as EventStore>::Metadata: Default,
+        A::Event: crate::event::EventKind + serde::Serialize + Send + Sync + 'a,
+        <Self::Store as EventStore>::Metadata: Default + Clone,
     {
         self.seed_events::<A>(id, vec![event])
     }
@@ -224,30 +221,20 @@ pub trait RepositoryTestExt: StoreAccess + Send {
         &'a mut self,
         aggregate_kind: &'a str,
         id: &'a <Self::Store as EventStore>::Id,
-        event: &'a E,
+        event: E,
         metadata: <Self::Store as EventStore>::Metadata,
     ) -> impl Future<Output = Result<(), <Self::Store as EventStore>::Error>> + Send + 'a
     where
-        E: crate::event::EventKind + serde::Serialize + Sync + 'a,
+        E: crate::event::EventKind + serde::Serialize + Send + Sync + 'a,
+        <Self::Store as EventStore>::Metadata: Clone,
     {
         async move {
-            let store = self.store();
-            let staged = store.stage_event(event, metadata)?;
-            store
-                .append(
-                    aggregate_kind,
-                    id,
-                    None,
-                    crate::store::NonEmpty::from_vec(vec![staged]).expect("nonempty"),
-                )
+            self.store()
+                .commit_events(aggregate_kind, id, NonEmpty::singleton(event), &metadata)
                 .await
                 .map(|_| ())
                 .map_err(|e| match e {
-                    AppendError::Store(e) => e,
-                    AppendError::Conflict(_) => {
-                        unreachable!("no version check on inject_event")
-                    }
-                    AppendError::EmptyAppend => unreachable!("nonempty injection"),
+                    CommitError::Store(err) | CommitError::Serialization { source: err, .. } => err,
                 })
         }
     }
@@ -748,7 +735,7 @@ mod repository_test_ext_tests {
         repo.inject_event(
             "score",
             &"s1".to_string(),
-            &ScoreEvent::Added(PointsAdded { points: 42 }),
+            ScoreEvent::Added(PointsAdded { points: 42 }),
             (),
         )
         .await

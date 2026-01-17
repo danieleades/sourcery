@@ -16,11 +16,13 @@ use std::{
     sync::{Arc, RwLock},
 };
 
+use nonempty::NonEmpty;
+
 use crate::{
-    concurrency::{ConcurrencyConflict, ConcurrencyStrategy},
+    concurrency::ConcurrencyConflict,
     store::{
-        AppendError, AppendResult, EventFilter, EventStore, GloballyOrderedStore, LoadEventsResult,
-        NonEmpty, StagedEvent, StoredEvent, StreamKey, Transaction,
+        CommitError, CommitResult, EventFilter, EventStore, GloballyOrderedStore, LoadEventsResult,
+        OptimisticCommitError, StoredEvent, StreamKey,
     },
 };
 
@@ -86,23 +88,6 @@ where
     type Metadata = M;
     type Position = u64;
 
-    fn stage_event<E>(
-        &self,
-        event: &E,
-        metadata: Self::Metadata,
-    ) -> Result<StagedEvent<Self::Data, Self::Metadata>, Self::Error>
-    where
-        E: crate::event::EventKind + serde::Serialize,
-    {
-        let data =
-            serde_json::to_value(event).map_err(|e| InMemoryError::Serialization(Box::new(e)))?;
-        Ok(StagedEvent {
-            kind: event.kind().to_string(),
-            data,
-            metadata,
-        })
-    }
-
     fn decode_event<E>(
         &self,
         stored: &StoredEvent<Self::Id, Self::Position, Self::Data, Self::Metadata>,
@@ -132,147 +117,146 @@ where
         std::future::ready(Ok(version))
     }
 
-    fn begin<Conc: ConcurrencyStrategy>(
-        &self,
-        aggregate_kind: &str,
-        aggregate_id: Self::Id,
-        expected_version: Option<Self::Position>,
-    ) -> Transaction<'_, Self, Conc> {
-        Transaction::new(
-            self,
-            aggregate_kind.to_string(),
-            aggregate_id,
-            expected_version,
-        )
-    }
-
-    #[tracing::instrument(skip(self, aggregate_id, events), fields(event_count = events.len()))]
-    fn append<'a>(
+    #[tracing::instrument(skip(self, aggregate_id, events, metadata), fields(event_count = events.len()))]
+    fn commit_events<'a, E>(
         &'a self,
         aggregate_kind: &'a str,
         aggregate_id: &'a Self::Id,
-        expected_version: Option<u64>,
-        events: NonEmpty<StagedEvent<Self::Data, Self::Metadata>>,
-    ) -> impl Future<Output = Result<AppendResult<u64>, AppendError<u64, Self::Error>>> + Send + 'a
+        events: NonEmpty<E>,
+        metadata: &'a Self::Metadata,
+    ) -> impl Future<Output = Result<CommitResult<u64>, CommitError<Self::Error>>> + Send + 'a
+    where
+        E: crate::event::EventKind + serde::Serialize + Send + Sync + 'a,
+        Self::Metadata: Clone,
     {
-        let event_count = events.len();
-
         let result = (|| {
-            let mut inner = self.inner.write().expect("in-memory store lock poisoned");
-            // Check version if provided
-            if let Some(expected) = expected_version {
-                let stream_key = StreamKey::new(aggregate_kind, aggregate_id.clone());
-                let current = inner
-                    .streams
-                    .get(&stream_key)
-                    .and_then(|s| s.last().map(|e| e.position));
-                if current != Some(expected) {
-                    tracing::debug!(?expected, ?current, "version mismatch, rejecting append");
-                    return Err(ConcurrencyConflict {
-                        expected: Some(expected),
-                        actual: current,
-                    }
-                    .into());
-                }
+            // Serialize all events first
+            let mut staged = Vec::with_capacity(events.len());
+            for (index, event) in events.iter().enumerate() {
+                let data = serde_json::to_value(event).map_err(|e| CommitError::Serialization {
+                    index,
+                    source: InMemoryError::Serialization(Box::new(e)),
+                })?;
+                staged.push((event.kind().to_string(), data));
             }
 
+            let mut inner = self.inner.write().expect("in-memory store lock poisoned");
             let stream_key = StreamKey::new(aggregate_kind, aggregate_id.clone());
-            let mut last_position = None;
-            let mut stored = Vec::with_capacity(events.len());
-            for e in events {
+            let mut last_position = 0;
+            let mut stored = Vec::with_capacity(staged.len());
+
+            for (kind, data) in staged {
                 let position = inner.next_position;
                 inner.next_position += 1;
-                last_position = Some(position);
-                let StagedEvent {
-                    kind,
-                    data,
-                    metadata,
-                } = e;
+                last_position = position;
                 stored.push(StoredEvent {
                     aggregate_kind: aggregate_kind.to_string(),
                     aggregate_id: aggregate_id.clone(),
                     kind,
                     position,
                     data,
-                    metadata,
+                    metadata: metadata.clone(),
                 });
             }
 
             inner.streams.entry(stream_key).or_default().extend(stored);
             drop(inner);
-            tracing::debug!(events_appended = event_count, "events appended to stream");
-            Ok(AppendResult {
-                last_position: last_position.expect("nonempty append"),
-            })
+            tracing::debug!(events_appended = events.len(), "events committed to stream");
+            Ok(CommitResult { last_position })
         })();
 
         std::future::ready(result)
     }
 
-    #[tracing::instrument(skip(self, aggregate_id, events), fields(event_count = events.len()))]
-    fn append_expecting_new<'a>(
+    #[tracing::instrument(skip(self, aggregate_id, events, metadata), fields(event_count = events.len()))]
+    fn commit_events_optimistic<'a, E>(
         &'a self,
         aggregate_kind: &'a str,
         aggregate_id: &'a Self::Id,
-        events: NonEmpty<StagedEvent<Self::Data, Self::Metadata>>,
-    ) -> impl Future<Output = Result<AppendResult<u64>, AppendError<u64, Self::Error>>> + Send + 'a
+        expected_version: Option<Self::Position>,
+        events: NonEmpty<E>,
+        metadata: &'a Self::Metadata,
+    ) -> impl Future<Output = Result<CommitResult<u64>, OptimisticCommitError<u64, Self::Error>>>
+    + Send
+    + 'a
+    where
+        E: crate::event::EventKind + serde::Serialize + Send + Sync + 'a,
+        Self::Metadata: Clone,
     {
-        let event_count = events.len();
-
         let result = (|| {
+            // Serialize all events first
+            let mut staged = Vec::with_capacity(events.len());
+            for (index, event) in events.iter().enumerate() {
+                let data = serde_json::to_value(event).map_err(|e| {
+                    OptimisticCommitError::Serialization {
+                        index,
+                        source: InMemoryError::Serialization(Box::new(e)),
+                    }
+                })?;
+                staged.push((event.kind().to_string(), data));
+            }
+
             let mut inner = self.inner.write().expect("in-memory store lock poisoned");
-            // Check that stream is empty (new aggregate)
             let stream_key = StreamKey::new(aggregate_kind, aggregate_id.clone());
+
+            // Check version
             let current = inner
                 .streams
                 .get(&stream_key)
                 .and_then(|s| s.last().map(|e| e.position));
 
-            if let Some(actual) = current {
-                // Stream already has events - conflict!
-                tracing::debug!(
-                    ?actual,
-                    "stream already exists, rejecting new aggregate append"
-                );
-                return Err(ConcurrencyConflict {
-                    expected: None, // "expected new stream"
-                    actual: Some(actual),
+            match expected_version {
+                Some(expected) => {
+                    // Expected specific version
+                    if current != Some(expected) {
+                        tracing::debug!(?expected, ?current, "version mismatch, rejecting commit");
+                        return Err(ConcurrencyConflict {
+                            expected: Some(expected),
+                            actual: current,
+                        }
+                        .into());
+                    }
                 }
-                .into());
+                None => {
+                    // Expected new stream (no events)
+                    if let Some(actual) = current {
+                        tracing::debug!(
+                            ?actual,
+                            "stream already exists, rejecting new aggregate commit"
+                        );
+                        return Err(ConcurrencyConflict {
+                            expected: None,
+                            actual: Some(actual),
+                        }
+                        .into());
+                    }
+                }
             }
 
-            // Stream is empty, proceed with append (no further version check needed)
-            let stream_key = StreamKey::new(aggregate_kind, aggregate_id.clone());
-            let mut last_position = None;
-            let mut stored = Vec::with_capacity(events.len());
-            for e in events {
+            let mut last_position = 0;
+            let mut stored = Vec::with_capacity(staged.len());
+
+            for (kind, data) in staged {
                 let position = inner.next_position;
                 inner.next_position += 1;
-                last_position = Some(position);
-                let StagedEvent {
-                    kind,
-                    data,
-                    metadata,
-                } = e;
+                last_position = position;
                 stored.push(StoredEvent {
                     aggregate_kind: aggregate_kind.to_string(),
                     aggregate_id: aggregate_id.clone(),
                     kind,
                     position,
                     data,
-                    metadata,
+                    metadata: metadata.clone(),
                 });
             }
 
             inner.streams.entry(stream_key).or_default().extend(stored);
             drop(inner);
             tracing::debug!(
-                events_appended = event_count,
-                "new stream created with events"
+                events_appended = events.len(),
+                "events committed to stream (optimistic)"
             );
-            Ok(AppendResult {
-                last_position: last_position.expect("nonempty append"),
-            })
+            Ok(CommitResult { last_position })
         })();
 
         std::future::ready(result)
@@ -407,28 +391,18 @@ mod tests {
     }
 
     #[test]
-    fn stage_event_captures_kind_and_data() {
-        let store = Store::<String, ()>::new();
-        let event = TestEvent { value: 42 };
-        let staged = store.stage_event(&event, ()).unwrap();
-
-        assert_eq!(staged.kind, "test-event");
-        assert_eq!(staged.data, serde_json::json!({"value": 42}));
-    }
-
-    #[test]
     fn decode_event_deserializes() {
         let store = Store::<String, ()>::new();
         let event = TestEvent { value: 42 };
-        let staged = store.stage_event(&event, ()).unwrap();
+        let data = serde_json::to_value(&event).unwrap();
 
-        // Create a stored event from the staged event
+        // Create a stored event
         let stored = StoredEvent {
             aggregate_kind: "test-agg".to_string(),
             aggregate_id: "id".to_string(),
-            kind: staged.kind,
+            kind: "test-event".to_string(),
             position: 0,
-            data: staged.data,
+            data,
             metadata: (),
         };
 
@@ -459,14 +433,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn version_returns_position_after_append() {
+    async fn version_returns_position_after_commit() {
         let store = Store::<String, ()>::new();
         let id = "id".to_string();
-        let event = TestEvent { value: 1 };
-        let staged = store.stage_event(&event, ()).unwrap();
+        let events = NonEmpty::singleton(TestEvent { value: 1 });
 
         store
-            .append_expecting_new("test-agg", &id, NonEmpty::from_vec(vec![staged]).unwrap())
+            .commit_events("test-agg", &id, events, &())
             .await
             .unwrap();
 
@@ -475,29 +448,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn append_with_wrong_version_returns_conflict() {
+    async fn commit_with_wrong_version_returns_conflict() {
         let store = Store::<String, ()>::new();
         let id = "id".to_string();
-        let event = TestEvent { value: 1 };
+        let events1 = NonEmpty::singleton(TestEvent { value: 1 });
 
         // First, create the stream
-        let staged = store.stage_event(&event, ()).unwrap();
         store
-            .append_expecting_new("test-agg", &id, NonEmpty::from_vec(vec![staged]).unwrap())
+            .commit_events("test-agg", &id, events1, &())
             .await
             .unwrap();
 
-        // Try to append with wrong expected version
-        let staged2 = store.stage_event(&TestEvent { value: 2 }, ()).unwrap();
+        // Try to commit with wrong expected version
+        let events2 = NonEmpty::singleton(TestEvent { value: 2 });
         let result = store
-            .append(
-                "test-agg",
-                &id,
-                Some(99), // wrong version
-                NonEmpty::from_vec(vec![staged2]).unwrap(),
-            )
+            .commit_events_optimistic("test-agg", &id, Some(99), events2, &())
             .await;
 
-        assert!(matches!(result, Err(AppendError::Conflict(_))));
+        assert!(matches!(result, Err(OptimisticCommitError::Conflict(_))));
+    }
+
+    #[tokio::test]
+    async fn commit_new_stream_fails_if_stream_exists() {
+        let store = Store::<String, ()>::new();
+        let id = "id".to_string();
+        let events = NonEmpty::singleton(TestEvent { value: 1 });
+
+        // First, create the stream
+        store
+            .commit_events("test-agg", &id, events, &())
+            .await
+            .unwrap();
+
+        // Try to commit expecting new stream
+        let events2 = NonEmpty::singleton(TestEvent { value: 2 });
+        let result = store
+            .commit_events_optimistic("test-agg", &id, None, events2, &())
+            .await;
+
+        assert!(matches!(result, Err(OptimisticCommitError::Conflict(_))));
     }
 }
