@@ -48,7 +48,7 @@ CREATE INDEX idx_events_kind
 use std::future::Future;
 use sourcery::store::{
     AppendError, AppendResult, EventFilter, EventStore, NonEmpty,
-    StoredEventView, Transaction,
+    StagedEvent, StoredEvent, Transaction,
 };
 use sourcery::concurrency::ConcurrencyStrategy;
 
@@ -56,50 +56,38 @@ pub struct PostgresEventStore {
     pool: sqlx::PgPool,
 }
 
-// Your stored event type
-pub struct StoredEvent {
-    aggregate_kind: String,
-    aggregate_id: String,
-    kind: String,
-    position: i64,
-    data: serde_json::Value,
-    metadata: serde_json::Value,
-}
-
-impl StoredEventView for StoredEvent {
-    type Id = String;
-    type Pos = i64;
-    type Metadata = serde_json::Value;
-
-    fn aggregate_kind(&self) -> &str { &self.aggregate_kind }
-    fn aggregate_id(&self) -> &Self::Id { &self.aggregate_id }
-    fn kind(&self) -> &str { &self.kind }
-    fn position(&self) -> Self::Pos { self.position }
-    fn metadata(&self) -> &Self::Metadata { &self.metadata }
-}
-
 impl EventStore for PostgresEventStore {
     type Id = String;
     type Position = i64;
     type Error = sqlx::Error;
     type Metadata = serde_json::Value;
-    type StoredEvent = StoredEvent;
-    type StagedEvent = StagedEvent; // Your staged event type
+    type Data = serde_json::Value;  // Serialization format
 
-    fn stage_event<E>(&self, event: &E, metadata: Self::Metadata)
-        -> Result<Self::StagedEvent, Self::Error>
+    fn stage_event<E>(
+        &self,
+        event: &E,
+        metadata: Self::Metadata,
+    ) -> Result<StagedEvent<Self::Data, Self::Metadata>, Self::Error>
     where
         E: EventKind + serde::Serialize
     {
-        todo!("Serialize event to StagedEvent")
+        let data = serde_json::to_value(event)?;
+        Ok(StagedEvent {
+            kind: event.kind().to_string(),
+            data,
+            metadata,
+        })
     }
 
-    fn decode_event<E>(&self, stored: &Self::StoredEvent)
-        -> Result<E, Self::Error>
+    fn decode_event<E>(
+        &self,
+        stored: &StoredEvent<Self::Id, Self::Position, Self::Data, Self::Metadata>,
+    ) -> Result<E, Self::Error>
     where
         E: DomainEvent + serde::de::DeserializeOwned
     {
-        todo!("Deserialize from stored.data")
+        serde_json::from_value(stored.data.clone())
+            .map_err(Into::into)
     }
 
     fn stream_version<'a>(&'a self, aggregate_kind: &'a str, aggregate_id: &'a Self::Id)
@@ -124,7 +112,7 @@ impl EventStore for PostgresEventStore {
         aggregate_kind: &'a str,
         aggregate_id: &'a Self::Id,
         expected_version: Option<Self::Position>,
-        events: NonEmpty<Self::StagedEvent>
+        events: NonEmpty<StagedEvent<Self::Data, Self::Metadata>>
     ) -> impl Future<Output = Result<AppendResult<Self::Position>, AppendError<Self::Position, Self::Error>>> + Send + 'a
     {
         async move { todo!("INSERT with version check") }
@@ -134,19 +122,23 @@ impl EventStore for PostgresEventStore {
         &'a self,
         aggregate_kind: &'a str,
         aggregate_id: &'a Self::Id,
-        events: NonEmpty<Self::StagedEvent>
+        events: NonEmpty<StagedEvent<Self::Data, Self::Metadata>>
     ) -> impl Future<Output = Result<AppendResult<Self::Position>, AppendError<Self::Position, Self::Error>>> + Send + 'a
     {
         async move { todo!("INSERT only if stream empty") }
     }
 
-    fn load_events<'a>(&'a self, filters: &'a [EventFilter<Self::Id, Self::Position>])
-        -> impl Future<Output = Result<Vec<Self::StoredEvent>, Self::Error>> + Send + 'a
+    fn load_events<'a>(
+        &'a self,
+        filters: &'a [EventFilter<Self::Id, Self::Position>]
+    ) -> impl Future<Output = Result<Vec<StoredEvent<Self::Id, Self::Position, Self::Data, Self::Metadata>>, Self::Error>> + Send + 'a
     {
         async move { todo!("SELECT with filters") }
     }
 }
 ```
+
+The `StagedEvent` and `StoredEvent` types are provided by the library—you don't need to define your own. Your store just needs to specify the `Data` associated type (e.g., `serde_json::Value` for JSON, `Vec<u8>` for binary formats).
 
 ## Loading Events
 

@@ -19,87 +19,13 @@ use std::{
 use crate::{
     concurrency::{ConcurrencyConflict, ConcurrencyStrategy},
     store::{
-        AppendError, AppendResult, EventFilter, EventStore, GloballyOrderedStore, NonEmpty,
-        StoredEventView, StreamKey, Transaction,
+        AppendError, AppendResult, EventFilter, EventStore, GloballyOrderedStore, LoadEventsResult,
+        NonEmpty, StagedEvent, StoredEvent, StreamKey, Transaction,
     },
 };
 
-/// Stored event with position and metadata.
-///
-/// This type represents an event that has been persisted to the in-memory store
-/// and can be loaded back. It contains all the information needed to
-/// deserialize the event data and metadata, along with the aggregate
-/// identifiers and position.
-///
-/// # Type Parameters
-///
-/// - `Id`: The aggregate ID type (must be `Clone + Eq + Hash + Send + Sync`)
-/// - `M`: The metadata type (must be `Clone + Send + Sync`)
-///
-/// # Fields
-///
-/// All fields are accessible through the
-/// [`StoredEventView`](super::StoredEventView) trait implementation. Use the
-/// trait methods rather than accessing fields directly to maintain
-/// compatibility across store implementations.
-#[derive(Clone)]
-pub struct StoredEvent<Id, M> {
-    aggregate_kind: String,
-    aggregate_id: Id,
-    kind: String,
-    position: u64,
-    data: serde_json::Value,
-    metadata: M,
-}
-
-impl<Id, M> StoredEventView for StoredEvent<Id, M> {
-    type Id = Id;
-    type Metadata = M;
-    type Pos = u64;
-
-    fn aggregate_kind(&self) -> &str {
-        &self.aggregate_kind
-    }
-
-    fn aggregate_id(&self) -> &Self::Id {
-        &self.aggregate_id
-    }
-
-    fn kind(&self) -> &str {
-        &self.kind
-    }
-
-    fn position(&self) -> Self::Pos {
-        self.position
-    }
-
-    fn metadata(&self) -> &Self::Metadata {
-        &self.metadata
-    }
-}
-
-/// Staged event awaiting persistence.
-///
-/// This type represents an event that has been serialized and prepared for
-/// persistence but not yet written to the in-memory store. The repository
-/// creates these from domain events, then batches them together for atomic
-/// appending.
-///
-/// # Type Parameters
-///
-/// - `M`: The metadata type (must be `Clone + Send + Sync`)
-///
-/// # Internal Use
-///
-/// This type is primarily used by the [`Store`] implementation. Users typically
-/// interact with domain events directly and don't need to create `StagedEvent`
-/// instances manually.
-#[derive(Clone)]
-pub struct StagedEvent<M> {
-    kind: String,
-    data: serde_json::Value,
-    metadata: M,
-}
+/// Event stream stored in memory with fixed position and data types.
+type InMemoryStream<Id, M> = Vec<StoredEvent<Id, u64, serde_json::Value, M>>;
 
 /// In-memory event store that keeps streams in a hash map.
 ///
@@ -110,13 +36,15 @@ pub struct StagedEvent<M> {
 /// Generic over:
 /// - `Id`: Aggregate identifier type (must be hashable/equatable for map keys)
 /// - `M`: Metadata type (use `()` when not needed)
+///
+/// This store uses `serde_json::Value` as the internal data representation.
 #[derive(Clone)]
 pub struct Store<Id, M> {
     inner: Arc<RwLock<Inner<Id, M>>>,
 }
 
 struct Inner<Id, M> {
-    streams: HashMap<StreamKey<Id>, Vec<StoredEvent<Id, M>>>,
+    streams: HashMap<StreamKey<Id>, InMemoryStream<Id, M>>,
     next_position: u64,
 }
 
@@ -152,18 +80,17 @@ where
     Id: Clone + Eq + std::hash::Hash + Send + Sync + 'static,
     M: Clone + Send + Sync + 'static,
 {
+    type Data = serde_json::Value;
     type Error = InMemoryError;
     type Id = Id;
     type Metadata = M;
     type Position = u64;
-    type StagedEvent = StagedEvent<M>;
-    type StoredEvent = StoredEvent<Id, M>;
 
     fn stage_event<E>(
         &self,
         event: &E,
         metadata: Self::Metadata,
-    ) -> Result<Self::StagedEvent, Self::Error>
+    ) -> Result<StagedEvent<Self::Data, Self::Metadata>, Self::Error>
     where
         E: crate::event::EventKind + serde::Serialize,
     {
@@ -176,7 +103,10 @@ where
         })
     }
 
-    fn decode_event<E>(&self, stored: &Self::StoredEvent) -> Result<E, Self::Error>
+    fn decode_event<E>(
+        &self,
+        stored: &StoredEvent<Self::Id, Self::Position, Self::Data, Self::Metadata>,
+    ) -> Result<E, Self::Error>
     where
         E: crate::event::DomainEvent + serde::de::DeserializeOwned,
     {
@@ -222,7 +152,7 @@ where
         aggregate_kind: &'a str,
         aggregate_id: &'a Self::Id,
         expected_version: Option<u64>,
-        events: NonEmpty<Self::StagedEvent>,
+        events: NonEmpty<StagedEvent<Self::Data, Self::Metadata>>,
     ) -> impl Future<Output = Result<AppendResult<u64>, AppendError<u64, Self::Error>>> + Send + 'a
     {
         let event_count = events.len();
@@ -284,7 +214,7 @@ where
         &'a self,
         aggregate_kind: &'a str,
         aggregate_id: &'a Self::Id,
-        events: NonEmpty<Self::StagedEvent>,
+        events: NonEmpty<StagedEvent<Self::Data, Self::Metadata>>,
     ) -> impl Future<Output = Result<AppendResult<u64>, AppendError<u64, Self::Error>>> + Send + 'a
     {
         let event_count = events.len();
@@ -352,7 +282,16 @@ where
     fn load_events<'a>(
         &'a self,
         filters: &'a [EventFilter<Self::Id, Self::Position>],
-    ) -> impl Future<Output = Result<Vec<Self::StoredEvent>, Self::Error>> + Send + 'a {
+    ) -> impl Future<
+        Output = LoadEventsResult<
+            Self::Id,
+            Self::Position,
+            Self::Data,
+            Self::Metadata,
+            Self::Error,
+        >,
+    > + Send
+    + 'a {
         use std::collections::HashSet;
 
         let inner = self.inner.read().expect("in-memory store lock poisoned");
@@ -377,9 +316,9 @@ where
 
         // Helper to check position filter for a specific after_position constraint
         let passes_position_filter =
-            |event: &StoredEvent<Id, M>, after_position: Option<u64>| -> bool {
-                after_position.is_none_or(|after| event.position > after)
-            };
+            |event: &StoredEvent<Id, u64, serde_json::Value, M>,
+             after_position: Option<u64>|
+             -> bool { after_position.is_none_or(|after| event.position > after) };
 
         // Load events for specific aggregates
         for (stream_key, kinds) in &by_aggregate {

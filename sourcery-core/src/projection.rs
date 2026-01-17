@@ -12,7 +12,7 @@ use crate::{
     aggregate::Aggregate,
     event::{DomainEvent, EventDecodeError, ProjectionEvent},
     snapshot::{Snapshot, SnapshotStore},
-    store::{EventFilter, EventStore, GloballyOrderedStore, StoredEventView},
+    store::{EventFilter, EventStore, GloballyOrderedStore, StoredEvent},
 };
 
 /// Trait implemented by read models that can be constructed from an event
@@ -85,9 +85,14 @@ impl<StoreError> From<StoreError> for HandlerError<StoreError> {
 type EventHandler<P, S> = Box<
     dyn Fn(
             &mut P,
-            &<<S as EventStore>::StoredEvent as StoredEventView>::Id,
-            &<S as EventStore>::StoredEvent,
-            &<<S as EventStore>::StoredEvent as StoredEventView>::Metadata,
+            &<S as EventStore>::Id,
+            &StoredEvent<
+                <S as EventStore>::Id,
+                <S as EventStore>::Position,
+                <S as EventStore>::Data,
+                <S as EventStore>::Metadata,
+            >,
+            &<S as EventStore>::Metadata,
             &S,
         ) -> Result<(), HandlerError<<S as EventStore>::Error>>
         + Send

@@ -7,7 +7,7 @@ use nonempty::NonEmpty;
 use serde::{Deserialize, Serialize};
 use sourcery_core::{
     event::DomainEvent,
-    store::{EventFilter, EventStore, StoredEventView},
+    store::{EventFilter, EventStore, StagedEvent},
 };
 use sourcery_postgres::Store;
 use sqlx::PgPool;
@@ -58,7 +58,7 @@ fn test_event(
     store: &Store<TestMetadata>,
     data: &str,
     user_id: &str,
-) -> <Store<TestMetadata> as EventStore>::StagedEvent {
+) -> StagedEvent<serde_json::Value, TestMetadata> {
     let event = TestEvent {
         data: data.to_string(),
     };

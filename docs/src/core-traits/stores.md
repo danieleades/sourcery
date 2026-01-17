@@ -58,25 +58,38 @@ EventFilter::for_aggregate("account.deposited", "account", "ACC-001")
 EventFilter::for_event("account.deposited").after(100)
 ```
 
-## The `StoredEventView` Trait
+## Event Types
 
-Events loaded from the store implement this trait:
+Events flow through two representations during persistence:
+
+### `StagedEvent<Data, M>`
+
+An event that has been serialized and staged for persistence. Created by `EventStore::stage_event()`, it holds the serialized payload but has no position yet—that's assigned by the store during append.
 
 ```rust,ignore
-pub trait StoredEventView {
-    type Id;
-    type Pos;
-    type Metadata;
-
-    fn aggregate_kind(&self) -> &str;
-    fn aggregate_id(&self) -> &Self::Id;
-    fn kind(&self) -> &str;
-    fn position(&self) -> Self::Pos;
-    fn metadata(&self) -> &Self::Metadata;
+pub struct StagedEvent<Data, M> {
+    pub kind: String,      // Event type identifier (e.g., "account.deposited")
+    pub data: Data,        // Serialized event payload
+    pub metadata: M,       // Infrastructure metadata
 }
 ```
 
-Stores provide their own `StoredEvent` type that implements this trait, allowing different internal representations (e.g., JSONB, binary) while exposing a uniform interface.
+### `StoredEvent<Id, Pos, Data, M>`
+
+An event loaded from the store. Contains the serialized data plus store-assigned metadata. Use `EventStore::decode_event()` to deserialize back to a domain event.
+
+```rust,ignore
+pub struct StoredEvent<Id, Pos, Data, M> {
+    pub aggregate_kind: String,  // Aggregate type identifier
+    pub aggregate_id: Id,        // Aggregate instance identifier
+    pub kind: String,            // Event type identifier
+    pub position: Pos,           // Global position assigned by store
+    pub data: Data,              // Serialized event payload
+    pub metadata: M,             // Infrastructure metadata
+}
+```
+
+Both types are generic over `Data` (the serialization format—e.g., `serde_json::Value` for JSON stores) and `M` (metadata). Store implementations specify their concrete types through the `EventStore::Data` associated type.
 
 ## The `SnapshotStore` Trait
 

@@ -1,8 +1,28 @@
 //! Persistence layer abstractions.
 //!
-//! This module describes the storage contract (`EventStore`), wire formats,
+//! This module describes the storage contract ([`EventStore`]), wire formats,
 //! transactions, and a reference in-memory implementation. Filters and
 //! positions live here to keep storage concerns together.
+//!
+//! # Event Lifecycle
+//!
+//! Events flow through two representations during persistence:
+//!
+//! 1. **[`StagedEvent`]** - An event that has been serialized and staged for
+//!    persistence. Created by [`EventStore::stage_event`], it holds the
+//!    serialized event data but has no position yet (that's assigned by the
+//!    store during append).
+//!
+//! 2. **[`StoredEvent`]** - An event loaded from the store. Contains the
+//!    serialized event data plus store-assigned metadata (position, aggregate
+//!    info). Use [`EventStore::decode_event`] to deserialize back to a domain
+//!    event.
+//!
+//! ```text
+//! DomainEvent ──stage_event()──▶ StagedEvent ──append()──▶ Database
+//!                                                              │
+//! DomainEvent ◀──decode_event()── StoredEvent ◀──load_events()─┘
+//! ```
 use std::{future::Future, marker::PhantomData};
 
 pub use nonempty::NonEmpty;
@@ -12,21 +32,88 @@ use crate::concurrency::{ConcurrencyConflict, ConcurrencyStrategy, Optimistic, U
 
 pub mod inmemory;
 
-/// View trait for stored events.
+/// An event that has been serialized and staged for persistence.
 ///
-/// This trait abstracts over the stored event representation from different
-/// event stores. Stores can use different internal representations (e.g.,
-/// JSONB, binary, etc.) but must expose this interface.
-pub trait StoredEventView {
-    type Id;
-    type Pos;
-    type Metadata;
+/// Created by [`EventStore::stage_event`] and consumed by
+/// [`EventStore::append`]. The staged event holds the serialized event data and
+/// metadata, but does not yet have a position—that is assigned by the store
+/// during append.
+///
+/// # Type Parameters
+///
+/// - `Data`: The serialized event payload type (e.g., `serde_json::Value` for
+///   JSON stores, `Vec<u8>` for binary stores)
+/// - `M`: The metadata type
+#[derive(Clone, Debug)]
+pub struct StagedEvent<Data, M> {
+    /// The event type identifier (e.g., `"account.deposited"`).
+    pub kind: String,
+    /// The serialized event payload.
+    pub data: Data,
+    /// Infrastructure metadata (timestamps, causation IDs, etc.).
+    pub metadata: M,
+}
 
-    fn aggregate_kind(&self) -> &str;
-    fn aggregate_id(&self) -> &Self::Id;
-    fn kind(&self) -> &str;
-    fn position(&self) -> Self::Pos;
-    fn metadata(&self) -> &Self::Metadata;
+/// An event loaded from the store.
+///
+/// Contains the serialized event data plus store-assigned metadata. Returned by
+/// [`EventStore::load_events`]. Use [`EventStore::decode_event`] to deserialize
+/// the `data` field back into a domain event.
+///
+/// # Type Parameters
+///
+/// - `Id`: The aggregate identifier type
+/// - `Pos`: The position type used for ordering
+/// - `Data`: The serialized event payload type (e.g., `serde_json::Value`)
+/// - `M`: The metadata type
+#[derive(Clone, Debug)]
+pub struct StoredEvent<Id, Pos, Data, M> {
+    /// The aggregate type identifier (e.g., `"account"`).
+    pub aggregate_kind: String,
+    /// The aggregate instance identifier.
+    pub aggregate_id: Id,
+    /// The event type identifier (e.g., `"account.deposited"`).
+    pub kind: String,
+    /// The global position assigned by the store.
+    pub position: Pos,
+    /// The serialized event payload.
+    pub data: Data,
+    /// Infrastructure metadata (timestamps, causation IDs, etc.).
+    pub metadata: M,
+}
+
+impl<Id, Pos, Data, M> StoredEvent<Id, Pos, Data, M> {
+    /// Returns the aggregate type identifier.
+    #[inline]
+    pub fn aggregate_kind(&self) -> &str {
+        &self.aggregate_kind
+    }
+
+    /// Returns a reference to the aggregate instance identifier.
+    #[inline]
+    pub const fn aggregate_id(&self) -> &Id {
+        &self.aggregate_id
+    }
+
+    /// Returns the event type identifier.
+    #[inline]
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+
+    /// Returns a reference to the metadata.
+    #[inline]
+    pub const fn metadata(&self) -> &M {
+        &self.metadata
+    }
+}
+
+impl<Id, Pos: Clone, Data, M> StoredEvent<Id, Pos, Data, M> {
+    /// Returns a copy of the position.
+    #[inline]
+    pub fn position(&self) -> Pos {
+        self.position.clone()
+    }
 }
 
 /// Filter describing which events should be loaded from the store.
@@ -114,6 +201,12 @@ pub struct AppendResult<Pos> {
 /// Convenience alias for append outcomes returned by event stores.
 pub type AppendOutcome<Pos, Err> = Result<AppendResult<Pos>, AppendError<Pos, Err>>;
 
+/// A vector of stored events loaded from an event store.
+pub type StoredEvents<Id, Pos, Data, M> = Vec<StoredEvent<Id, Pos, Data, M>>;
+
+/// Result type for event loading operations.
+pub type LoadEventsResult<Id, Pos, Data, M, E> = Result<StoredEvents<Id, Pos, Data, M>, E>;
+
 /// Transaction for appending events to an aggregate instance.
 ///
 /// Events are accumulated in the transaction and persisted atomically when
@@ -130,7 +223,7 @@ pub struct Transaction<'a, S: EventStore, C: ConcurrencyStrategy = Optimistic> {
     aggregate_kind: String,
     aggregate_id: S::Id,
     expected_version: Option<S::Position>,
-    events: Vec<S::StagedEvent>,
+    events: Vec<StagedEvent<S::Data, S::Metadata>>,
     committed: bool,
     _concurrency: PhantomData<C>,
 }
@@ -281,9 +374,7 @@ impl<S: EventStore, C: ConcurrencyStrategy> Drop for Transaction<'_, S, C> {
 ///   ordering)
 /// - `Metadata`: Infrastructure metadata type (timestamps, causation tracking,
 ///   etc.)
-/// - `StoredEvent`: Store-specific stored event representation
-/// - `StagedEvent`: Store-specific staged event type (type-erased serialized
-///   form)
+/// - `Data`: Serialized event payload type (e.g., `serde_json::Value` for JSON)
 // ANCHOR: event_store_trait
 pub trait EventStore: Send + Sync {
     /// Aggregate identifier type.
@@ -304,13 +395,17 @@ pub trait EventStore: Send + Sync {
     /// Metadata type for infrastructure concerns.
     type Metadata: Send + Sync + 'static;
 
-    /// Stored event type with position and metadata.
-    type StoredEvent: StoredEventView<Id = Self::Id, Pos = Self::Position, Metadata = Self::Metadata>;
-
-    /// Staged event type (type-erased serialized form).
-    type StagedEvent: Send + 'static;
+    /// Serialized event payload type.
+    ///
+    /// This is the format used to store event data internally. Common choices:
+    /// - `serde_json::Value` for JSON-based stores
+    /// - `Vec<u8>` for binary stores
+    type Data: Clone + Send + Sync + 'static;
 
     /// Stage an event for append (serialize it).
+    ///
+    /// Converts a domain event into a [`StagedEvent`] ready for persistence.
+    /// The staged event holds the serialized payload but has no position yet.
     ///
     /// # Errors
     ///
@@ -319,16 +414,22 @@ pub trait EventStore: Send + Sync {
         &self,
         event: &E,
         metadata: Self::Metadata,
-    ) -> Result<Self::StagedEvent, Self::Error>
+    ) -> Result<StagedEvent<Self::Data, Self::Metadata>, Self::Error>
     where
         E: crate::event::EventKind + serde::Serialize;
 
     /// Decode a stored event into a concrete event type.
     ///
+    /// Deserializes the `data` field of a [`StoredEvent`] back into a domain
+    /// event.
+    ///
     /// # Errors
     ///
     /// Returns an error if deserialization fails.
-    fn decode_event<E>(&self, stored: &Self::StoredEvent) -> Result<E, Self::Error>
+    fn decode_event<E>(
+        &self,
+        stored: &StoredEvent<Self::Id, Self::Position, Self::Data, Self::Metadata>,
+    ) -> Result<E, Self::Error>
     where
         E: crate::event::DomainEvent + serde::de::DeserializeOwned;
 
@@ -377,7 +478,7 @@ pub trait EventStore: Send + Sync {
         aggregate_kind: &'a str,
         aggregate_id: &'a Self::Id,
         expected_version: Option<Self::Position>,
-        events: NonEmpty<Self::StagedEvent>,
+        events: NonEmpty<StagedEvent<Self::Data, Self::Metadata>>,
     ) -> impl Future<Output = AppendOutcome<Self::Position, Self::Error>> + Send + 'a;
 
     /// Load events matching the specified filters.
@@ -392,10 +493,20 @@ pub trait EventStore: Send + Sync {
     /// # Errors
     ///
     /// Returns a store-specific error when loading fails.
+    #[allow(clippy::type_complexity)]
     fn load_events<'a>(
         &'a self,
         filters: &'a [EventFilter<Self::Id, Self::Position>],
-    ) -> impl Future<Output = Result<Vec<Self::StoredEvent>, Self::Error>> + Send + 'a;
+    ) -> impl Future<
+        Output = LoadEventsResult<
+            Self::Id,
+            Self::Position,
+            Self::Data,
+            Self::Metadata,
+            Self::Error,
+        >,
+    > + Send
+    + 'a;
 
     /// Append events expecting an empty stream.
     ///
@@ -411,7 +522,7 @@ pub trait EventStore: Send + Sync {
         &'a self,
         aggregate_kind: &'a str,
         aggregate_id: &'a Self::Id,
-        events: NonEmpty<Self::StagedEvent>,
+        events: NonEmpty<StagedEvent<Self::Data, Self::Metadata>>,
     ) -> impl Future<Output = AppendOutcome<Self::Position, Self::Error>> + Send + 'a;
 }
 

@@ -39,7 +39,7 @@ use crate::{
     event::{EventKind, ProjectionEvent},
     projection::{Projection, ProjectionBuilder, ProjectionError},
     snapshot::{OfferSnapshotError, Snapshot, SnapshotOffer, SnapshotStore},
-    store::{AppendError, EventFilter, EventStore, StoredEventView},
+    store::{AppendError, EventFilter, EventStore, StoredEvents},
 };
 
 type LoadError<S> = ProjectionError<<S as EventStore>::Error>;
@@ -200,10 +200,11 @@ where
 fn apply_stored_events<A, S>(
     aggregate: &mut A,
     store: &S,
-    events: &[S::StoredEvent],
+    events: &StoredEvents<S::Id, S::Position, S::Data, S::Metadata>,
 ) -> Result<Option<S::Position>, crate::event::EventDecodeError<S::Error>>
 where
     S: EventStore,
+    S::Position: Clone,
     A: Aggregate<Id = S::Id>,
     A::Event: ProjectionEvent,
 {

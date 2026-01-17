@@ -18,8 +18,8 @@ use sourcery_core::{
     concurrency::{ConcurrencyConflict, ConcurrencyStrategy},
     event::DomainEvent,
     store::{
-        AppendError, AppendResult, EventFilter, EventStore, GloballyOrderedStore, NonEmpty,
-        StoredEventView, Transaction,
+        AppendError, AppendResult, EventFilter, EventStore, GloballyOrderedStore, LoadEventsResult,
+        NonEmpty, StagedEvent, StoredEvent, Transaction,
     },
 };
 use sqlx::{PgPool, Postgres, QueryBuilder, Row};
@@ -38,79 +38,6 @@ pub enum Error {
     Serialization(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
     #[error("deserialization error: {0}")]
     Deserialization(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
-}
-
-/// Stored event with position and metadata.
-///
-/// This type represents an event that has been persisted to `PostgreSQL` and
-/// loaded back. It contains all the information needed to deserialize the event
-/// data and metadata, along with the aggregate identifiers and global position.
-///
-/// # Type Parameters
-///
-/// - `M`: The metadata type (must be `Serialize + DeserializeOwned`)
-///
-/// # Fields
-///
-/// All fields are accessible through the [`StoredEventView`] trait
-/// implementation. Use the trait methods rather than accessing fields directly
-/// to maintain compatibility across store implementations.
-#[derive(Clone)]
-pub struct StoredEvent<M> {
-    aggregate_kind: String,
-    aggregate_id: uuid::Uuid,
-    kind: String,
-    position: i64,
-    data: serde_json::Value,
-    metadata: M,
-}
-
-/// Staged event awaiting persistence.
-///
-/// This type represents an event that has been serialized and prepared for
-/// persistence but not yet written to `PostgreSQL`. The repository creates
-/// these from domain events, then batches them together for atomic appending.
-///
-/// # Type Parameters
-///
-/// - `M`: The metadata type (must be `Serialize + DeserializeOwned`)
-///
-/// # Internal Use
-///
-/// This type is primarily used by the [`Store`] implementation. Users typically
-/// interact with domain events directly and don't need to create `StagedEvent`
-/// instances manually.
-#[derive(Clone)]
-pub struct StagedEvent<M> {
-    kind: String,
-    data: serde_json::Value,
-    metadata: M,
-}
-
-impl<M> StoredEventView for StoredEvent<M> {
-    type Id = uuid::Uuid;
-    type Metadata = M;
-    type Pos = i64;
-
-    fn aggregate_kind(&self) -> &str {
-        &self.aggregate_kind
-    }
-
-    fn aggregate_id(&self) -> &Self::Id {
-        &self.aggregate_id
-    }
-
-    fn kind(&self) -> &str {
-        &self.kind
-    }
-
-    fn position(&self) -> Self::Pos {
-        self.position
-    }
-
-    fn metadata(&self) -> &Self::Metadata {
-        &self.metadata
-    }
 }
 
 /// A PostgreSQL-backed [`EventStore`].
@@ -199,18 +126,17 @@ impl<M> EventStore for Store<M>
 where
     M: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
+    type Data = serde_json::Value;
     type Error = Error;
     type Id = uuid::Uuid;
     type Metadata = M;
     type Position = i64;
-    type StagedEvent = StagedEvent<M>;
-    type StoredEvent = StoredEvent<M>;
 
     fn stage_event<E>(
         &self,
         event: &E,
         metadata: Self::Metadata,
-    ) -> Result<Self::StagedEvent, Self::Error>
+    ) -> Result<StagedEvent<Self::Data, Self::Metadata>, Self::Error>
     where
         E: sourcery_core::event::EventKind + serde::Serialize,
     {
@@ -222,7 +148,10 @@ where
         })
     }
 
-    fn decode_event<E>(&self, stored: &Self::StoredEvent) -> Result<E, Self::Error>
+    fn decode_event<E>(
+        &self,
+        stored: &StoredEvent<Self::Id, Self::Position, Self::Data, Self::Metadata>,
+    ) -> Result<E, Self::Error>
     where
         E: DomainEvent + serde::de::DeserializeOwned,
     {
@@ -274,7 +203,7 @@ where
         aggregate_kind: &'a str,
         aggregate_id: &'a Self::Id,
         expected_version: Option<Self::Position>,
-        events: NonEmpty<Self::StagedEvent>,
+        events: NonEmpty<StagedEvent<Self::Data, Self::Metadata>>,
     ) -> AppendOutcome {
         let mut tx = self
             .pool
@@ -373,11 +302,12 @@ where
         })
     }
 
+    #[allow(clippy::type_complexity)]
     #[tracing::instrument(skip(self, filters), fields(filters_len = filters.len()))]
     async fn load_events<'a>(
         &'a self,
         filters: &'a [EventFilter<Self::Id, Self::Position>],
-    ) -> Result<Vec<Self::StoredEvent>, Self::Error> {
+    ) -> LoadEventsResult<Self::Id, Self::Position, Self::Data, Self::Metadata, Self::Error> {
         if filters.is_empty() {
             return Ok(Vec::new());
         }
@@ -447,7 +377,7 @@ where
         &'a self,
         aggregate_kind: &'a str,
         aggregate_id: &'a Self::Id,
-        events: NonEmpty<Self::StagedEvent>,
+        events: NonEmpty<StagedEvent<Self::Data, Self::Metadata>>,
     ) -> AppendOutcome {
         let mut tx = self
             .pool

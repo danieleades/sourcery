@@ -24,7 +24,8 @@ pub mod store {
     #[doc(hidden)]
     pub use sourcery_core::store::{AppendError, AppendResult};
     pub use sourcery_core::store::{
-        EventFilter, EventStore, GloballyOrderedStore, NonEmpty, StoredEventView, Transaction,
+        EventFilter, EventStore, GloballyOrderedStore, NonEmpty, StagedEvent, StoredEvent,
+        Transaction,
     };
 
     #[cfg(feature = "postgres")]

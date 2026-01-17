@@ -606,7 +606,7 @@ mod repository_test_ext_tests {
     use super::*;
     use crate::{
         event::{DomainEvent, EventDecodeError, EventKind, ProjectionEvent},
-        store::{StoredEventView, inmemory},
+        store::inmemory,
     };
 
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -646,7 +646,7 @@ mod repository_test_ext_tests {
         const EVENT_KINDS: &'static [&'static str] = &[PointsAdded::KIND];
 
         fn from_stored<S: crate::store::EventStore>(
-            stored: &S::StoredEvent,
+            stored: &crate::store::StoredEvent<S::Id, S::Position, S::Data, S::Metadata>,
             store: &S,
         ) -> Result<Self, EventDecodeError<S::Error>> {
             match stored.kind() {
