@@ -84,26 +84,6 @@ impl ApplyProjection<FundsDeposited> for AuditLog {
 
 Track event relationships for debugging and workflows:
 
-```d2
-Request A: "Request A (correlation: abc)" {
-  E1: |md
-    OrderPlaced
-    causation: null
-  |
-  E2: |md
-    InventoryReserved
-    causation: OrderPlaced
-  |
-  E3: |md
-    PaymentProcessed
-    causation: OrderPlaced
-  |
-
-  E1 -> E2
-  E1 -> E3
-}
-```
-
 - **Correlation ID**: Groups all events from a single user request
 - **Causation ID**: Points to the event that triggered this one
 

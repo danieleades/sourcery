@@ -4,9 +4,7 @@ The `inmemory::Store` is useful for testing, but production systems need durable
 
 ## The EventStore Trait
 
-```rust,ignore
-{{#include ../../../sourcery-core/src/store.rs:event_store_trait}}
-```
+See [Stores](../core-traits/stores.md) for the full trait definition.
 
 ## Design Decisions
 
@@ -98,18 +96,8 @@ impl EventStore for PostgresEventStore {
         Self::Metadata: Clone,
     {
         async move {
-            // Serialize events
-            let prepared: Vec<_> = events.iter()
-                .enumerate()
-                .map(|(i, e)| {
-                    let data = serde_json::to_value(e)
-                        .map_err(|e| CommitError::Serialization { index: i, source: e.into() })?;
-                    Ok((e.kind(), data))
-                })
-                .collect::<Result<_, CommitError<Self::Error>>>()?;
-
-            // INSERT all events atomically
-            // Return Committed { last_position }
+            // Serialize each event with e.kind() and serde_json::to_value(e)
+            // INSERT atomically, return Committed { last_position }
             todo!()
         }
     }
@@ -127,10 +115,8 @@ impl EventStore for PostgresEventStore {
         Self::Metadata: Clone,
     {
         async move {
-            // 1. Check current version matches expected_version
-            // 2. If mismatch, return OptimisticCommitError::Conflict
-            // 3. Serialize and INSERT events atomically
-            // 4. Return Committed { last_position }
+            // Check version, return Conflict on mismatch
+            // Serialize and INSERT atomically
             todo!()
         }
     }
@@ -147,18 +133,15 @@ impl EventStore for PostgresEventStore {
 
 ## Loading Events
 
-Handle multiple filters efficiently:
+Build a `WHERE` clause from filters with `OR`, ordered by position:
 
 ```rust,ignore
 fn load_events(&self, filters: &[EventFilter<String, i64>])
     -> Result<Vec<StoredEvent>, sqlx::Error>
 {
-    // Deduplicate overlapping filters
-    // Build WHERE clause:
-    //   (event_kind = 'x' AND position > N)
-    //   OR (event_kind = 'y' AND aggregate_kind = 'a' AND aggregate_id = 'b')
+    // WHERE (event_kind = 'x' AND position > N)
+    //    OR (aggregate_kind = 'a' AND aggregate_id = 'b')
     // ORDER BY position ASC
-    // Map rows to StoredEvent
     todo!()
 }
 ```

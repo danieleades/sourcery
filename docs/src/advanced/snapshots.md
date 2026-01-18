@@ -15,14 +15,12 @@ Agg: Aggregate
 App -> Snap: 'load("account", "ACC-001")'
 Snap -> App: "Snapshot at position 1000" {style.stroke-dash: 3}
 App -> Agg: "Deserialize snapshot"
-App."balance = 5000 (from snapshot)"
 App -> Store: "load_events(after: 1000)"
 Store -> App: "Events 1001-1050" {style.stroke-dash: 3}
-App -> Agg: "apply(event) [For each new event]"
-App."balance = 5250 (current)"
+App -> Agg: "apply(event) for each"
 ```
 
-Instead of replaying 1050 events, you load the snapshot and replay only 50.
+Instead of replaying all 1050 events, load the snapshot and replay only the 50 new ones.
 
 ## Enabling Snapshots
 

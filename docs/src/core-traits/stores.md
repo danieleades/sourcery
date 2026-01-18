@@ -22,11 +22,7 @@ let store: inmemory::Store<String, ()> = inmemory::Store::new();
 let store: inmemory::Store<String, MyMetadata> = inmemory::Store::new();
 ```
 
-Features:
-- Uses `u64` positions (global sequence number)
-- Events stored in memory (lost on drop)
-- JSON serialization via `serde_json`
-- Deduplicates overlapping filters when loading
+Uses JSON serialization via `serde_json` and deduplicates overlapping filters when loading.
 
 ## Committing Events
 

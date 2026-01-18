@@ -16,11 +16,7 @@ Projections must be `Default` because they start empty and build up through even
 {{#include ../../../sourcery-core/src/projection.rs:apply_projection_trait}}
 ```
 
-Unlike aggregate `Apply`, projections receive:
-
-- `aggregate_id` — Which instance produced this event
-- `event` — The domain event
-- `metadata` — Store-provided metadata (timestamps, correlation IDs, etc.)
+Projections receive the aggregate ID and metadata alongside each event, enabling cross-aggregate views and audit trails.
 
 ## Basic Example
 

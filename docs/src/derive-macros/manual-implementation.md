@@ -150,20 +150,11 @@ impl Aggregate for Account {
 }
 ```
 
-## What You Gain
+## Trade-offs
 
-Manual implementation lets you:
+**You gain**: Custom enum structure, custom serialization (compress/encrypt), fallback handling for unknown events, conditional replay logic.
 
-1. **Custom enum structure** — Different variant names, nested enums
-2. **Custom serialization** — Compress, encrypt, or version events
-3. **Fallback handling** — Gracefully handle unknown event types
-4. **Conditional logic** — Skip certain events during replay
-
-## What You Lose
-
-- More code to maintain
-- Easy to introduce bugs in the match arms
-- Must keep `EVENT_KINDS` array in sync with `from_stored`
+**You lose**: More code to maintain, easy to introduce bugs in match arms, must keep `EVENT_KINDS` in sync with `from_stored`.
 
 ## When to Go Manual
 
