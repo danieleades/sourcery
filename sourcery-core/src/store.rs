@@ -178,9 +178,9 @@ where
     Store(#[source] StoreError),
 }
 
-/// Result of a successful commit operation.
+/// Successful commit of events to a stream.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CommitResult<Pos> {
+pub struct Committed<Pos> {
     /// Position of the last event written in the batch.
     pub last_position: Pos,
 }
@@ -273,7 +273,7 @@ pub trait EventStore: Send + Sync {
         aggregate_id: &'a Self::Id,
         events: NonEmpty<E>,
         metadata: &'a Self::Metadata,
-    ) -> impl Future<Output = Result<CommitResult<Self::Position>, CommitError<Self::Error>>> + Send + 'a
+    ) -> impl Future<Output = Result<Committed<Self::Position>, CommitError<Self::Error>>> + Send + 'a
     where
         E: crate::event::EventKind + serde::Serialize + Send + Sync + 'a,
         Self::Metadata: Clone;
@@ -292,6 +292,7 @@ pub trait EventStore: Send + Sync {
     /// Returns [`OptimisticCommitError::Serialization`] if an event fails to
     /// serialize, [`OptimisticCommitError::Conflict`] if the version check
     /// fails, or [`OptimisticCommitError::Store`] if persistence fails.
+    #[allow(clippy::type_complexity)]
     fn commit_events_optimistic<'a, E>(
         &'a self,
         aggregate_kind: &'a str,
@@ -301,7 +302,7 @@ pub trait EventStore: Send + Sync {
         metadata: &'a Self::Metadata,
     ) -> impl Future<
         Output = Result<
-            CommitResult<Self::Position>,
+            Committed<Self::Position>,
             OptimisticCommitError<Self::Position, Self::Error>,
         >,
     > + Send

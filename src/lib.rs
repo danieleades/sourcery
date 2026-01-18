@@ -22,7 +22,7 @@ pub mod store {
     // Re-export low-level commit types for EventStore implementors only.
     // Most users should interact with the Repository API instead.
     #[doc(hidden)]
-    pub use sourcery_core::store::{CommitError, CommitResult, OptimisticCommitError};
+    pub use sourcery_core::store::{CommitError, Committed, OptimisticCommitError};
     pub use sourcery_core::store::{
         EventFilter, EventStore, GloballyOrderedStore, NonEmpty, StoredEvent,
     };

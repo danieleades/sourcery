@@ -19,7 +19,7 @@ use sourcery_core::{
     concurrency::ConcurrencyConflict,
     event::DomainEvent,
     store::{
-        CommitError, CommitResult, EventFilter, EventStore, GloballyOrderedStore, LoadEventsResult,
+        CommitError, Committed, EventFilter, EventStore, GloballyOrderedStore, LoadEventsResult,
         OptimisticCommitError, StoredEvent,
     },
 };
@@ -172,7 +172,7 @@ where
         aggregate_id: &'a Self::Id,
         events: NonEmpty<E>,
         metadata: &'a Self::Metadata,
-    ) -> Result<CommitResult<i64>, CommitError<Self::Error>>
+    ) -> Result<Committed<i64>, CommitError<Self::Error>>
     where
         E: sourcery_core::event::EventKind + serde::Serialize + Send + Sync + 'a,
         Self::Metadata: Clone,
@@ -246,7 +246,7 @@ where
             .await
             .map_err(|e| CommitError::Store(Error::Database(e)))?;
 
-        Ok(CommitResult {
+        Ok(Committed {
             last_position: *last_position,
         })
     }
@@ -267,7 +267,7 @@ where
         expected_version: Option<Self::Position>,
         events: NonEmpty<E>,
         metadata: &'a Self::Metadata,
-    ) -> Result<CommitResult<i64>, OptimisticCommitError<i64, Self::Error>>
+    ) -> Result<Committed<i64>, OptimisticCommitError<i64, Self::Error>>
     where
         E: sourcery_core::event::EventKind + serde::Serialize + Send + Sync + 'a,
         Self::Metadata: Clone,
@@ -377,7 +377,7 @@ where
             .await
             .map_err(|e| OptimisticCommitError::Store(Error::Database(e)))?;
 
-        Ok(CommitResult {
+        Ok(Committed {
             last_position: *last_position,
         })
     }

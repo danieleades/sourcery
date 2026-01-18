@@ -46,11 +46,12 @@ CREATE INDEX idx_events_kind
 
 ```rust,ignore
 use std::future::Future;
+use nonempty::NonEmpty;
 use sourcery::store::{
-    AppendError, AppendResult, EventFilter, EventStore, NonEmpty,
-    StagedEvent, StoredEvent, Transaction,
+    CommitError, Committed, EventFilter, EventStore,
+    OptimisticCommitError, StoredEvent,
 };
-use sourcery::concurrency::ConcurrencyStrategy;
+use sourcery::concurrency::ConcurrencyConflict;
 
 pub struct PostgresEventStore {
     pool: sqlx::PgPool,
@@ -61,23 +62,7 @@ impl EventStore for PostgresEventStore {
     type Position = i64;
     type Error = sqlx::Error;
     type Metadata = serde_json::Value;
-    type Data = serde_json::Value;  // Serialization format
-
-    fn stage_event<E>(
-        &self,
-        event: &E,
-        metadata: Self::Metadata,
-    ) -> Result<StagedEvent<Self::Data, Self::Metadata>, Self::Error>
-    where
-        E: EventKind + serde::Serialize
-    {
-        let data = serde_json::to_value(event)?;
-        Ok(StagedEvent {
-            kind: event.kind().to_string(),
-            data,
-            metadata,
-        })
-    }
+    type Data = serde_json::Value;
 
     fn decode_event<E>(
         &self,
@@ -90,55 +75,75 @@ impl EventStore for PostgresEventStore {
             .map_err(Into::into)
     }
 
-    fn stream_version<'a>(&'a self, aggregate_kind: &'a str, aggregate_id: &'a Self::Id)
-        -> impl Future<Output = Result<Option<Self::Position>, Self::Error>> + Send + 'a
+    fn stream_version<'a>(
+        &'a self,
+        aggregate_kind: &'a str,
+        aggregate_id: &'a Self::Id,
+    ) -> impl Future<Output = Result<Option<Self::Position>, Self::Error>> + Send + 'a
     {
         async move {
             todo!("SELECT MAX(position) WHERE aggregate_kind = $1 AND aggregate_id = $2")
         }
     }
 
-    fn begin<C: ConcurrencyStrategy>(
-        &self,
-        aggregate_kind: &str,
-        aggregate_id: Self::Id,
-        expected_version: Option<Self::Position>
-    ) -> Transaction<'_, Self, C> {
-        Transaction::new(self, aggregate_kind.to_string(), aggregate_id, expected_version)
+    fn commit_events<'a, E>(
+        &'a self,
+        aggregate_kind: &'a str,
+        aggregate_id: &'a Self::Id,
+        events: NonEmpty<E>,
+        metadata: &'a Self::Metadata,
+    ) -> impl Future<Output = Result<Committed<Self::Position>, CommitError<Self::Error>>> + Send + 'a
+    where
+        E: EventKind + serde::Serialize + Send + Sync + 'a,
+        Self::Metadata: Clone,
+    {
+        async move {
+            // Serialize events
+            let prepared: Vec<_> = events.iter()
+                .enumerate()
+                .map(|(i, e)| {
+                    let data = serde_json::to_value(e)
+                        .map_err(|e| CommitError::Serialization { index: i, source: e.into() })?;
+                    Ok((e.kind(), data))
+                })
+                .collect::<Result<_, CommitError<Self::Error>>>()?;
+
+            // INSERT all events atomically
+            // Return Committed { last_position }
+            todo!()
+        }
     }
 
-    fn append<'a>(
+    fn commit_events_optimistic<'a, E>(
         &'a self,
         aggregate_kind: &'a str,
         aggregate_id: &'a Self::Id,
         expected_version: Option<Self::Position>,
-        events: NonEmpty<StagedEvent<Self::Data, Self::Metadata>>
-    ) -> impl Future<Output = Result<AppendResult<Self::Position>, AppendError<Self::Position, Self::Error>>> + Send + 'a
+        events: NonEmpty<E>,
+        metadata: &'a Self::Metadata,
+    ) -> impl Future<Output = Result<Committed<Self::Position>, OptimisticCommitError<Self::Position, Self::Error>>> + Send + 'a
+    where
+        E: EventKind + serde::Serialize + Send + Sync + 'a,
+        Self::Metadata: Clone,
     {
-        async move { todo!("INSERT with version check") }
-    }
-
-    fn append_expecting_new<'a>(
-        &'a self,
-        aggregate_kind: &'a str,
-        aggregate_id: &'a Self::Id,
-        events: NonEmpty<StagedEvent<Self::Data, Self::Metadata>>
-    ) -> impl Future<Output = Result<AppendResult<Self::Position>, AppendError<Self::Position, Self::Error>>> + Send + 'a
-    {
-        async move { todo!("INSERT only if stream empty") }
+        async move {
+            // 1. Check current version matches expected_version
+            // 2. If mismatch, return OptimisticCommitError::Conflict
+            // 3. Serialize and INSERT events atomically
+            // 4. Return Committed { last_position }
+            todo!()
+        }
     }
 
     fn load_events<'a>(
         &'a self,
-        filters: &'a [EventFilter<Self::Id, Self::Position>]
+        filters: &'a [EventFilter<Self::Id, Self::Position>],
     ) -> impl Future<Output = Result<Vec<StoredEvent<Self::Id, Self::Position, Self::Data, Self::Metadata>>, Self::Error>> + Send + 'a
     {
         async move { todo!("SELECT with filters") }
     }
 }
 ```
-
-The `StagedEvent` and `StoredEvent` types are provided by the library—you don't need to define your own. Your store just needs to specify the `Data` associated type (e.g., `serde_json::Value` for JSON, `Vec<u8>` for binary formats).
 
 ## Loading Events
 
@@ -170,10 +175,12 @@ CREATE UNIQUE INDEX idx_events_stream_version
 ```
 
 ```rust,ignore
-// In append:
+// In commit_events_optimistic:
 // 1. Get current max version for stream
-// 2. Insert with version + 1
-// 3. Handle unique constraint violation as concurrency conflict
+// 2. Compare against expected_version
+// 3. If mismatch, return OptimisticCommitError::Conflict(ConcurrencyConflict { expected, actual })
+// 4. Insert with version + 1
+// 5. Handle unique constraint violation as concurrency conflict
 ```
 
 ## Event Stores for Different Databases
@@ -214,22 +221,38 @@ Use the same test patterns as `inmemory::Store`:
 
 ```rust,ignore
 #[tokio::test]
-async fn test_append_and_load() {
+async fn test_commit_and_load() {
     let store = PostgresEventStore::new(test_pool()).await;
 
-    // Append events
-    let mut tx = store.begin::<Unchecked>("account", "ACC-001".to_string(), None);
-    tx.append(&event, metadata)?;
-    tx.commit().await?;
+    // Commit events
+    let events = NonEmpty::singleton(MyEvent { data: "test".into() });
+    store.commit_events("account", &"ACC-001".into(), events, &metadata).await?;
 
     // Load and verify
-    let events = store
+    let loaded = store
         .load_events(&[
-        EventFilter::for_aggregate("account.deposited", "account", "ACC-001".to_string())
-    ])
+            EventFilter::for_aggregate("my-event", "account", "ACC-001".to_string())
+        ])
         .await?;
 
-    assert_eq!(events.len(), 1);
+    assert_eq!(loaded.len(), 1);
+}
+
+#[tokio::test]
+async fn test_optimistic_concurrency() {
+    let store = PostgresEventStore::new(test_pool()).await;
+
+    // Create initial event
+    let events = NonEmpty::singleton(MyEvent { data: "first".into() });
+    store.commit_events_optimistic("account", &id, None, events, &metadata).await?;
+
+    // Concurrent write with wrong version should fail
+    let events = NonEmpty::singleton(MyEvent { data: "second".into() });
+    let result = store
+        .commit_events_optimistic("account", &id, Some(999), events, &metadata)
+        .await;
+
+    assert!(matches!(result, Err(OptimisticCommitError::Conflict(_))));
 }
 ```
 

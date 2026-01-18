@@ -21,7 +21,7 @@ use nonempty::NonEmpty;
 use crate::{
     concurrency::ConcurrencyConflict,
     store::{
-        CommitError, CommitResult, EventFilter, EventStore, GloballyOrderedStore, LoadEventsResult,
+        CommitError, Committed, EventFilter, EventStore, GloballyOrderedStore, LoadEventsResult,
         OptimisticCommitError, StoredEvent, StreamKey,
     },
 };
@@ -124,7 +124,7 @@ where
         aggregate_id: &'a Self::Id,
         events: NonEmpty<E>,
         metadata: &'a Self::Metadata,
-    ) -> impl Future<Output = Result<CommitResult<u64>, CommitError<Self::Error>>> + Send + 'a
+    ) -> impl Future<Output = Result<Committed<u64>, CommitError<Self::Error>>> + Send + 'a
     where
         E: crate::event::EventKind + serde::Serialize + Send + Sync + 'a,
         Self::Metadata: Clone,
@@ -162,7 +162,7 @@ where
             inner.streams.entry(stream_key).or_default().extend(stored);
             drop(inner);
             tracing::debug!(events_appended = events.len(), "events committed to stream");
-            Ok(CommitResult { last_position })
+            Ok(Committed { last_position })
         })();
 
         std::future::ready(result)
@@ -176,9 +176,7 @@ where
         expected_version: Option<Self::Position>,
         events: NonEmpty<E>,
         metadata: &'a Self::Metadata,
-    ) -> impl Future<Output = Result<CommitResult<u64>, OptimisticCommitError<u64, Self::Error>>>
-    + Send
-    + 'a
+    ) -> impl Future<Output = Result<Committed<u64>, OptimisticCommitError<u64, Self::Error>>> + Send + 'a
     where
         E: crate::event::EventKind + serde::Serialize + Send + Sync + 'a,
         Self::Metadata: Clone,
@@ -256,7 +254,7 @@ where
                 events_appended = events.len(),
                 "events committed to stream (optimistic)"
             );
-            Ok(CommitResult { last_position })
+            Ok(Committed { last_position })
         })();
 
         std::future::ready(result)

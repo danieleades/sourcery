@@ -28,20 +28,29 @@ Features:
 - JSON serialization via `serde_json`
 - Deduplicates overlapping filters when loading
 
-## Transactions
+## Committing Events
 
-Events are appended within a transaction for atomicity:
+Events are committed atomically using one of two methods:
 
 ```rust,ignore
-use sourcery::concurrency::Unchecked;
+use nonempty::NonEmpty;
 
-let mut tx = store.begin::<Unchecked>("account", "ACC-001".to_string(), None);
-tx.append(&event, metadata.clone())?;
-tx.append(&event2, metadata.clone())?;
-tx.commit().await?; // Events visible only after commit
+// Without version checking (last-writer-wins)
+let events = NonEmpty::singleton(my_event);
+let result = store
+    .commit_events("account", &account_id, events, &metadata)
+    .await?;
+
+// With optimistic concurrency control
+let events = NonEmpty::singleton(my_event);
+let result = store
+    .commit_events_optimistic("account", &account_id, Some(expected_version), events, &metadata)
+    .await?;
 ```
 
-If the transaction is dropped without committing, no events are persisted.
+The `commit_events_optimistic` method fails with a `ConcurrencyConflict` if:
+- `expected_version` is `Some(v)` and the current stream version differs
+- `expected_version` is `None` and the stream already has events
 
 ## Event Filters
 
@@ -60,20 +69,6 @@ EventFilter::for_event("account.deposited").after(100)
 
 ## Event Types
 
-Events flow through two representations during persistence:
-
-### `StagedEvent<Data, M>`
-
-An event that has been serialized and staged for persistence. Created by `EventStore::stage_event()`, it holds the serialized payload but has no position yet—that's assigned by the store during append.
-
-```rust,ignore
-pub struct StagedEvent<Data, M> {
-    pub kind: String,      // Event type identifier (e.g., "account.deposited")
-    pub data: Data,        // Serialized event payload
-    pub metadata: M,       // Infrastructure metadata
-}
-```
-
 ### `StoredEvent<Id, Pos, Data, M>`
 
 An event loaded from the store. Contains the serialized data plus store-assigned metadata. Use `EventStore::decode_event()` to deserialize back to a domain event.
@@ -89,7 +84,7 @@ pub struct StoredEvent<Id, Pos, Data, M> {
 }
 ```
 
-Both types are generic over `Data` (the serialization format—e.g., `serde_json::Value` for JSON stores) and `M` (metadata). Store implementations specify their concrete types through the `EventStore::Data` associated type.
+The `Data` type is generic over the serialization format (e.g., `serde_json::Value` for JSON stores). Store implementations specify their concrete type through the `EventStore::Data` associated type.
 
 ## The `SnapshotStore` Trait
 
