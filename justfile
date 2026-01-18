@@ -18,3 +18,6 @@ update-trybuild:
 
 lint:
     cargo +nightly clippy --all --all-features --all-targets
+
+coverage:
+    cargo +nightly llvm-cov --all-features --workspace --doctests -- --skip ui

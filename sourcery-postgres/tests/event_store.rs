@@ -428,3 +428,141 @@ async fn metadata_is_preserved() {
 
     assert_eq!(events[0].metadata().user_id, "special-user-123");
 }
+
+// =============================================================================
+// Tests for commit_events (unchecked / last-writer-wins)
+// =============================================================================
+
+#[tokio::test]
+async fn commit_events_creates_stream() {
+    let db = TestDb::new().await;
+    let store: Store<TestMetadata> = Store::new(db.pool.clone());
+    store.migrate().await.unwrap();
+
+    let id = Uuid::new_v4();
+    let events = NonEmpty::singleton(test_event("data"));
+    let metadata = test_metadata("user1");
+
+    let result = store
+        .commit_events("test.aggregate", &id, events, &metadata)
+        .await
+        .unwrap();
+
+    assert!(result.last_position > 0);
+
+    // Stream version should now be set
+    let version = store.stream_version("test.aggregate", &id).await.unwrap();
+    assert_eq!(version, Some(result.last_position));
+}
+
+#[tokio::test]
+async fn commit_events_appends_to_existing_stream() {
+    let db = TestDb::new().await;
+    let store: Store<TestMetadata> = Store::new(db.pool.clone());
+    store.migrate().await.unwrap();
+
+    let id = Uuid::new_v4();
+    let metadata = test_metadata("user1");
+
+    // First commit
+    let first = store
+        .commit_events(
+            "test.aggregate",
+            &id,
+            NonEmpty::singleton(test_event("first")),
+            &metadata,
+        )
+        .await
+        .unwrap();
+
+    // Second commit (no version check - should succeed)
+    let second = store
+        .commit_events(
+            "test.aggregate",
+            &id,
+            NonEmpty::singleton(test_event("second")),
+            &metadata,
+        )
+        .await
+        .unwrap();
+
+    assert!(second.last_position > first.last_position);
+
+    // Both events should be in the stream
+    let filters = vec![EventFilter::for_aggregate(
+        "test-event",
+        "test.aggregate",
+        id,
+    )];
+    let events = store.load_events(&filters).await.unwrap();
+    assert_eq!(events.len(), 2);
+}
+
+#[tokio::test]
+async fn commit_events_multiple_events_atomically() {
+    let db = TestDb::new().await;
+    let store: Store<TestMetadata> = Store::new(db.pool.clone());
+    store.migrate().await.unwrap();
+
+    let id = Uuid::new_v4();
+    let metadata = test_metadata("user1");
+
+    let events = NonEmpty::from_vec(vec![
+        test_event("first"),
+        test_event("second"),
+        test_event("third"),
+    ])
+    .unwrap();
+
+    let result = store
+        .commit_events("test.aggregate", &id, events, &metadata)
+        .await
+        .unwrap();
+
+    // Load all events
+    let filters = vec![EventFilter::for_aggregate(
+        "test-event",
+        "test.aggregate",
+        id,
+    )];
+    let loaded = store.load_events(&filters).await.unwrap();
+
+    assert_eq!(loaded.len(), 3);
+    assert_eq!(loaded[2].position(), result.last_position);
+}
+
+// =============================================================================
+// Tests for decode_event
+// =============================================================================
+
+#[tokio::test]
+async fn decode_event_deserializes_stored_event() {
+    let db = TestDb::new().await;
+    let store: Store<TestMetadata> = Store::new(db.pool.clone());
+    store.migrate().await.unwrap();
+
+    let id = Uuid::new_v4();
+    let original_event = test_event("test data for decode");
+    let metadata = test_metadata("user1");
+
+    store
+        .commit_events(
+            "test.aggregate",
+            &id,
+            NonEmpty::singleton(original_event.clone()),
+            &metadata,
+        )
+        .await
+        .unwrap();
+
+    // Load and decode the event
+    let filters = vec![EventFilter::for_aggregate(
+        "test-event",
+        "test.aggregate",
+        id,
+    )];
+    let stored = store.load_events(&filters).await.unwrap();
+
+    let decoded: TestEvent = store.decode_event(&stored[0]).unwrap();
+    assert_eq!(decoded, original_event);
+}
