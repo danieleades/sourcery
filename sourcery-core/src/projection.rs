@@ -110,7 +110,7 @@ where
     store: &'a S,
     snapshots: &'a SS,
     /// Event kind -> handler mapping for O(1) dispatch
-    handlers: HashMap<String, EventHandler<P, S>>,
+    handlers: HashMap<&'a str, EventHandler<P, S>>,
     /// Filters for loading events from the store
     filters: Vec<EventFilter<S::Id, S::Position>>,
     _phantom: PhantomData<fn() -> (P, Snap)>,
@@ -171,7 +171,7 @@ where
     {
         self.filters.push(EventFilter::for_event(E::KIND));
         self.handlers.insert(
-            E::KIND.to_string(),
+            E::KIND,
             Box::new(|proj, agg_id, stored, metadata, store| {
                 let event: E = store.decode_event(stored)?;
                 let metadata_converted: P::Metadata = metadata.clone().into();
@@ -204,7 +204,7 @@ where
         for &kind in E::EVENT_KINDS {
             self.filters.push(EventFilter::for_event(kind));
             self.handlers.insert(
-                kind.to_string(),
+                kind,
                 Box::new(move |proj, agg_id, stored, metadata, store| {
                     let event = E::from_stored(stored, store).map_err(HandlerError::EventDecode)?;
                     let metadata_converted: P::Metadata = metadata.clone().into();
@@ -241,7 +241,7 @@ where
             aggregate_id.clone(),
         ));
         self.handlers.insert(
-            E::KIND.to_string(),
+            E::KIND,
             Box::new(|proj, agg_id, stored, metadata, store| {
                 let event: E = store.decode_event(stored)?;
                 let metadata_converted: P::Metadata = metadata.clone().into();
@@ -280,7 +280,7 @@ where
                 aggregate_id.clone(),
             ));
             self.handlers.insert(
-                kind.to_string(),
+                kind,
                 Box::new(move |proj, agg_id, stored, metadata, store| {
                     let event = <A::Event as ProjectionEvent>::from_stored(stored, store)
                         .map_err(HandlerError::EventDecode)?;

@@ -154,6 +154,17 @@ async fn load_surfaces_deserialization_error() {
 
 // ============================================================================
 // Tests for events() method with aggregate event enums
+//
+// The `events()` and `events_for()` builder methods load all events from an
+// aggregate's event enum in a single call. This requires implementing
+// `ApplyProjection` for the enum type, which dispatches to individual handlers.
+//
+// This API is useful when:
+// - An aggregate replays its own history
+// - A projection is tightly coupled to one aggregate and wants all its events
+//
+// For most projections, prefer chaining `.event::<E>()` calls instead - this
+// subscribes to specific event types without needing the enum dispatch impl.
 // ============================================================================
 
 /// Second event type to test multi-event aggregate enums
@@ -247,8 +258,10 @@ impl ApplyProjection<ValueReset> for MultiEventProjection {
     }
 }
 
-/// Implementation for the aggregate event enum - dispatches to individual
-/// handlers
+/// Implementation for the aggregate event enum - required only when using
+/// `.events::<MultiEventCounterEvent>()` or
+/// `.events_for::<MultiEventCounter>()`. Dispatches to the individual event
+/// handlers above.
 impl ApplyProjection<MultiEventCounterEvent> for MultiEventProjection {
     fn apply_projection(
         &mut self,
@@ -258,10 +271,10 @@ impl ApplyProjection<MultiEventCounterEvent> for MultiEventProjection {
     ) {
         match event {
             MultiEventCounterEvent::ValueAdded(e) => {
-                self.apply_projection(aggregate_id, e, metadata)
+                self.apply_projection(aggregate_id, e, metadata);
             }
             MultiEventCounterEvent::ValueReset(e) => {
-                self.apply_projection(aggregate_id, e, metadata)
+                self.apply_projection(aggregate_id, e, metadata);
             }
         }
     }
