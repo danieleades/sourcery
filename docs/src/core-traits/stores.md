@@ -28,20 +28,29 @@ Features:
 - JSON serialization via `serde_json`
 - Deduplicates overlapping filters when loading
 
-## Transactions
+## Committing Events
 
-Events are appended within a transaction for atomicity:
+Events are committed atomically using one of two methods:
 
 ```rust,ignore
-use sourcery::concurrency::Unchecked;
+use nonempty::NonEmpty;
 
-let mut tx = store.begin::<Unchecked>("account", "ACC-001".to_string(), None);
-tx.append(&event, metadata.clone())?;
-tx.append(&event2, metadata.clone())?;
-tx.commit().await?; // Events visible only after commit
+// Without version checking (last-writer-wins)
+let events = NonEmpty::singleton(my_event);
+let result = store
+    .commit_events("account", &account_id, events, &metadata)
+    .await?;
+
+// With optimistic concurrency control
+let events = NonEmpty::singleton(my_event);
+let result = store
+    .commit_events_optimistic("account", &account_id, Some(expected_version), events, &metadata)
+    .await?;
 ```
 
-If the transaction is dropped without committing, no events are persisted.
+The `commit_events_optimistic` method fails with a `ConcurrencyConflict` if:
+- `expected_version` is `Some(v)` and the current stream version differs
+- `expected_version` is `None` and the stream already has events
 
 ## Event Filters
 
@@ -58,25 +67,24 @@ EventFilter::for_aggregate("account.deposited", "account", "ACC-001")
 EventFilter::for_event("account.deposited").after(100)
 ```
 
-## The `StoredEventView` Trait
+## Event Types
 
-Events loaded from the store implement this trait:
+### `StoredEvent<Id, Pos, Data, M>`
+
+An event loaded from the store. Contains the serialized data plus store-assigned metadata. Use `EventStore::decode_event()` to deserialize back to a domain event.
 
 ```rust,ignore
-pub trait StoredEventView {
-    type Id;
-    type Pos;
-    type Metadata;
-
-    fn aggregate_kind(&self) -> &str;
-    fn aggregate_id(&self) -> &Self::Id;
-    fn kind(&self) -> &str;
-    fn position(&self) -> Self::Pos;
-    fn metadata(&self) -> &Self::Metadata;
+pub struct StoredEvent<Id, Pos, Data, M> {
+    pub aggregate_kind: String,  // Aggregate type identifier
+    pub aggregate_id: Id,        // Aggregate instance identifier
+    pub kind: String,            // Event type identifier
+    pub position: Pos,           // Global position assigned by store
+    pub data: Data,              // Serialized event payload
+    pub metadata: M,             // Infrastructure metadata
 }
 ```
 
-Stores provide their own `StoredEvent` type that implements this trait, allowing different internal representations (e.g., JSONB, binary) while exposing a uniform interface.
+The `Data` type is generic over the serialization format (e.g., `serde_json::Value` for JSON stores). Store implementations specify their concrete type through the `EventStore::Data` associated type.
 
 ## The `SnapshotStore` Trait
 

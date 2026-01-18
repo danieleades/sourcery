@@ -132,7 +132,7 @@ async fn load_surfaces_deserialization_error() {
     let mut repo = Repository::new(store);
 
     // Inject malformed JSON data that won't deserialize to ValueAdded
-    repo.inject_event(Counter::KIND, &"c1".to_string(), &InvalidValueAdded, ())
+    repo.inject_event(Counter::KIND, &"c1".to_string(), InvalidValueAdded, ())
         .await
         .unwrap();
 

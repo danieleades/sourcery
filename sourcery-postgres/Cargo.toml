@@ -18,6 +18,7 @@ default = []
 
 [dependencies]
 sourcery-core = { path = "../sourcery-core", version = "0.1"}
+nonempty = "0.10"
 serde = { version = "1", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
 sqlx = { version = "0.8.3", default-features = false, features = ["json", "postgres", "runtime-tokio-rustls", "uuid"] }
@@ -27,7 +28,6 @@ uuid = { version = "1", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 criterion = { version = "0.6", default-features = false, features = ["async_tokio"] }
-nonempty = "0.10"
 serde_json = { version = "1", default-features = false, features = ["std"] }
 testcontainers = { version = "0.26", default-features = false }
 testcontainers-modules = { version = "0.14", default-features = false, features = ["postgres"] }

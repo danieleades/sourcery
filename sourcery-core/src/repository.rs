@@ -30,6 +30,7 @@
 
 use std::marker::PhantomData;
 
+use nonempty::NonEmpty;
 use serde::{Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
@@ -39,7 +40,7 @@ use crate::{
     event::{EventKind, ProjectionEvent},
     projection::{Projection, ProjectionBuilder, ProjectionError},
     snapshot::{OfferSnapshotError, Snapshot, SnapshotOffer, SnapshotStore},
-    store::{AppendError, EventFilter, EventStore, StoredEventView},
+    store::{CommitError, EventFilter, EventStore, OptimisticCommitError, StoredEvents},
 };
 
 type LoadError<S> = ProjectionError<<S as EventStore>::Error>;
@@ -200,10 +201,11 @@ where
 fn apply_stored_events<A, S>(
     aggregate: &mut A,
     store: &S,
-    events: &[S::StoredEvent],
+    events: &StoredEvents<S::Id, S::Position, S::Data, S::Metadata>,
 ) -> Result<Option<S::Position>, crate::event::EventDecodeError<S::Error>>
 where
     S: EventStore,
+    S::Position: Clone,
     A: Aggregate<Id = S::Id>,
     A::Event: ProjectionEvent,
 {
@@ -524,7 +526,7 @@ where
     ) -> UncheckedCommandResult<A, S>
     where
         A: Aggregate<Id = S::Id> + Handle<Cmd>,
-        A::Event: ProjectionEvent + EventKind + serde::Serialize,
+        A::Event: ProjectionEvent + EventKind + serde::Serialize + Send + Sync,
         Cmd: Sync,
         S::Metadata: Clone,
     {
@@ -536,21 +538,19 @@ where
             Handle::<Cmd>::handle(&aggregate, command).map_err(CommandError::Aggregate)?
         };
 
-        if new_events.is_empty() {
+        let Some(events) = NonEmpty::from_vec(new_events) else {
             return Ok(());
-        }
+        };
 
-        let mut tx = self.store.begin::<Unchecked>(A::KIND, id.clone(), None);
-        for event in &new_events {
-            tx.append(event, metadata.clone())
-                .map_err(CommandError::Store)?;
-        }
-        drop(new_events);
-        tx.commit().await.map_err(|e| match e {
-            AppendError::Store(err) => CommandError::Store(err),
-            AppendError::Conflict(_) => unreachable!("conflict impossible without version"),
-            AppendError::EmptyAppend => unreachable!("empty append filtered above"),
-        })?;
+        self.store
+            .commit_events(A::KIND, id, events, metadata)
+            .await
+            .map_err(|e| match e {
+                CommitError::Store(err) | CommitError::Serialization { source: err, .. } => {
+                    CommandError::Store(err)
+                }
+            })?;
+
         Ok(())
     }
 }
@@ -575,7 +575,7 @@ where
     ) -> OptimisticCommandResult<A, S>
     where
         A: Aggregate<Id = S::Id> + Handle<Cmd>,
-        A::Event: ProjectionEvent + EventKind + serde::Serialize,
+        A::Event: ProjectionEvent + EventKind + serde::Serialize + Send + Sync,
         Cmd: Sync,
         S::Metadata: Clone,
     {
@@ -591,25 +591,20 @@ where
             (version, new_events)
         };
 
-        if new_events.is_empty() {
+        let Some(events) = NonEmpty::from_vec(new_events) else {
             return Ok(());
-        }
+        };
 
-        let mut tx = self.store.begin::<Optimistic>(A::KIND, id.clone(), version);
-        for event in &new_events {
-            tx.append(event, metadata.clone())
-                .map_err(OptimisticCommandError::Store)?;
-        }
-        drop(new_events);
-
-        match tx.commit().await {
-            Ok(_) => {}
-            Err(AppendError::Conflict(c)) => {
-                return Err(OptimisticCommandError::Concurrency(c));
-            }
-            Err(AppendError::Store(s)) => return Err(OptimisticCommandError::Store(s)),
-            Err(AppendError::EmptyAppend) => unreachable!("empty append filtered above"),
-        }
+        self.store
+            .commit_events_optimistic(A::KIND, id, version, events, metadata)
+            .await
+            .map_err(|e| match e {
+                OptimisticCommitError::Conflict(c) => OptimisticCommandError::Concurrency(c),
+                OptimisticCommitError::Store(err)
+                | OptimisticCommitError::Serialization { source: err, .. } => {
+                    OptimisticCommandError::Store(err)
+                }
+            })?;
 
         Ok(())
     }
@@ -629,7 +624,7 @@ where
     ) -> RetryResult<A, S>
     where
         A: Aggregate<Id = S::Id> + Handle<Cmd>,
-        A::Event: ProjectionEvent + EventKind + serde::Serialize,
+        A::Event: ProjectionEvent + EventKind + serde::Serialize + Send + Sync,
         Cmd: Sync,
         S::Metadata: Clone,
     {
@@ -744,7 +739,7 @@ where
     ) -> UncheckedSnapshotCommandResult<A, S, SS>
     where
         A: Aggregate<Id = S::Id> + Handle<Cmd> + Serialize + DeserializeOwned + Send,
-        A::Event: ProjectionEvent + EventKind + serde::Serialize,
+        A::Event: ProjectionEvent + EventKind + serde::Serialize + Send + Sync,
         Cmd: Sync,
         S::Metadata: Clone,
     {
@@ -760,29 +755,27 @@ where
         let new_events =
             Handle::<Cmd>::handle(&aggregate, command).map_err(SnapshotCommandError::Aggregate)?;
 
-        if new_events.is_empty() {
+        let Some(events) = NonEmpty::from_vec(new_events) else {
             return Ok(());
-        }
+        };
 
-        let total_events_since_snapshot = events_since_snapshot + new_events.len() as u64;
+        let total_events_since_snapshot = events_since_snapshot + events.len() as u64;
 
         let mut aggregate = aggregate;
-        for event in &new_events {
+        for event in &events {
             aggregate.apply(event);
         }
 
-        let mut tx = self.store.begin::<Unchecked>(A::KIND, id.clone(), None);
-        for event in &new_events {
-            tx.append(event, metadata.clone())
-                .map_err(SnapshotCommandError::Store)?;
-        }
-        drop(new_events);
-        let append_result = tx.commit().await.map_err(|e| match e {
-            AppendError::Store(err) => SnapshotCommandError::Store(err),
-            AppendError::Conflict(_) => unreachable!("conflict impossible without version"),
-            AppendError::EmptyAppend => unreachable!("empty append filtered above"),
-        })?;
-        let new_position = append_result.last_position;
+        let commit_result = self
+            .store
+            .commit_events(A::KIND, id, events, metadata)
+            .await
+            .map_err(|e| match e {
+                CommitError::Store(err) | CommitError::Serialization { source: err, .. } => {
+                    SnapshotCommandError::Store(err)
+                }
+            })?;
+        let new_position = commit_result.last_position;
 
         let offer_result = self.snapshots.0.offer_snapshot(
             A::KIND,
@@ -831,7 +824,7 @@ where
     ) -> OptimisticSnapshotCommandResult<A, S, SS>
     where
         A: Aggregate<Id = S::Id> + Handle<Cmd> + Serialize + DeserializeOwned + Send,
-        A::Event: ProjectionEvent + EventKind + serde::Serialize,
+        A::Event: ProjectionEvent + EventKind + serde::Serialize + Send + Sync,
         Cmd: Sync,
         S::Metadata: Clone,
     {
@@ -847,33 +840,31 @@ where
         let new_events = Handle::<Cmd>::handle(&aggregate, command)
             .map_err(OptimisticSnapshotCommandError::Aggregate)?;
 
-        if new_events.is_empty() {
+        let Some(events) = NonEmpty::from_vec(new_events) else {
             return Ok(());
-        }
+        };
 
-        let total_events_since_snapshot = events_since_snapshot + new_events.len() as u64;
+        let total_events_since_snapshot = events_since_snapshot + events.len() as u64;
 
         let mut aggregate = aggregate;
-        for event in &new_events {
+        for event in &events {
             aggregate.apply(event);
         }
 
-        let mut tx = self.store.begin::<Optimistic>(A::KIND, id.clone(), version);
-        for event in &new_events {
-            tx.append(event, metadata.clone())
-                .map_err(OptimisticSnapshotCommandError::Store)?;
-        }
-        drop(new_events);
-
-        let append_result = match tx.commit().await {
-            Ok(result) => result,
-            Err(AppendError::Conflict(c)) => {
-                return Err(OptimisticSnapshotCommandError::Concurrency(c));
-            }
-            Err(AppendError::Store(s)) => return Err(OptimisticSnapshotCommandError::Store(s)),
-            Err(AppendError::EmptyAppend) => unreachable!("empty append filtered above"),
-        };
-        let new_position = append_result.last_position;
+        let commit_result = self
+            .store
+            .commit_events_optimistic(A::KIND, id, version, events, metadata)
+            .await
+            .map_err(|e| match e {
+                OptimisticCommitError::Conflict(c) => {
+                    OptimisticSnapshotCommandError::Concurrency(c)
+                }
+                OptimisticCommitError::Store(err)
+                | OptimisticCommitError::Serialization { source: err, .. } => {
+                    OptimisticSnapshotCommandError::Store(err)
+                }
+            })?;
+        let new_position = commit_result.last_position;
 
         let offer_result = self.snapshots.0.offer_snapshot(
             A::KIND,
@@ -916,7 +907,7 @@ where
     ) -> SnapshotRetryResult<A, S, SS>
     where
         A: Aggregate<Id = S::Id> + Handle<Cmd> + Serialize + DeserializeOwned + Send,
-        A::Event: ProjectionEvent + EventKind + serde::Serialize,
+        A::Event: ProjectionEvent + EventKind + serde::Serialize + Send + Sync,
         Cmd: Sync,
         S::Metadata: Clone,
     {

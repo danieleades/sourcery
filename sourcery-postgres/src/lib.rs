@@ -13,18 +13,17 @@ pub mod snapshot;
 
 use std::marker::PhantomData;
 
+use nonempty::NonEmpty;
 use serde::{Serialize, de::DeserializeOwned};
 use sourcery_core::{
-    concurrency::{ConcurrencyConflict, ConcurrencyStrategy},
+    concurrency::ConcurrencyConflict,
     event::DomainEvent,
     store::{
-        AppendError, AppendResult, EventFilter, EventStore, GloballyOrderedStore, NonEmpty,
-        StoredEventView, Transaction,
+        CommitError, Committed, EventFilter, EventStore, GloballyOrderedStore, LoadEventsResult,
+        OptimisticCommitError, StoredEvent,
     },
 };
 use sqlx::{PgPool, Postgres, QueryBuilder, Row};
-
-type AppendOutcome = Result<AppendResult<i64>, AppendError<i64, Error>>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -38,79 +37,6 @@ pub enum Error {
     Serialization(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
     #[error("deserialization error: {0}")]
     Deserialization(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
-}
-
-/// Stored event with position and metadata.
-///
-/// This type represents an event that has been persisted to `PostgreSQL` and
-/// loaded back. It contains all the information needed to deserialize the event
-/// data and metadata, along with the aggregate identifiers and global position.
-///
-/// # Type Parameters
-///
-/// - `M`: The metadata type (must be `Serialize + DeserializeOwned`)
-///
-/// # Fields
-///
-/// All fields are accessible through the [`StoredEventView`] trait
-/// implementation. Use the trait methods rather than accessing fields directly
-/// to maintain compatibility across store implementations.
-#[derive(Clone)]
-pub struct StoredEvent<M> {
-    aggregate_kind: String,
-    aggregate_id: uuid::Uuid,
-    kind: String,
-    position: i64,
-    data: serde_json::Value,
-    metadata: M,
-}
-
-/// Staged event awaiting persistence.
-///
-/// This type represents an event that has been serialized and prepared for
-/// persistence but not yet written to `PostgreSQL`. The repository creates
-/// these from domain events, then batches them together for atomic appending.
-///
-/// # Type Parameters
-///
-/// - `M`: The metadata type (must be `Serialize + DeserializeOwned`)
-///
-/// # Internal Use
-///
-/// This type is primarily used by the [`Store`] implementation. Users typically
-/// interact with domain events directly and don't need to create `StagedEvent`
-/// instances manually.
-#[derive(Clone)]
-pub struct StagedEvent<M> {
-    kind: String,
-    data: serde_json::Value,
-    metadata: M,
-}
-
-impl<M> StoredEventView for StoredEvent<M> {
-    type Id = uuid::Uuid;
-    type Metadata = M;
-    type Pos = i64;
-
-    fn aggregate_kind(&self) -> &str {
-        &self.aggregate_kind
-    }
-
-    fn aggregate_id(&self) -> &Self::Id {
-        &self.aggregate_id
-    }
-
-    fn kind(&self) -> &str {
-        &self.kind
-    }
-
-    fn position(&self) -> Self::Pos {
-        self.position
-    }
-
-    fn metadata(&self) -> &Self::Metadata {
-        &self.metadata
-    }
 }
 
 /// A PostgreSQL-backed [`EventStore`].
@@ -199,30 +125,16 @@ impl<M> EventStore for Store<M>
 where
     M: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
+    type Data = serde_json::Value;
     type Error = Error;
     type Id = uuid::Uuid;
     type Metadata = M;
     type Position = i64;
-    type StagedEvent = StagedEvent<M>;
-    type StoredEvent = StoredEvent<M>;
 
-    fn stage_event<E>(
+    fn decode_event<E>(
         &self,
-        event: &E,
-        metadata: Self::Metadata,
-    ) -> Result<Self::StagedEvent, Self::Error>
-    where
-        E: sourcery_core::event::EventKind + serde::Serialize,
-    {
-        let data = serde_json::to_value(event).map_err(|e| Error::Serialization(Box::new(e)))?;
-        Ok(StagedEvent {
-            kind: event.kind().to_string(),
-            data,
-            metadata,
-        })
-    }
-
-    fn decode_event<E>(&self, stored: &Self::StoredEvent) -> Result<E, Self::Error>
+        stored: &StoredEvent<Self::Id, Self::Position, Self::Data, Self::Metadata>,
+    ) -> Result<E, Self::Error>
     where
         E: DomainEvent + serde::de::DeserializeOwned,
     {
@@ -246,41 +158,40 @@ where
         Ok(result)
     }
 
-    fn begin<Conc: ConcurrencyStrategy>(
-        &self,
-        aggregate_kind: &str,
-        aggregate_id: Self::Id,
-        expected_version: Option<Self::Position>,
-    ) -> Transaction<'_, Self, Conc> {
-        Transaction::new(
-            self,
-            aggregate_kind.to_string(),
-            aggregate_id,
-            expected_version,
-        )
-    }
-
     #[tracing::instrument(
-        skip(self, events),
+        skip(self, events, metadata),
         fields(
             aggregate_kind,
             aggregate_id = %aggregate_id,
-            expected_version,
             events_len = events.len()
         )
     )]
-    async fn append<'a>(
+    async fn commit_events<'a, E>(
         &'a self,
         aggregate_kind: &'a str,
         aggregate_id: &'a Self::Id,
-        expected_version: Option<Self::Position>,
-        events: NonEmpty<Self::StagedEvent>,
-    ) -> AppendOutcome {
+        events: NonEmpty<E>,
+        metadata: &'a Self::Metadata,
+    ) -> Result<Committed<i64>, CommitError<Self::Error>>
+    where
+        E: sourcery_core::event::EventKind + serde::Serialize + Send + Sync + 'a,
+        Self::Metadata: Clone,
+    {
+        // Serialize all events first
+        let mut prepared: Vec<(String, serde_json::Value)> = Vec::with_capacity(events.len());
+        for (index, event) in events.iter().enumerate() {
+            let data = serde_json::to_value(event).map_err(|e| CommitError::Serialization {
+                index,
+                source: Error::Serialization(Box::new(e)),
+            })?;
+            prepared.push((event.kind().to_string(), data));
+        }
+
         let mut tx = self
             .pool
             .begin()
             .await
-            .map_err(|e| AppendError::store(Error::Database(e)))?;
+            .map_err(|e| CommitError::Store(Error::Database(e)))?;
 
         sqlx::query(
             r"
@@ -293,50 +204,17 @@ where
         .bind(aggregate_id)
         .execute(&mut *tx)
         .await
-        .map_err(|e| AppendError::store(Error::Database(e)))?;
-
-        let current: Option<i64> = sqlx::query_scalar::<_, Option<i64>>(
-            r"
-                SELECT last_position
-                FROM es_streams
-                WHERE aggregate_kind = $1 AND aggregate_id = $2
-                FOR UPDATE
-                ",
-        )
-        .bind(aggregate_kind)
-        .bind(aggregate_id)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|e| AppendError::store(Error::Database(e)))?;
-
-        if let Some(expected) = expected_version
-            && current != Some(expected)
-        {
-            return Err(AppendError::Conflict(ConcurrencyConflict {
-                expected: Some(expected),
-                actual: current,
-            }));
-        }
-
-        let mut prepared = Vec::with_capacity(events.len());
-        for event in events {
-            let StagedEvent {
-                kind,
-                data,
-                metadata,
-            } = event;
-            prepared.push((kind, data, metadata));
-        }
+        .map_err(|e| CommitError::Store(Error::Database(e)))?;
 
         let mut qb = QueryBuilder::<Postgres>::new(
             "INSERT INTO es_events (aggregate_kind, aggregate_id, event_kind, data, metadata) ",
         );
-        qb.push_values(prepared.into_iter(), |mut b, (kind, data, metadata)| {
+        qb.push_values(prepared, |mut b, (kind, data)| {
             b.push_bind(aggregate_kind);
             b.push_bind(aggregate_id);
             b.push_bind(kind);
             b.push_bind(sqlx::types::Json(data));
-            b.push_bind(sqlx::types::Json(metadata));
+            b.push_bind(sqlx::types::Json(metadata.clone()));
         });
         qb.push(" RETURNING position");
 
@@ -344,11 +222,11 @@ where
             .build_query_scalar()
             .fetch_all(&mut *tx)
             .await
-            .map_err(|e| AppendError::store(Error::Database(e)))?;
+            .map_err(|e| CommitError::Store(Error::Database(e)))?;
 
         let last_position = rows
             .last()
-            .ok_or_else(|| AppendError::store(Error::MissingReturnedPosition))?;
+            .ok_or_else(|| CommitError::Store(Error::MissingReturnedPosition))?;
 
         sqlx::query(
             r"
@@ -362,22 +240,154 @@ where
         .bind(aggregate_id)
         .execute(&mut *tx)
         .await
-        .map_err(|e| AppendError::store(Error::Database(e)))?;
+        .map_err(|e| CommitError::Store(Error::Database(e)))?;
 
         tx.commit()
             .await
-            .map_err(|e| AppendError::store(Error::Database(e)))?;
+            .map_err(|e| CommitError::Store(Error::Database(e)))?;
 
-        Ok(AppendResult {
+        Ok(Committed {
             last_position: *last_position,
         })
     }
 
+    #[tracing::instrument(
+        skip(self, events, metadata),
+        fields(
+            aggregate_kind,
+            aggregate_id = %aggregate_id,
+            expected_version,
+            events_len = events.len()
+        )
+    )]
+    async fn commit_events_optimistic<'a, E>(
+        &'a self,
+        aggregate_kind: &'a str,
+        aggregate_id: &'a Self::Id,
+        expected_version: Option<Self::Position>,
+        events: NonEmpty<E>,
+        metadata: &'a Self::Metadata,
+    ) -> Result<Committed<i64>, OptimisticCommitError<i64, Self::Error>>
+    where
+        E: sourcery_core::event::EventKind + serde::Serialize + Send + Sync + 'a,
+        Self::Metadata: Clone,
+    {
+        // Serialize all events first
+        let mut prepared: Vec<(String, serde_json::Value)> = Vec::with_capacity(events.len());
+        for (index, event) in events.iter().enumerate() {
+            let data =
+                serde_json::to_value(event).map_err(|e| OptimisticCommitError::Serialization {
+                    index,
+                    source: Error::Serialization(Box::new(e)),
+                })?;
+            prepared.push((event.kind().to_string(), data));
+        }
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| OptimisticCommitError::Store(Error::Database(e)))?;
+
+        sqlx::query(
+            r"
+                INSERT INTO es_streams (aggregate_kind, aggregate_id, last_position)
+                VALUES ($1, $2, NULL)
+                ON CONFLICT (aggregate_kind, aggregate_id) DO NOTHING
+                ",
+        )
+        .bind(aggregate_kind)
+        .bind(aggregate_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| OptimisticCommitError::Store(Error::Database(e)))?;
+
+        let current: Option<i64> = sqlx::query_scalar::<_, Option<i64>>(
+            r"
+                SELECT last_position
+                FROM es_streams
+                WHERE aggregate_kind = $1 AND aggregate_id = $2
+                FOR UPDATE
+                ",
+        )
+        .bind(aggregate_kind)
+        .bind(aggregate_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| OptimisticCommitError::Store(Error::Database(e)))?;
+
+        // Version check
+        match expected_version {
+            Some(expected) => {
+                if current != Some(expected) {
+                    return Err(OptimisticCommitError::Conflict(ConcurrencyConflict {
+                        expected: Some(expected),
+                        actual: current,
+                    }));
+                }
+            }
+            None => {
+                // Expected new stream (no events)
+                if let Some(actual) = current {
+                    return Err(OptimisticCommitError::Conflict(ConcurrencyConflict {
+                        expected: None,
+                        actual: Some(actual),
+                    }));
+                }
+            }
+        }
+
+        let mut qb = QueryBuilder::<Postgres>::new(
+            "INSERT INTO es_events (aggregate_kind, aggregate_id, event_kind, data, metadata) ",
+        );
+        qb.push_values(prepared, |mut b, (kind, data)| {
+            b.push_bind(aggregate_kind);
+            b.push_bind(aggregate_id);
+            b.push_bind(kind);
+            b.push_bind(sqlx::types::Json(data));
+            b.push_bind(sqlx::types::Json(metadata.clone()));
+        });
+        qb.push(" RETURNING position");
+
+        let rows: Vec<i64> = qb
+            .build_query_scalar()
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| OptimisticCommitError::Store(Error::Database(e)))?;
+
+        let last_position = rows
+            .last()
+            .ok_or_else(|| OptimisticCommitError::Store(Error::MissingReturnedPosition))?;
+
+        sqlx::query(
+            r"
+                UPDATE es_streams
+                SET last_position = $1
+                WHERE aggregate_kind = $2 AND aggregate_id = $3
+                ",
+        )
+        .bind(last_position)
+        .bind(aggregate_kind)
+        .bind(aggregate_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| OptimisticCommitError::Store(Error::Database(e)))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| OptimisticCommitError::Store(Error::Database(e)))?;
+
+        Ok(Committed {
+            last_position: *last_position,
+        })
+    }
+
+    #[allow(clippy::type_complexity)]
     #[tracing::instrument(skip(self, filters), fields(filters_len = filters.len()))]
     async fn load_events<'a>(
         &'a self,
         filters: &'a [EventFilter<Self::Id, Self::Position>],
-    ) -> Result<Vec<Self::StoredEvent>, Self::Error> {
+    ) -> LoadEventsResult<Self::Id, Self::Position, Self::Data, Self::Metadata, Self::Error> {
         if filters.is_empty() {
             return Ok(Vec::new());
         }
@@ -437,111 +447,6 @@ where
         }
 
         Ok(out)
-    }
-
-    #[tracing::instrument(
-        skip(self, events),
-        fields(aggregate_kind, aggregate_id = %aggregate_id, events_len = events.len())
-    )]
-    async fn append_expecting_new<'a>(
-        &'a self,
-        aggregate_kind: &'a str,
-        aggregate_id: &'a Self::Id,
-        events: NonEmpty<Self::StagedEvent>,
-    ) -> AppendOutcome {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| AppendError::store(Error::Database(e)))?;
-
-        sqlx::query(
-            r"
-                INSERT INTO es_streams (aggregate_kind, aggregate_id, last_position)
-                VALUES ($1, $2, NULL)
-                ON CONFLICT (aggregate_kind, aggregate_id) DO NOTHING
-                ",
-        )
-        .bind(aggregate_kind)
-        .bind(aggregate_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| AppendError::store(Error::Database(e)))?;
-
-        let current: Option<i64> = sqlx::query_scalar::<_, Option<i64>>(
-            r"
-                SELECT last_position
-                FROM es_streams
-                WHERE aggregate_kind = $1 AND aggregate_id = $2
-                FOR UPDATE
-                ",
-        )
-        .bind(aggregate_kind)
-        .bind(aggregate_id)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|e| AppendError::store(Error::Database(e)))?;
-
-        if let Some(actual) = current {
-            return Err(AppendError::Conflict(ConcurrencyConflict {
-                expected: None,
-                actual: Some(actual),
-            }));
-        }
-
-        let mut prepared = Vec::with_capacity(events.len());
-        for event in events {
-            let StagedEvent {
-                kind,
-                data,
-                metadata,
-            } = event;
-            prepared.push((kind, data, metadata));
-        }
-
-        let mut qb = QueryBuilder::<Postgres>::new(
-            "INSERT INTO es_events (aggregate_kind, aggregate_id, event_kind, data, metadata) ",
-        );
-        qb.push_values(prepared.into_iter(), |mut b, (kind, data, metadata)| {
-            b.push_bind(aggregate_kind);
-            b.push_bind(aggregate_id);
-            b.push_bind(kind);
-            b.push_bind(sqlx::types::Json(data));
-            b.push_bind(sqlx::types::Json(metadata));
-        });
-        qb.push(" RETURNING position");
-
-        let rows: Vec<i64> = qb
-            .build_query_scalar()
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(|e| AppendError::store(Error::Database(e)))?;
-
-        let last_position = rows
-            .last()
-            .ok_or_else(|| AppendError::store(Error::MissingReturnedPosition))?;
-
-        sqlx::query(
-            r"
-                UPDATE es_streams
-                SET last_position = $1
-                WHERE aggregate_kind = $2 AND aggregate_id = $3
-                ",
-        )
-        .bind(last_position)
-        .bind(aggregate_kind)
-        .bind(aggregate_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| AppendError::store(Error::Database(e)))?;
-
-        tx.commit()
-            .await
-            .map_err(|e| AppendError::store(Error::Database(e)))?;
-
-        Ok(AppendResult {
-            last_position: *last_position,
-        })
     }
 }
 

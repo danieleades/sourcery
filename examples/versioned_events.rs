@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_evolve::Versioned;
 use sourcery::{
     Aggregate, Apply, DomainEvent, Handle, ProjectionEvent, Repository,
-    store::{EventFilter, EventStore, StoredEventView, inmemory},
+    store::{EventFilter, EventStore, inmemory},
 };
 
 // =============================================================================

@@ -243,10 +243,9 @@ fn generate_aggregate_impl(args: AggregateArgs, input: &DeriveInput) -> TokenStr
             const EVENT_KINDS: &'static [&'static str] = &[#(#event_types::KIND),*];
 
             fn from_stored<S: ::sourcery::store::EventStore>(
-                stored: &S::StoredEvent,
+                stored: &::sourcery::store::StoredEvent<S::Id, S::Position, S::Data, S::Metadata>,
                 store: &S,
             ) -> Result<Self, ::sourcery::event::EventDecodeError<S::Error>> {
-                use ::sourcery::store::StoredEventView;
                 match stored.kind() {
                     #(#event_types::KIND => Ok(Self::#variant_names(
                         store.decode_event(stored).map_err(::sourcery::event::EventDecodeError::Store)?

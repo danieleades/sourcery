@@ -80,7 +80,7 @@ pub trait ProjectionEvent: Sized {
     /// Returns [`EventDecodeError::UnknownKind`] if the event kind is not
     /// recognized, or [`EventDecodeError::Store`] if deserialization fails.
     fn from_stored<S: crate::store::EventStore>(
-        stored: &S::StoredEvent,
+        stored: &crate::store::StoredEvent<S::Id, S::Position, S::Data, S::Metadata>,
         store: &S,
     ) -> Result<Self, EventDecodeError<S::Error>>;
 }

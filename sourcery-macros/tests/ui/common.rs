@@ -43,22 +43,54 @@ pub mod event {
         const EVENT_KINDS: &'static [&'static str];
 
         fn from_stored<S: super::store::EventStore>(
-            stored: &S::StoredEvent,
+            stored: &super::store::StoredEvent<S::Id, S::Position, S::Data, S::Metadata>,
             store: &S,
         ) -> Result<Self, EventDecodeError<S::Error>>;
     }
 }
 
 pub mod store {
-    pub trait StoredEventView {
-        type Id;
-        type Pos;
-        type Metadata;
-        fn aggregate_kind(&self) -> &str;
-        fn aggregate_id(&self) -> &Self::Id;
-        fn kind(&self) -> &str;
-        fn position(&self) -> Self::Pos;
-        fn metadata(&self) -> &Self::Metadata;
+    /// Stored event with position and metadata.
+    #[derive(Clone, Debug)]
+    pub struct StoredEvent<Id, Pos, Data, M> {
+        pub aggregate_kind: String,
+        pub aggregate_id: Id,
+        pub kind: String,
+        pub position: Pos,
+        pub data: Data,
+        pub metadata: M,
+    }
+
+    impl<Id, Pos, Data, M> StoredEvent<Id, Pos, Data, M> {
+        pub fn aggregate_kind(&self) -> &str {
+            &self.aggregate_kind
+        }
+
+        pub fn aggregate_id(&self) -> &Id {
+            &self.aggregate_id
+        }
+
+        pub fn kind(&self) -> &str {
+            &self.kind
+        }
+
+        pub fn metadata(&self) -> &M {
+            &self.metadata
+        }
+    }
+
+    impl<Id, Pos: Clone, Data, M> StoredEvent<Id, Pos, Data, M> {
+        pub fn position(&self) -> Pos {
+            self.position.clone()
+        }
+    }
+
+    /// Staged event awaiting persistence.
+    #[derive(Clone, Debug)]
+    pub struct StagedEvent<Data, M> {
+        pub kind: String,
+        pub data: Data,
+        pub metadata: M,
     }
 
     pub trait EventStore: Send + Sync {
@@ -66,14 +98,20 @@ pub mod store {
         type Id;
         type Metadata;
         type Position;
-        type StoredEvent: StoredEventView<Id = Self::Id, Pos = Self::Position, Metadata = Self::Metadata>;
-        type StagedEvent: Send + 'static;
+        type Data: Clone + Send + Sync + 'static;
 
-        fn stage_event<E>(&self, event: &E, metadata: Self::Metadata) -> Result<Self::StagedEvent, Self::Error>
+        fn stage_event<E>(
+            &self,
+            event: &E,
+            metadata: Self::Metadata,
+        ) -> Result<StagedEvent<Self::Data, Self::Metadata>, Self::Error>
         where
             E: super::event::EventKind + serde::Serialize;
 
-        fn decode_event<E>(&self, stored: &Self::StoredEvent) -> Result<E, Self::Error>
+        fn decode_event<E>(
+            &self,
+            stored: &StoredEvent<Self::Id, Self::Position, Self::Data, Self::Metadata>,
+        ) -> Result<E, Self::Error>
         where
             E: super::event::DomainEvent + serde::de::DeserializeOwned;
     }
