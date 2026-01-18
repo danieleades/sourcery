@@ -7,7 +7,7 @@ The `#[derive(Aggregate)]` macro eliminates boilerplate by generating the event 
 ```rust,ignore
 use sourcery::Aggregate;
 
-#[derive(Debug, Default, Serialize, Deserialize, Aggregate)]
+#[derive(Debug, Default, Aggregate)]
 #[aggregate(id = String, error = String, events(FundsDeposited, FundsWithdrawn))]
 pub struct Account {
     balance: i64,
@@ -23,6 +23,7 @@ pub struct Account {
 | `events(E1, E2, ...)` | Yes | Event types this aggregate produces |
 | `kind = "name"` | No | Aggregate type identifier (default: lowercase struct name) |
 | `event_enum = "Name"` | No | Generated enum name (default: `{Struct}Event`) |
+| `derives(Trait1, Trait2)` | No | Additional derives for the generated enum (default: `Clone` only) |
 
 ## What Gets Generated
 
@@ -46,13 +47,15 @@ Input -> "enum AccountEvent"
 Input -> "impl Aggregate for Account"
 Input -> "impl From<FundsDeposited>"
 Input -> "impl From<FundsWithdrawn>"
-Input -> "impl SerializableEvent"
+Input -> "impl EventKind"
+Input -> "impl serde::Serialize"
 Input -> "impl ProjectionEvent"
 ```
 
 ### 1. Event Enum
 
 ```rust,ignore
+#[derive(Clone)]
 pub enum AccountEvent {
     FundsDeposited(FundsDeposited),
     FundsWithdrawn(FundsWithdrawn),
@@ -90,54 +93,74 @@ impl Aggregate for Account {
     type Error = AccountError;
     type Id = String;
 
-    fn apply(&mut self, event: Self::Event) {
+    fn apply(&mut self, event: &Self::Event) {
         match event {
-            AccountEvent::FundsDeposited(e) => Apply::apply(self, &e),
-            AccountEvent::FundsWithdrawn(e) => Apply::apply(self, &e),
+            AccountEvent::FundsDeposited(e) => Apply::apply(self, e),
+            AccountEvent::FundsWithdrawn(e) => Apply::apply(self, e),
         }
     }
 }
 ```
 
-### 4. SerializableEvent Implementation
+### 4. EventKind Implementation
 
-Converts domain events to persistable form:
+Provides runtime access to the event type identifier:
 
 ```rust,ignore
-impl SerializableEvent for AccountEvent {
-    fn to_persistable<C: Codec, M>(
-        self,
-        codec: &C,
-        metadata: M,
-    ) -> Result<PersistableEvent<M>, C::Error> {
+impl EventKind for AccountEvent {
+    fn kind(&self) -> &'static str {
         match self {
-            AccountEvent::FundsDeposited(e) => /* serialize with kind */,
-            AccountEvent::FundsWithdrawn(e) => /* serialize with kind */,
+            Self::FundsDeposited(_) => FundsDeposited::KIND,
+            Self::FundsWithdrawn(_) => FundsWithdrawn::KIND,
         }
     }
 }
 ```
 
-### 5. ProjectionEvent Implementation
+### 5. Serialize Implementation
 
-Deserializes stored events:
+Serializes events without enum wrapper (flat serialization):
+
+```rust,ignore
+impl serde::Serialize for AccountEvent {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::FundsDeposited(inner) => inner.serialize(serializer),
+            Self::FundsWithdrawn(inner) => inner.serialize(serializer),
+        }
+    }
+}
+```
+
+This ensures events are stored as their inner type, not as tagged enums.
+
+### 6. ProjectionEvent Implementation
+
+Deserializes stored events by kind:
 
 ```rust,ignore
 impl ProjectionEvent for AccountEvent {
     const EVENT_KINDS: &'static [&'static str] = &[
-        "account.deposited",
-        "account.withdrawn",
+        FundsDeposited::KIND,
+        FundsWithdrawn::KIND,
     ];
 
-    fn from_stored<C: Codec>(
-        kind: &str,
-        data: &[u8],
-        codec: &C,
-    ) -> Result<Self, C::Error> {
-        match kind {
-            "account.deposited" => Ok(Self::FundsDeposited(codec.deserialize(data)?)),
-            "account.withdrawn" => Ok(Self::FundsWithdrawn(codec.deserialize(data)?)),
-            _ => /* unknown event error */,
+    fn from_stored<S: EventStore>(
+        stored: &S::StoredEvent,
+        store: &S,
+    ) -> Result<Self, EventDecodeError<S::Error>> {
+        use sourcery::store::StoredEventView;
+        match stored.kind() {
+            FundsDeposited::KIND => Ok(Self::FundsDeposited(
+                store.decode_event(stored)?
+            )),
+            FundsWithdrawn::KIND => Ok(Self::FundsWithdrawn(
+                store.decode_event(stored)?
+            )),
+            _ => Err(EventDecodeError::UnknownKind { ... }),
         }
     }
 }
@@ -175,14 +198,32 @@ pub struct Account { /* ... */ }
 
 Now the generated enum is `BankEvent` instead of `AccountEvent`.
 
+## Adding Derives to the Event Enum
+
+By default, the generated enum only derives `Clone`. Add more:
+
+```rust,ignore
+#[derive(Aggregate)]
+#[aggregate(
+    id = String,
+    error = String,
+    events(FundsDeposited),
+    derives(Debug, PartialEq)
+)]
+pub struct Account { /* ... */ }
+```
+
+Now the generated enum has `#[derive(Clone, Debug, PartialEq)]`.
+
 ## Requirements
 
 Your struct must also derive/implement:
 
 - `Default` — Fresh aggregate state
-- `Serialize` + `Deserialize` — For snapshotting
 
 Each event type must implement `DomainEvent`.
+
+**Note:** Aggregates do not require `Serialize` or `Deserialize` by default. These are only needed if you enable snapshots via `Repository::with_snapshots()`.
 
 ## Next
 

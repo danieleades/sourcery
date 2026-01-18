@@ -30,9 +30,7 @@ With traditional storage, you only know the current balance. With event sourcing
 
 ## The Core Principle
 
-> **Events are the source of truth.**
-
-An event represents something that happened in the past. It is immutable—you never modify or delete events. To "undo" something, you append a compensating event.
+> **Events are the source of truth.** To "undo" something, append a compensating event.
 
 | Property | Description |
 |----------|-------------|

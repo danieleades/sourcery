@@ -66,7 +66,7 @@ async fn load_returns_none_for_nonexistent_snapshot() {
     store.migrate().await.unwrap();
 
     let id = Uuid::new_v4();
-    let result = store.load("test.aggregate", &id).await.unwrap();
+    let result = store.load::<String>("test.aggregate", &id).await.unwrap();
 
     assert!(result.is_none());
 }
@@ -78,11 +78,11 @@ async fn offer_and_load_snapshot_roundtrip() {
     store.migrate().await.unwrap();
 
     let id = Uuid::new_v4();
-    let snapshot_data = b"test snapshot data".to_vec();
+    let snapshot_data = "test snapshot data".to_string();
 
     // Offer a snapshot
     let result = store
-        .offer_snapshot::<std::convert::Infallible, _>("test.aggregate", &id, 10, || {
+        .offer_snapshot::<std::convert::Infallible, _, _>("test.aggregate", &id, 10, || {
             Ok(Snapshot {
                 position: 42,
                 data: snapshot_data.clone(),
@@ -94,7 +94,11 @@ async fn offer_and_load_snapshot_roundtrip() {
     assert_eq!(result, SnapshotOffer::Stored);
 
     // Load the snapshot back
-    let loaded = store.load("test.aggregate", &id).await.unwrap().unwrap();
+    let loaded = store
+        .load::<String>("test.aggregate", &id)
+        .await
+        .unwrap()
+        .unwrap();
 
     assert_eq!(loaded.position, 42);
     assert_eq!(loaded.data, snapshot_data);
@@ -110,10 +114,10 @@ async fn offer_updates_existing_snapshot_with_higher_position() {
 
     // Store initial snapshot at position 10
     store
-        .offer_snapshot::<std::convert::Infallible, _>("test.aggregate", &id, 5, || {
+        .offer_snapshot::<std::convert::Infallible, _, _>("test.aggregate", &id, 5, || {
             Ok(Snapshot {
                 position: 10,
-                data: b"first".to_vec(),
+                data: "first".to_string(),
             })
         })
         .await
@@ -121,10 +125,10 @@ async fn offer_updates_existing_snapshot_with_higher_position() {
 
     // Update with higher position
     let result = store
-        .offer_snapshot::<std::convert::Infallible, _>("test.aggregate", &id, 5, || {
+        .offer_snapshot::<std::convert::Infallible, _, _>("test.aggregate", &id, 5, || {
             Ok(Snapshot {
                 position: 20,
-                data: b"second".to_vec(),
+                data: "second".to_string(),
             })
         })
         .await
@@ -133,9 +137,13 @@ async fn offer_updates_existing_snapshot_with_higher_position() {
     assert_eq!(result, SnapshotOffer::Stored);
 
     // Verify the updated snapshot
-    let loaded = store.load("test.aggregate", &id).await.unwrap().unwrap();
+    let loaded = store
+        .load::<String>("test.aggregate", &id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(loaded.position, 20);
-    assert_eq!(loaded.data, b"second".to_vec());
+    assert_eq!(loaded.data, "second".to_string());
 }
 
 #[tokio::test]
@@ -148,10 +156,10 @@ async fn offer_declines_stale_snapshot_with_lower_position() {
 
     // Store initial snapshot at position 20
     store
-        .offer_snapshot::<std::convert::Infallible, _>("test.aggregate", &id, 5, || {
+        .offer_snapshot::<std::convert::Infallible, _, _>("test.aggregate", &id, 5, || {
             Ok(Snapshot {
                 position: 20,
-                data: b"newer".to_vec(),
+                data: "newer".to_string(),
             })
         })
         .await
@@ -159,10 +167,10 @@ async fn offer_declines_stale_snapshot_with_lower_position() {
 
     // Try to store older snapshot at position 10
     let result = store
-        .offer_snapshot::<std::convert::Infallible, _>("test.aggregate", &id, 5, || {
+        .offer_snapshot::<std::convert::Infallible, _, _>("test.aggregate", &id, 5, || {
             Ok(Snapshot {
                 position: 10,
-                data: b"older".to_vec(),
+                data: "older".to_string(),
             })
         })
         .await
@@ -172,9 +180,13 @@ async fn offer_declines_stale_snapshot_with_lower_position() {
     assert_eq!(result, SnapshotOffer::Declined);
 
     // Original snapshot should remain
-    let loaded = store.load("test.aggregate", &id).await.unwrap().unwrap();
+    let loaded = store
+        .load::<String>("test.aggregate", &id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(loaded.position, 20);
-    assert_eq!(loaded.data, b"newer".to_vec());
+    assert_eq!(loaded.data, "newer".to_string());
 }
 
 #[tokio::test]
@@ -187,10 +199,10 @@ async fn offer_declines_equal_position_snapshot() {
 
     // Store initial snapshot at position 15
     store
-        .offer_snapshot::<std::convert::Infallible, _>("test.aggregate", &id, 5, || {
+        .offer_snapshot::<std::convert::Infallible, _, _>("test.aggregate", &id, 5, || {
             Ok(Snapshot {
                 position: 15,
-                data: b"first".to_vec(),
+                data: "first".to_string(),
             })
         })
         .await
@@ -198,10 +210,10 @@ async fn offer_declines_equal_position_snapshot() {
 
     // Try to store snapshot with same position
     let result = store
-        .offer_snapshot::<std::convert::Infallible, _>("test.aggregate", &id, 5, || {
+        .offer_snapshot::<std::convert::Infallible, _, _>("test.aggregate", &id, 5, || {
             Ok(Snapshot {
                 position: 15,
-                data: b"duplicate".to_vec(),
+                data: "duplicate".to_string(),
             })
         })
         .await
@@ -221,10 +233,10 @@ async fn policy_always_stores_snapshot() {
 
     // Even with 0 events since last snapshot, should store
     let result = store
-        .offer_snapshot::<std::convert::Infallible, _>("test.aggregate", &id, 0, || {
+        .offer_snapshot::<std::convert::Infallible, _, _>("test.aggregate", &id, 0, || {
             Ok(Snapshot {
                 position: 1,
-                data: b"data".to_vec(),
+                data: "data".to_string(),
             })
         })
         .await
@@ -243,10 +255,10 @@ async fn policy_every_n_declines_below_threshold() {
 
     // With only 49 events, should decline
     let result = store
-        .offer_snapshot::<std::convert::Infallible, _>("test.aggregate", &id, 49, || {
+        .offer_snapshot::<std::convert::Infallible, _, _>("test.aggregate", &id, 49, || {
             Ok(Snapshot {
                 position: 1,
-                data: b"data".to_vec(),
+                data: "data".to_string(),
             })
         })
         .await
@@ -265,10 +277,10 @@ async fn policy_every_n_stores_at_threshold() {
 
     // At exactly 50 events, should store
     let result = store
-        .offer_snapshot::<std::convert::Infallible, _>("test.aggregate", &id, 50, || {
+        .offer_snapshot::<std::convert::Infallible, _, _>("test.aggregate", &id, 50, || {
             Ok(Snapshot {
                 position: 1,
-                data: b"data".to_vec(),
+                data: "data".to_string(),
             })
         })
         .await
@@ -287,10 +299,10 @@ async fn policy_never_always_declines() {
 
     // Even with many events, should decline
     let result = store
-        .offer_snapshot::<std::convert::Infallible, _>("test.aggregate", &id, 1000, || {
+        .offer_snapshot::<std::convert::Infallible, _, _>("test.aggregate", &id, 1000, || {
             Ok(Snapshot {
                 position: 1,
-                data: b"data".to_vec(),
+                data: "data".to_string(),
             })
         })
         .await
@@ -309,10 +321,10 @@ async fn policy_never_can_still_load_snapshots() {
 
     let id = Uuid::new_v4();
     always_store
-        .offer_snapshot::<std::convert::Infallible, _>("test.aggregate", &id, 0, || {
+        .offer_snapshot::<std::convert::Infallible, _, _>("test.aggregate", &id, 0, || {
             Ok(Snapshot {
                 position: 100,
-                data: b"stored by always".to_vec(),
+                data: "stored by always".to_string(),
             })
         })
         .await
@@ -322,13 +334,13 @@ async fn policy_never_can_still_load_snapshots() {
     let never_store = Store::never(db.pool.clone());
 
     let loaded = never_store
-        .load("test.aggregate", &id)
+        .load::<String>("test.aggregate", &id)
         .await
         .unwrap()
         .unwrap();
 
     assert_eq!(loaded.position, 100);
-    assert_eq!(loaded.data, b"stored by always".to_vec());
+    assert_eq!(loaded.data, "stored by always".to_string());
 }
 
 #[tokio::test]
@@ -341,10 +353,10 @@ async fn different_aggregate_kinds_are_isolated() {
 
     // Store snapshot for "kind.a"
     store
-        .offer_snapshot::<std::convert::Infallible, _>("kind.a", &id, 0, || {
+        .offer_snapshot::<std::convert::Infallible, _, _>("kind.a", &id, 0, || {
             Ok(Snapshot {
                 position: 10,
-                data: b"kind a data".to_vec(),
+                data: "kind a data".to_string(),
             })
         })
         .await
@@ -352,23 +364,23 @@ async fn different_aggregate_kinds_are_isolated() {
 
     // Store snapshot for "kind.b" with same id
     store
-        .offer_snapshot::<std::convert::Infallible, _>("kind.b", &id, 0, || {
+        .offer_snapshot::<std::convert::Infallible, _, _>("kind.b", &id, 0, || {
             Ok(Snapshot {
                 position: 20,
-                data: b"kind b data".to_vec(),
+                data: "kind b data".to_string(),
             })
         })
         .await
         .unwrap();
 
     // Verify they are separate
-    let loaded_a = store.load("kind.a", &id).await.unwrap().unwrap();
-    let loaded_b = store.load("kind.b", &id).await.unwrap().unwrap();
+    let loaded_a = store.load::<String>("kind.a", &id).await.unwrap().unwrap();
+    let loaded_b = store.load::<String>("kind.b", &id).await.unwrap().unwrap();
 
     assert_eq!(loaded_a.position, 10);
-    assert_eq!(loaded_a.data, b"kind a data".to_vec());
+    assert_eq!(loaded_a.data, "kind a data".to_string());
     assert_eq!(loaded_b.position, 20);
-    assert_eq!(loaded_b.data, b"kind b data".to_vec());
+    assert_eq!(loaded_b.data, "kind b data".to_string());
 }
 
 #[tokio::test]
@@ -382,33 +394,41 @@ async fn different_aggregate_ids_are_isolated() {
 
     // Store snapshots for different IDs
     store
-        .offer_snapshot::<std::convert::Infallible, _>("test.aggregate", &id1, 0, || {
+        .offer_snapshot::<std::convert::Infallible, _, _>("test.aggregate", &id1, 0, || {
             Ok(Snapshot {
                 position: 10,
-                data: b"id1 data".to_vec(),
+                data: "id1 data".to_string(),
             })
         })
         .await
         .unwrap();
 
     store
-        .offer_snapshot::<std::convert::Infallible, _>("test.aggregate", &id2, 0, || {
+        .offer_snapshot::<std::convert::Infallible, _, _>("test.aggregate", &id2, 0, || {
             Ok(Snapshot {
                 position: 20,
-                data: b"id2 data".to_vec(),
+                data: "id2 data".to_string(),
             })
         })
         .await
         .unwrap();
 
     // Verify they are separate
-    let loaded1 = store.load("test.aggregate", &id1).await.unwrap().unwrap();
-    let loaded2 = store.load("test.aggregate", &id2).await.unwrap().unwrap();
+    let loaded1 = store
+        .load::<String>("test.aggregate", &id1)
+        .await
+        .unwrap()
+        .unwrap();
+    let loaded2 = store
+        .load::<String>("test.aggregate", &id2)
+        .await
+        .unwrap()
+        .unwrap();
 
     assert_eq!(loaded1.position, 10);
-    assert_eq!(loaded1.data, b"id1 data".to_vec());
+    assert_eq!(loaded1.data, "id1 data".to_string());
     assert_eq!(loaded2.position, 20);
-    assert_eq!(loaded2.data, b"id2 data".to_vec());
+    assert_eq!(loaded2.data, "id2 data".to_string());
 }
 
 #[tokio::test]
@@ -421,7 +441,7 @@ async fn create_snapshot_callback_not_called_when_policy_declines() {
 
     // The callback should never be invoked for "never" policy
     let result = store
-        .offer_snapshot::<std::convert::Infallible, _>("test.aggregate", &id, 1000, || {
+        .offer_snapshot::<std::convert::Infallible, String, _>("test.aggregate", &id, 1000, || {
             panic!("create_snapshot should not be called when policy declines");
         })
         .await
@@ -448,7 +468,7 @@ async fn create_snapshot_error_is_propagated() {
     let id = Uuid::new_v4();
 
     let result = store
-        .offer_snapshot::<CreateError, _>("test.aggregate", &id, 0, || Err(CreateError))
+        .offer_snapshot::<CreateError, String, _>("test.aggregate", &id, 0, || Err(CreateError))
         .await;
 
     assert!(matches!(

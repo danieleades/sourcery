@@ -87,14 +87,14 @@ the aggregate derive and the in-memory store.
 
 ```rust,no_run
 use sourcery::{
-    Apply, ApplyProjection, DomainEvent, Handle, store::{inmemory, JsonCodec},
+    Apply, ApplyProjection, DomainEvent, Handle, store::inmemory,
     Repository,
 };
 use serde::{Deserialize, Serialize};
 
 // === Domain events ===
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FundsDeposited {
     pub amount_cents: i64,
 }
@@ -157,7 +157,7 @@ impl ApplyProjection<FundsDeposited> for AccountBalance {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let store: inmemory::Store<String, JsonCodec, ()> = inmemory::Store::new(JsonCodec);
+    let store: inmemory::Store<String, ()> = inmemory::Store::new();
     let repository = Repository::new(store);
 
     let account_id = "ACC-001".to_string();

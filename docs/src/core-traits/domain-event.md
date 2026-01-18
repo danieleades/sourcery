@@ -5,7 +5,7 @@ Events are the heart of event sourcing. They represent facts—things that have 
 ## The `DomainEvent` Trait
 
 ```rust,ignore
-pub trait DomainEvent: Serialize + DeserializeOwned {
+pub trait DomainEvent {
     /// Unique identifier for this event type (used for serialization routing)
     const KIND: &'static str;
 }

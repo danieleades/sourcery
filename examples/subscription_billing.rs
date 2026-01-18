@@ -25,8 +25,7 @@ use std::{collections::HashMap, fmt};
 
 use serde::{Deserialize, Serialize};
 use sourcery::{
-    Aggregate, Apply, ApplyProjection, DomainEvent, Handle, Repository,
-    store::{JsonCodec, inmemory},
+    Aggregate, Apply, ApplyProjection, DomainEvent, Handle, Repository, store::inmemory,
 };
 
 // =============================================================================
@@ -44,7 +43,7 @@ pub struct EventMetadata {
 // Subscription Aggregate
 // =============================================================================
 
-#[derive(Debug, Default, Serialize, Deserialize, Aggregate)]
+#[derive(Default, Serialize, Deserialize, Aggregate)]
 #[aggregate(
     id = String,
     error = String,
@@ -64,7 +63,7 @@ enum SubscriptionStatus {
     Inactive,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubscriptionStarted {
     pub plan_name: String,
     pub activated_at: String,
@@ -74,7 +73,7 @@ impl DomainEvent for SubscriptionStarted {
     const KIND: &'static str = "billing.subscription.started";
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubscriptionCancelled {
     pub reason: String,
     pub cancelled_at: String,
@@ -169,7 +168,7 @@ impl fmt::Display for InvoiceId {
     }
 }
 
-#[derive(Debug, Default, Serialize, Deserialize, Aggregate)]
+#[derive(Default, Serialize, Deserialize, Aggregate)]
 #[aggregate(
     id = String,
     error = String,
@@ -185,7 +184,7 @@ pub struct Invoice {
     due_date: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InvoiceIssued {
     pub customer_id: String,
     pub amount_cents: i64,
@@ -196,7 +195,7 @@ impl DomainEvent for InvoiceIssued {
     const KIND: &'static str = "billing.invoice.issued";
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaymentRecorded {
     pub customer_id: String,
     pub amount_cents: i64,
@@ -206,7 +205,7 @@ impl DomainEvent for PaymentRecorded {
     const KIND: &'static str = "billing.invoice.payment_recorded";
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InvoiceSettled {
     pub customer_id: String,
 }
@@ -442,7 +441,7 @@ impl ApplyProjection<InvoiceSettled> for CustomerBillingProjection {
 #[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let store: inmemory::Store<String, JsonCodec, EventMetadata> = inmemory::Store::new(JsonCodec);
+    let store: inmemory::Store<String, EventMetadata> = inmemory::Store::new();
     let repository = Repository::new(store);
 
     let customer_id = String::from("ACME-001");

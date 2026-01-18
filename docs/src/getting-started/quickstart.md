@@ -10,13 +10,10 @@ Build a simple bank account aggregate in a compact, end-to-end example. This exa
 
 ## What Just Happened?
 
-1. **Defined an event** — `FundsDeposited` is a simple struct with `DomainEvent`
-2. **Defined a command** — `Deposit` is a plain struct (no traits required)
-3. **Created an aggregate** — `Account` uses the derive macro to generate boilerplate
-4. **Implemented `Apply`** — How events mutate state
-5. **Implemented `Handle`** — How commands produce events
-6. **Created a projection** — `TotalDeposits` builds a read model
-7. **Wired the repository** — Connected everything with `inmemory::Store`
+1. **Defined types** — `FundsDeposited` event with `DomainEvent`, `Deposit` command (plain struct)
+2. **Created an aggregate** — `Account` with the derive macro, `Apply` for state mutations, `Handle` for command validation
+3. **Created a projection** — `TotalDeposits` builds a read model from events
+4. **Wired the repository** — Connected everything with `inmemory::Store`
 
 ## Key Points
 

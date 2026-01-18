@@ -8,9 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 use sourcery::{
-    Apply, DomainEvent, Handle, Repository,
-    repository::OptimisticCommandError,
-    store::{JsonCodec, inmemory},
+    Apply, DomainEvent, Handle, Repository, repository::OptimisticCommandError, store::inmemory,
     test::RepositoryTestExt,
 };
 
@@ -18,7 +16,7 @@ use sourcery::{
 // Domain Events
 // =============================================================================
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ItemReserved {
     pub quantity: u32,
 }
@@ -27,7 +25,7 @@ impl DomainEvent for ItemReserved {
     const KIND: &'static str = "inventory.item.reserved";
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ItemRestocked {
     pub quantity: u32,
 }
@@ -54,7 +52,7 @@ pub struct RestockItem {
 // Aggregate
 // =============================================================================
 
-#[derive(Debug, Default, Serialize, Deserialize, sourcery::Aggregate)]
+#[derive(Default, Serialize, Deserialize, sourcery::Aggregate)]
 #[aggregate(id = String, error = InventoryError, events(ItemReserved, ItemRestocked))]
 pub struct InventoryItem {
     available: u32,
@@ -110,7 +108,7 @@ impl Handle<RestockItem> for InventoryItem {
 // Example Parts
 // =============================================================================
 
-type OptimisticRepo = Repository<inmemory::Store<String, JsonCodec, ()>>;
+type OptimisticRepo = Repository<inmemory::Store<String, ()>>;
 
 /// Part 1: Basic optimistic concurrency usage.
 ///
@@ -119,7 +117,7 @@ type OptimisticRepo = Repository<inmemory::Store<String, JsonCodec, ()>>;
 async fn part1_basic_usage() -> Result<(OptimisticRepo, String), Box<dyn std::error::Error>> {
     println!("PART 1: Basic optimistic concurrency usage\n");
 
-    let store: inmemory::Store<String, JsonCodec, ()> = inmemory::Store::new(JsonCodec);
+    let store: inmemory::Store<String, ()> = inmemory::Store::new();
     let repo = Repository::new(store); // Optimistic concurrency is the default
 
     let item_id = "SKU-001".to_string();
@@ -133,7 +131,7 @@ async fn part1_basic_usage() -> Result<(OptimisticRepo, String), Box<dyn std::er
     )
     .await?;
 
-    let item: InventoryItem = repo.aggregate_builder().load(&item_id).await?;
+    let item: InventoryItem = repo.load(&item_id).await?;
     println!("   Available: {}\n", item.available);
 
     // Normal reservation (no conflict)
@@ -145,7 +143,7 @@ async fn part1_basic_usage() -> Result<(OptimisticRepo, String), Box<dyn std::er
     )
     .await?;
 
-    let item: InventoryItem = repo.aggregate_builder().load(&item_id).await?;
+    let item: InventoryItem = repo.load(&item_id).await?;
     println!("   Available: {}\n", item.available);
 
     Ok((repo, item_id))
@@ -167,7 +165,7 @@ async fn part2_conflict_detection(
     repo.inject_concurrent_event::<InventoryItem>(item_id, ItemReserved { quantity: 20 }.into())
         .await?;
 
-    let item: InventoryItem = repo.aggregate_builder().load(item_id).await?;
+    let item: InventoryItem = repo.load(item_id).await?;
     println!(
         "   Available after concurrent modification: {}\n",
         item.available
@@ -180,7 +178,7 @@ async fn part2_conflict_detection(
     repo.execute_command::<InventoryItem, ReserveItem>(item_id, &ReserveItem { quantity: 10 }, &())
         .await?;
 
-    let item: InventoryItem = repo.aggregate_builder().load(item_id).await?;
+    let item: InventoryItem = repo.load(item_id).await?;
     println!("   Available: {}\n", item.available);
 
     Ok(())
@@ -194,7 +192,7 @@ async fn part3_retry_pattern() -> Result<(OptimisticRepo, String), Box<dyn std::
     println!("PART 3: Retry pattern for handling conflicts\n");
 
     // Create a fresh store to demonstrate retry more clearly
-    let store: inmemory::Store<String, JsonCodec, ()> = inmemory::Store::new(JsonCodec);
+    let store: inmemory::Store<String, ()> = inmemory::Store::new();
     let mut repo = Repository::new(store); // Optimistic concurrency is the default
     let item_id = "SKU-002".to_string();
 
@@ -221,7 +219,7 @@ async fn part3_retry_pattern() -> Result<(OptimisticRepo, String), Box<dyn std::
         .await?;
     println!("   Succeeded on attempt {attempts}");
 
-    let item: InventoryItem = repo.aggregate_builder().load(&item_id).await?;
+    let item: InventoryItem = repo.load(&item_id).await?;
     println!(
         "   Final available: {} (50 - 5 - 10 = 35)\n",
         item.available

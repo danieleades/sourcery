@@ -13,8 +13,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use sourcery::{
-    Aggregate, Apply, ApplyProjection, DomainEvent, Repository,
-    store::{JsonCodec, inmemory},
+    Aggregate, Apply, ApplyProjection, DomainEvent, Repository, store::inmemory,
     test::RepositoryTestExt,
 };
 
@@ -22,11 +21,11 @@ use sourcery::{
 // Aggregates and domain events
 // =============================================================================
 
-#[derive(Debug, Default, Serialize, Deserialize, Aggregate)]
+#[derive(Default, Serialize, Deserialize, Aggregate)]
 #[aggregate(id = String, error = String, events(ProductRestocked, InventoryAdjusted))]
 struct Product;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct ProductRestocked {
     sku: String,
     quantity: i64,
@@ -36,7 +35,7 @@ impl DomainEvent for ProductRestocked {
     const KIND: &'static str = "inventory.product.restocked";
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct InventoryAdjusted {
     sku: String,
     delta: i64,
@@ -54,11 +53,11 @@ impl Apply<InventoryAdjusted> for Product {
     fn apply(&mut self, _event: &InventoryAdjusted) {}
 }
 
-#[derive(Debug, Default, Serialize, Deserialize, Aggregate)]
+#[derive(Default, Serialize, Deserialize, Aggregate)]
 #[aggregate(id = String, error = String, events(SaleCompleted))]
 struct Sale;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct SaleCompleted {
     sale_id: String,
     product_sku: String,
@@ -73,11 +72,11 @@ impl Apply<SaleCompleted> for Sale {
     fn apply(&mut self, _event: &SaleCompleted) {}
 }
 
-#[derive(Debug, Default, Serialize, Deserialize, Aggregate)]
+#[derive(Default, Serialize, Deserialize, Aggregate)]
 #[aggregate(id = String, error = String, events(PromotionApplied))]
 struct Promotion;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct PromotionApplied {
     promotion_id: String,
     product_sku: String,
@@ -153,7 +152,7 @@ impl ApplyProjection<PromotionApplied> for ProductSummary {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let store: inmemory::Store<String, JsonCodec, ()> = inmemory::Store::new(JsonCodec);
+    let store: inmemory::Store<String, ()> = inmemory::Store::new();
     let mut repository = Repository::new(store);
 
     let product_id = String::from("SKU-007");

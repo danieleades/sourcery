@@ -8,18 +8,13 @@
 //! - [`SnapshotStore`] - Trait for snapshot persistence with policy
 //! - [`NoSnapshots`] - No-op implementation (use `Repository` instead if you
 //!   want no snapshots)
-//! - [`InMemorySnapshotStore`] - Reference implementation with configurable
-//!   policy
+//! - [`inmemory`] - In-memory reference implementation with configurable policy
 
-use std::{
-    any::TypeId,
-    collections::HashMap,
-    convert::Infallible,
-    future::Future,
-    sync::{Arc, RwLock},
-};
+use std::convert::Infallible;
 
-use serde::Serialize;
+use serde::{Serialize, de::DeserializeOwned};
+
+pub mod inmemory;
 /// Point-in-time snapshot of aggregate state.
 ///
 /// The `position` field indicates the event stream position when this snapshot
@@ -33,12 +28,13 @@ use serde::Serialize;
 ///
 /// - `Pos`: The position type used by the event store (e.g., `u64`, `i64`,
 ///   etc.)
+/// - `Data`: The snapshot payload type.
 #[derive(Clone, Debug)]
-pub struct Snapshot<Pos> {
+pub struct Snapshot<Pos, Data> {
     /// Event position when this snapshot was taken.
     pub position: Pos,
-    /// Serialized aggregate state.
-    pub data: Vec<u8>,
+    /// Snapshot payload.
+    pub data: Data,
 }
 
 /// Trait for snapshot persistence with built-in policy.
@@ -54,14 +50,11 @@ pub struct Snapshot<Pos> {
 /// - Every N events: balance between storage and replay cost
 /// - Never save: read-only replicas that only load snapshots created elsewhere
 // ANCHOR: snapshot_store_trait
-pub trait SnapshotStore<Id>: Send + Sync
-where
-    Id: Send + Sync + 'static,
-{
+pub trait SnapshotStore<Id: Sync>: Send + Sync {
     /// Position type for tracking snapshot positions.
     ///
     /// Must match the `EventStore::Position` type used in the same repository.
-    type Position: Send + Sync + 'static;
+    type Position: Send + Sync;
 
     /// Error type for snapshot operations.
     type Error: std::error::Error + Send + Sync + 'static;
@@ -73,11 +66,13 @@ where
     /// # Errors
     ///
     /// Returns an error if the underlying storage fails.
-    fn load<'a>(
-        &'a self,
-        kind: &'a str,
-        id: &'a Id,
-    ) -> impl Future<Output = Result<Option<Snapshot<Self::Position>>, Self::Error>> + Send + 'a;
+    fn load<T>(
+        &self,
+        kind: &str,
+        id: &Id,
+    ) -> impl std::future::Future<Output = Result<Option<Snapshot<Self::Position, T>>, Self::Error>> + Send
+    where
+        T: DeserializeOwned;
 
     /// Whether to store a snapshot, with lazy snapshot creation.
     ///
@@ -95,16 +90,19 @@ where
     ///
     /// Returns [`OfferSnapshotError::Create`] if `create_snapshot` fails.
     /// Returns [`OfferSnapshotError::Snapshot`] if persistence fails.
-    fn offer_snapshot<'a, CE, Create>(
-        &'a self,
-        kind: &'a str,
-        id: &'a Id,
+    fn offer_snapshot<CE, T, Create>(
+        &self,
+        kind: &str,
+        id: &Id,
         events_since_last_snapshot: u64,
         create_snapshot: Create,
-    ) -> impl Future<Output = Result<SnapshotOffer, OfferSnapshotError<Self::Error, CE>>> + Send + 'a
+    ) -> impl std::future::Future<
+        Output = Result<SnapshotOffer, OfferSnapshotError<Self::Error, CE>>,
+    > + Send
     where
         CE: std::error::Error + Send + Sync + 'static,
-        Create: FnOnce() -> Result<Snapshot<Self::Position>, CE> + 'a;
+        T: Serialize,
+        Create: FnOnce() -> Result<Snapshot<Self::Position, T>, CE> + Send;
 }
 // ANCHOR_END: snapshot_store_trait
 
@@ -154,249 +152,79 @@ impl<Pos> NoSnapshots<Pos> {
 
 impl<Id, Pos> SnapshotStore<Id> for NoSnapshots<Pos>
 where
-    Id: Send + Sync + 'static,
-    Pos: Send + Sync + 'static,
+    Id: Send + Sync,
+    Pos: Send + Sync,
 {
     type Error = Infallible;
     type Position = Pos;
 
-    fn load<'a>(
-        &'a self,
-        _kind: &'a str,
-        _id: &'a Id,
-    ) -> impl Future<Output = Result<Option<Snapshot<Pos>>, Self::Error>> + Send + 'a {
-        std::future::ready(Ok(None))
+    async fn load<T>(&self, _kind: &str, _id: &Id) -> Result<Option<Snapshot<Pos, T>>, Self::Error>
+    where
+        T: DeserializeOwned,
+    {
+        Ok(None)
     }
 
-    fn offer_snapshot<'a, CE, Create>(
-        &'a self,
-        _kind: &'a str,
-        _id: &'a Id,
+    async fn offer_snapshot<CE, T, Create>(
+        &self,
+        _kind: &str,
+        _id: &Id,
         _events_since_last_snapshot: u64,
         _create_snapshot: Create,
-    ) -> impl Future<Output = Result<SnapshotOffer, OfferSnapshotError<Self::Error, CE>>> + Send + 'a
+    ) -> Result<SnapshotOffer, OfferSnapshotError<Self::Error, CE>>
     where
         CE: std::error::Error + Send + Sync + 'static,
-        Create: FnOnce() -> Result<Snapshot<Pos>, CE> + 'a,
+        T: Serialize,
+        Create: FnOnce() -> Result<Snapshot<Pos, T>, CE>,
     {
-        std::future::ready(Ok(SnapshotOffer::Declined))
+        Ok(SnapshotOffer::Declined)
     }
 }
 
-/// Snapshot creation policy.
-///
-/// # Choosing a Policy
-///
-/// The right policy depends on your aggregate's characteristics:
-///
-/// | Policy | Best For | Trade-off |
-/// |--------|----------|-----------|
-/// | `Always` | Expensive replay, low write volume | Storage cost per command |
-/// | `EveryNEvents(n)` | Most use cases | Balanced storage vs replay |
-/// | `Never` | Read replicas, external snapshot management | Full replay every load |
-///
-/// ## `Always`
-///
-/// Creates a snapshot after every command. Best for aggregates where:
-/// - Event replay is computationally expensive
-/// - Aggregates have many events (100+)
-/// - Read latency is more important than write overhead
-/// - Write volume is relatively low
-///
-/// ## `EveryNEvents(n)`
-///
-/// Creates a snapshot every N events. Recommended for most use cases.
-/// - Start with `n = 50-100` and tune based on profiling
-/// - Balances storage cost against replay time
-/// - Works well for aggregates with moderate event counts
-///
-/// ## `Never`
-///
-/// Never creates snapshots. Use when:
-/// - Running a read replica that consumes snapshots created elsewhere
-/// - Aggregates are short-lived (few events per instance)
-/// - Managing snapshots through an external process
-/// - Testing without snapshot overhead
-#[derive(Clone, Debug)]
-enum SnapshotPolicy {
-    /// Create a snapshot after every command.
-    Always,
-    /// Create a snapshot every N events.
-    EveryNEvents(u64),
-    /// Never create snapshots (load-only mode).
-    Never,
-}
+#[cfg(test)]
+mod tests {
+    use std::{error::Error, io};
 
-impl SnapshotPolicy {
-    const fn should_snapshot(&self, events_since: u64) -> bool {
-        match self {
-            Self::Always => true,
-            Self::EveryNEvents(threshold) => events_since >= *threshold,
-            Self::Never => false,
-        }
-    }
-}
+    use super::*;
 
-/// In-memory snapshot store with configurable policy.
-///
-/// This is a reference implementation suitable for testing and development.
-/// Production systems should implement [`SnapshotStore`] with durable storage.
-///
-/// Keys are derived from `(kind, id)` via `serde_json`, so `Id: Serialize` is
-/// required for this store.
-///
-/// Generic over `Pos` to match the `EventStore` position type.
-///
-/// # Example
-///
-/// ```ignore
-/// use sourcery::{Repository, InMemoryEventStore, InMemorySnapshotStore, JsonCodec};
-///
-/// let repo = Repository::new(InMemoryEventStore::new(JsonCodec))
-///     .with_snapshots(InMemorySnapshotStore::every(100));
-/// ```
-#[derive(Clone, Debug)]
-pub struct InMemorySnapshotStore<Pos> {
-    snapshots: Arc<RwLock<HashMap<SnapshotKey, Snapshot<Pos>>>>,
-    policy: SnapshotPolicy,
-}
-
-impl<Pos> InMemorySnapshotStore<Pos> {
-    /// Create a snapshot store that saves after every command.
-    ///
-    /// Best for aggregates with expensive replay or many events.
-    /// See the policy guidelines above for choosing an appropriate cadence.
-    #[must_use]
-    pub fn always() -> Self {
-        Self {
-            snapshots: Arc::new(RwLock::new(HashMap::new())),
-            policy: SnapshotPolicy::Always,
-        }
+    #[tokio::test]
+    async fn no_snapshots_load_returns_none() {
+        let store = NoSnapshots::<u64>::new();
+        let result: Option<Snapshot<u64, String>> = store.load("test", &"id").await.unwrap();
+        assert!(result.is_none());
     }
 
-    /// Create a snapshot store that saves every N events.
-    ///
-    /// Recommended for most use cases. Start with `n = 50-100` and tune
-    /// based on your aggregate's replay cost.
-    /// See the policy guidelines above for choosing a policy.
-    #[must_use]
-    pub fn every(n: u64) -> Self {
-        Self {
-            snapshots: Arc::new(RwLock::new(HashMap::new())),
-            policy: SnapshotPolicy::EveryNEvents(n),
-        }
+    #[tokio::test]
+    async fn no_snapshots_offer_declines() {
+        let store = NoSnapshots::<u64>::new();
+        let result = store
+            .offer_snapshot::<io::Error, _, _>("test", &"id", 100, || {
+                Ok(Snapshot {
+                    position: 1,
+                    data: "data",
+                })
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result, SnapshotOffer::Declined);
     }
 
-    /// Create a snapshot store that never saves (load-only).
-    ///
-    /// Use for read replicas, short-lived aggregates, or when managing
-    /// snapshots externally. See the policy guidelines above for when this
-    /// fits.
-    #[must_use]
-    pub fn never() -> Self {
-        Self {
-            snapshots: Arc::new(RwLock::new(HashMap::new())),
-            policy: SnapshotPolicy::Never,
-        }
-    }
-}
-
-impl<Pos> Default for InMemorySnapshotStore<Pos> {
-    fn default() -> Self {
-        Self::always()
-    }
-}
-
-impl<Id, Pos> SnapshotStore<Id> for InMemorySnapshotStore<Pos>
-where
-    Id: Serialize + Send + Sync + 'static,
-    Pos: Clone + Ord + Send + Sync + 'static,
-{
-    type Error = serde_json::Error;
-    type Position = Pos;
-
-    #[tracing::instrument(skip(self, id))]
-    fn load<'a>(
-        &'a self,
-        kind: &'a str,
-        id: &'a Id,
-    ) -> impl Future<Output = Result<Option<Snapshot<Pos>>, Self::Error>> + Send + 'a {
-        async move {
-            let key = SnapshotKey::new(kind, id)?;
-            let snapshot = {
-                let snapshots = self.snapshots.read().expect("snapshot store lock poisoned");
-                snapshots.get(&key).cloned()
-            };
-            tracing::trace!(found = snapshot.is_some(), "snapshot lookup");
-            Ok(snapshot)
-        }
+    #[test]
+    fn offer_error_create_displays_source() {
+        let err: OfferSnapshotError<io::Error, io::Error> =
+            OfferSnapshotError::Create(io::Error::other("create failed"));
+        let msg = err.to_string();
+        assert!(msg.contains("failed to create snapshot"));
+        assert!(err.source().is_some());
     }
 
-    #[tracing::instrument(skip(self, id, create_snapshot))]
-    fn offer_snapshot<'a, CE, Create>(
-        &'a self,
-        kind: &'a str,
-        id: &'a Id,
-        events_since_last_snapshot: u64,
-        create_snapshot: Create,
-    ) -> impl Future<Output = Result<SnapshotOffer, OfferSnapshotError<Self::Error, CE>>> + Send + 'a
-    where
-        CE: std::error::Error + Send + Sync + 'static,
-        Create: FnOnce() -> Result<Snapshot<Pos>, CE> + 'a,
-    {
-        if !self.policy.should_snapshot(events_since_last_snapshot) {
-            return std::future::ready(Ok(SnapshotOffer::Declined));
-        }
-
-        let snapshot = match create_snapshot() {
-            Ok(snapshot) => snapshot,
-            Err(e) => return std::future::ready(Err(OfferSnapshotError::Create(e))),
-        };
-        let key = match SnapshotKey::new(kind, id) {
-            Ok(key) => key,
-            Err(e) => return std::future::ready(Err(OfferSnapshotError::Snapshot(e))),
-        };
-
-        let offer = {
-            let mut snapshots = self
-                .snapshots
-                .write()
-                .expect("snapshot store lock poisoned");
-            match snapshots.get(&key) {
-                Some(existing) if existing.position >= snapshot.position => SnapshotOffer::Declined,
-                _ => {
-                    snapshots.insert(key, snapshot);
-                    SnapshotOffer::Stored
-                }
-            }
-        };
-
-        tracing::debug!(
-            events_since_last_snapshot,
-            ?offer,
-            "snapshot offer evaluated"
-        );
-        std::future::ready(Ok(offer))
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
-struct SnapshotKey {
-    kind: String,
-    type_id: TypeId,
-    id: Vec<u8>,
-}
-
-impl SnapshotKey {
-    fn new<Id>(kind: &str, id: &Id) -> Result<Self, serde_json::Error>
-    where
-        Id: Serialize + 'static,
-    {
-        let id_bytes = serde_json::to_vec(id)?;
-        Ok(Self {
-            kind: kind.to_string(),
-            type_id: TypeId::of::<Id>(),
-            id: id_bytes,
-        })
+    #[test]
+    fn offer_error_snapshot_displays_source() {
+        let err: OfferSnapshotError<io::Error, io::Error> =
+            OfferSnapshotError::Snapshot(io::Error::other("snapshot failed"));
+        let msg = err.to_string();
+        assert!(msg.contains("snapshot operation failed"));
+        assert!(err.source().is_some());
     }
 }

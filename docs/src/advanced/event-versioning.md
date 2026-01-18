@@ -2,29 +2,6 @@
 
 Events are immutable and stored forever. When your domain model evolves, you need strategies to read old events with new code.
 
-## The Challenge
-
-```d2
-direction: right
-
-2024: {
-  V1: |md
-    UserRegistered
-    { email: String }
-  |
-}
-
-2025: {
-  V2: |md
-    UserRegistered
-    { email: String,
-      marketing_consent: bool }
-  |
-}
-
-2024.V1 -> 2025.V2: "How to read?"
-```
-
 Old events lack fields that new code expects.
 
 ## Strategy 1: Serde Defaults
@@ -117,35 +94,6 @@ impl From<UserRegisteredV2> for UserRegistered {
 
 When deserializing, `serde-evolve` tries each ancestor in order and applies the `From` chain.
 
-## Strategy 4: Codec-Level Migration
-
-Handle versioning in a custom codec:
-
-```rust,ignore
-pub struct VersionedJsonCodec;
-
-impl Codec for VersionedJsonCodec {
-    type Error = serde_json::Error;
-
-    fn deserialize<E: DeserializeOwned>(&self, data: &[u8]) -> Result<E, Self::Error> {
-        // Parse as Value first
-        let mut value: serde_json::Value = serde_json::from_slice(data)?;
-
-        // Apply migrations based on type or missing fields
-        if value.get("marketing_consent").is_none() {
-            value["marketing_consent"] = serde_json::Value::Bool(false);
-        }
-
-        // Deserialize to target type
-        serde_json::from_value(value)
-    }
-
-    fn serialize<E: Serialize>(&self, event: &E) -> Result<Vec<u8>, Self::Error> {
-        serde_json::to_vec(event)
-    }
-}
-```
-
 ## Which Strategy to Use?
 
 | Scenario | Recommended Approach |
@@ -154,7 +102,6 @@ impl Codec for VersionedJsonCodec {
 | Adding required field with known default | Serde defaults |
 | Complex migration logic | Explicit versions + From |
 | Multiple version hops | serde-evolve |
-| Schema changes with external validation | Codec-level |
 
 ## Event KIND Stability
 

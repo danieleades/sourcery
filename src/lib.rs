@@ -5,21 +5,26 @@ pub use sourcery_core::test;
 pub use sourcery_core::{
     aggregate,
     aggregate::{Aggregate, Apply, Handle},
-    codec, concurrency,
-    event::DomainEvent,
+    event,
+    event::{DomainEvent, EventDecodeError, EventKind, ProjectionEvent},
     projection,
     projection::{ApplyProjection, Projection},
     repository,
-    repository::Repository,
+    repository::{
+        OptimisticRepository, OptimisticSnapshotRepository, Repository, UncheckedRepository,
+    },
 };
 // Re-export proc macro derives so consumers only depend on `sourcery`.
 pub use sourcery_macros::{Aggregate, Projection};
 
 pub mod store {
 
+    // Re-export low-level commit types for EventStore implementors only.
+    // Most users should interact with the Repository API instead.
+    #[doc(hidden)]
+    pub use sourcery_core::store::{CommitError, Committed, OptimisticCommitError};
     pub use sourcery_core::store::{
-        AppendError, AppendResult, EventFilter, EventStore, GloballyOrderedStore, JsonCodec,
-        NonEmpty, PersistableEvent, StoredEvent, Transaction,
+        EventFilter, EventStore, GloballyOrderedStore, NonEmpty, StoredEvent,
     };
 
     #[cfg(feature = "postgres")]
@@ -34,8 +39,7 @@ pub mod store {
 pub mod snapshot {
 
     pub use sourcery_core::snapshot::{
-        InMemorySnapshotStore, NoSnapshots, OfferSnapshotError, Snapshot, SnapshotOffer,
-        SnapshotStore,
+        NoSnapshots, OfferSnapshotError, Snapshot, SnapshotOffer, SnapshotStore, inmemory,
     };
 
     #[cfg(feature = "postgres")]

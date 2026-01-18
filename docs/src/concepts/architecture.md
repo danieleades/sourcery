@@ -16,11 +16,9 @@ Crate: "sourcery crate" {
   Repository
   EventStore {shape: cylinder}
   SnapshotStore {shape: cylinder}
-  Codec
 
   Repository -> EventStore
   Repository -> SnapshotStore: {style.stroke-dash: 3}
-  EventStore -> Codec
 }
 
 App.Command -> Crate.Repository
@@ -36,21 +34,6 @@ App.Projection Definition -> Crate.Repository
 ## The Envelope Pattern
 
 Events travel with metadata, but domain types stay pure:
-
-```d2
-direction: right
-
-Envelope: "Event Envelope" {
-  Metadata: |md
-    aggregate_id, kind,
-    correlation_id, timestamp
-  |
-  Event: |md
-    Domain Event
-    (pure business data)
-  |
-}
-```
 
 - **Aggregates** receive only the pure event—no IDs or metadata
 - **Projections** receive the full envelope—aggregate ID and metadata included
@@ -77,9 +60,7 @@ Store -> Repo: "Vec<StoredEvent>" {style.stroke-dash: 3}
 Repo -> Agg: "replay events (apply)"
 Repo -> Agg: "handle(command)"
 Agg -> Repo: "Vec<Event>" {style.stroke-dash: 3}
-Repo -> Store: "begin transaction"
-Repo -> Store: "append events"
-Repo -> Store: "commit"
+Repo -> Store: "commit_events()"
 Repo -> Snap: "offer_snapshot()?"
 Repo -> App: "Ok(())" {style.stroke-dash: 3}
 ```
@@ -114,7 +95,6 @@ Projections specify which events they care about. The repository loads only thos
 | `Repository<S, C, Snapshots<SS>>` | Snapshot-enabled repository orchestration |
 | `EventStore` | Trait for event persistence |
 | `SnapshotStore` | Trait for aggregate snapshots |
-| `Codec` | Trait for serialization/deserialization |
 | `Aggregate` | Trait for command-side entities |
 | `Projection` | Trait for read-side views |
 | `DomainEvent` | Marker trait for event structs |

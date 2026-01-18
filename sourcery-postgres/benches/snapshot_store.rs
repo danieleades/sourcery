@@ -62,12 +62,17 @@ fn bench_snapshot_load(c: &mut Criterion) {
     rt.block_on(async {
         for id in &ids {
             store
-                .offer_snapshot::<std::convert::Infallible, _>("bench.aggregate", id, 100, || {
-                    Ok(Snapshot {
-                        position: 1000,
-                        data: vec![0u8; 1024], // 1KB snapshot
-                    })
-                })
+                .offer_snapshot::<std::convert::Infallible, _, _>(
+                    "bench.aggregate",
+                    id,
+                    100,
+                    || {
+                        Ok(Snapshot {
+                            position: 1000,
+                            data: vec![0u8; 1024], // 1KB snapshot
+                        })
+                    },
+                )
                 .await
                 .unwrap();
         }
@@ -81,14 +86,14 @@ fn bench_snapshot_load(c: &mut Criterion) {
         b.iter(|| {
             let id = &ids[idx % ids.len()];
             idx += 1;
-            rt.block_on(async { store.load("bench.aggregate", id).await.unwrap() })
+            rt.block_on(async { store.load::<Vec<u8>>("bench.aggregate", id).await.unwrap() })
         });
     });
 
     group.bench_function("load_nonexistent", |b| {
         b.iter(|| {
             let id = Uuid::new_v4();
-            rt.block_on(async { store.load("bench.aggregate", &id).await.unwrap() })
+            rt.block_on(async { store.load::<Vec<u8>>("bench.aggregate", &id).await.unwrap() })
         });
     });
 
@@ -109,7 +114,7 @@ fn bench_snapshot_offer(c: &mut Criterion) {
             let id = Uuid::new_v4();
             rt.block_on(async {
                 store
-                    .offer_snapshot::<std::convert::Infallible, _>(
+                    .offer_snapshot::<std::convert::Infallible, _, _>(
                         "bench.aggregate",
                         &id,
                         100,
@@ -135,12 +140,17 @@ fn bench_snapshot_offer(c: &mut Criterion) {
         // Create initial snapshot
         rt.block_on(async {
             store
-                .offer_snapshot::<std::convert::Infallible, _>("bench.aggregate", &id, 100, || {
-                    Ok(Snapshot {
-                        position: 0,
-                        data: vec![0u8; 1024],
-                    })
-                })
+                .offer_snapshot::<std::convert::Infallible, _, _>(
+                    "bench.aggregate",
+                    &id,
+                    100,
+                    || {
+                        Ok(Snapshot {
+                            position: 0,
+                            data: vec![0u8; 1024],
+                        })
+                    },
+                )
                 .await
                 .unwrap()
         });
@@ -150,7 +160,7 @@ fn bench_snapshot_offer(c: &mut Criterion) {
             let pos = position;
             rt.block_on(async {
                 store
-                    .offer_snapshot::<std::convert::Infallible, _>(
+                    .offer_snapshot::<std::convert::Infallible, _, _>(
                         "bench.aggregate",
                         &id,
                         100,
@@ -175,7 +185,7 @@ fn bench_snapshot_offer(c: &mut Criterion) {
         b.iter(|| {
             rt.block_on(async {
                 store
-                    .offer_snapshot::<std::convert::Infallible, _>(
+                    .offer_snapshot::<std::convert::Infallible, _, _>(
                         "bench.aggregate",
                         &id,
                         100,
@@ -210,7 +220,7 @@ fn bench_snapshot_sizes(c: &mut Criterion) {
                 let id = Uuid::new_v4();
                 rt.block_on(async {
                     store
-                        .offer_snapshot::<std::convert::Infallible, _>(
+                        .offer_snapshot::<std::convert::Infallible, _, _>(
                             "bench.aggregate",
                             &id,
                             100,
@@ -231,18 +241,25 @@ fn bench_snapshot_sizes(c: &mut Criterion) {
         let id = Uuid::new_v4();
         rt.block_on(async {
             store
-                .offer_snapshot::<std::convert::Infallible, _>("bench.aggregate", &id, 100, || {
-                    Ok(Snapshot {
-                        position: 1000,
-                        data: vec![0u8; size],
-                    })
-                })
+                .offer_snapshot::<std::convert::Infallible, _, _>(
+                    "bench.aggregate",
+                    &id,
+                    100,
+                    || {
+                        Ok(Snapshot {
+                            position: 1000,
+                            data: vec![0u8; size],
+                        })
+                    },
+                )
                 .await
                 .unwrap()
         });
 
         group.bench_function(format!("load_{size}b"), |b| {
-            b.iter(|| rt.block_on(async { store.load("bench.aggregate", &id).await.unwrap() }));
+            b.iter(|| {
+                rt.block_on(async { store.load::<Vec<u8>>("bench.aggregate", &id).await.unwrap() })
+            });
         });
     }
 

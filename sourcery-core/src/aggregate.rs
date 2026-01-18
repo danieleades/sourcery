@@ -1,22 +1,8 @@
 //! Command-side domain primitives.
 //!
 //! This module defines the building blocks for aggregates: state reconstruction
-//! (`Apply`), command handling (`Handle`), and loading (`AggregateBuilder`).
-//! The `#[derive(Aggregate)]` macro lives here to keep domain ergonomics in one
-//! spot.
-
-use std::marker::PhantomData;
-
-use serde::{Serialize, de::DeserializeOwned};
-
-use crate::{
-    codec::{Codec, ProjectionEvent},
-    concurrency::ConcurrencyStrategy,
-    projection::ProjectionError,
-    repository::{Repository, Snapshots},
-    snapshot::{NoSnapshots, SnapshotStore},
-    store::EventStore,
-};
+//! (`Apply`) and command handling (`Handle`). The `#[derive(Aggregate)]` macro
+//! lives here to keep domain ergonomics in one spot.
 
 /// Command-side entities that produce domain events.
 ///
@@ -30,7 +16,7 @@ use crate::{
 /// If you enable snapshots (via `Repository::with_snapshots`), the aggregate
 /// state must be serializable (`Serialize + DeserializeOwned`).
 // ANCHOR: aggregate_trait
-pub trait Aggregate: Default + Sized {
+pub trait Aggregate: Default {
     /// Aggregate type identifier used by the event store.
     ///
     /// This is combined with the aggregate ID to create stream identifiers.
@@ -103,71 +89,3 @@ pub trait Handle<C>: Aggregate {
     fn handle(&self, command: &C) -> Result<Vec<Self::Event>, Self::Error>;
 }
 // ANCHOR_END: handle_trait
-
-/// Builder for loading aggregates by ID.
-pub struct AggregateBuilder<'a, R, A> {
-    pub(super) repository: &'a R,
-    pub(super) _phantom: PhantomData<fn() -> A>,
-}
-
-impl<'a, R, A> AggregateBuilder<'a, R, A> {
-    pub(super) const fn new(repository: &'a R) -> Self {
-        Self {
-            repository,
-            _phantom: PhantomData,
-        }
-    }
-}
-
-impl<S, C, A> AggregateBuilder<'_, Repository<S, C, NoSnapshots<S::Position>>, A>
-where
-    S: EventStore,
-    C: ConcurrencyStrategy,
-    A: Aggregate<Id = S::Id>,
-{
-    /// Load the aggregate instance by replaying events (no snapshots).
-    ///
-    /// The event kinds to load are automatically determined from the
-    /// aggregate's event type via `ProjectionEvent::EVENT_KINDS`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the store fails to load events or if events cannot
-    /// be deserialized.
-    pub async fn load(
-        self,
-        id: &S::Id,
-    ) -> Result<A, ProjectionError<S::Error, <S::Codec as Codec>::Error>>
-    where
-        A::Event: ProjectionEvent,
-    {
-        self.repository.load::<A>(id).await
-    }
-}
-
-impl<S, SS, C, A> AggregateBuilder<'_, Repository<S, C, Snapshots<SS>>, A>
-where
-    S: EventStore,
-    SS: SnapshotStore<S::Id, Position = S::Position>,
-    C: ConcurrencyStrategy,
-    A: Aggregate<Id = S::Id> + Serialize + DeserializeOwned,
-{
-    /// Load the aggregate instance using snapshots when available.
-    ///
-    /// The event kinds to load are automatically determined from the
-    /// aggregate's event type via `ProjectionEvent::EVENT_KINDS`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if events cannot be deserialized or a stored snapshot
-    /// cannot be deserialized (which indicates snapshot data corruption).
-    pub async fn load(
-        self,
-        id: &S::Id,
-    ) -> Result<A, ProjectionError<S::Error, <S::Codec as Codec>::Error>>
-    where
-        A::Event: ProjectionEvent,
-    {
-        self.repository.load::<A>(id).await
-    }
-}

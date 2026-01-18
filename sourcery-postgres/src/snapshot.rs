@@ -1,9 +1,12 @@
 //! PostgreSQL-backed snapshot store implementation.
 //!
-//! This module provides [`SnapshotStore`], an implementation of
+//! This module provides [`Store`], an implementation of
 //! [`sourcery_core::snapshot::SnapshotStore`] for `PostgreSQL`.
 
-use sourcery_core::snapshot::{OfferSnapshotError, Snapshot, SnapshotOffer, SnapshotStore};
+use serde::{Serialize, de::DeserializeOwned};
+use sourcery_core::snapshot::{
+    OfferSnapshotError, Snapshot, SnapshotOffer, SnapshotStore, inmemory::SnapshotPolicy,
+};
 use sqlx::{PgPool, Row};
 
 /// Error type for `PostgreSQL` snapshot operations.
@@ -12,60 +15,12 @@ pub enum Error {
     /// Database error during snapshot operations.
     #[error("database error: {0}")]
     Database(#[from] sqlx::Error),
-}
-
-/// Snapshot creation policy.
-///
-/// # Choosing a Policy
-///
-/// The right policy depends on your aggregate's characteristics:
-///
-/// | Policy | Best For | Trade-off |
-/// |--------|----------|-----------|
-/// | `Always` | Expensive replay, low write volume | Storage cost per command |
-/// | `EveryNEvents(n)` | Most use cases | Balanced storage vs replay |
-/// | `Never` | Read replicas, external snapshot management | Full replay every load |
-///
-/// ## `Always`
-///
-/// Creates a snapshot after every command. Best for aggregates where:
-/// - Event replay is computationally expensive
-/// - Aggregates have many events (100+)
-/// - Read latency is more important than write overhead
-/// - Write volume is relatively low
-///
-/// ## `EveryNEvents(n)`
-///
-/// Creates a snapshot every N events. Recommended for most use cases.
-/// - Start with `n = 50-100` and tune based on profiling
-/// - Balances storage cost against replay time
-/// - Works well for aggregates with moderate event counts
-///
-/// ## `Never`
-///
-/// Never creates snapshots. Use when:
-/// - Running a read replica that consumes snapshots created elsewhere
-/// - Aggregates are short-lived (few events per instance)
-/// - Managing snapshots through an external process
-/// - Testing without snapshot overhead
-#[derive(Clone, Debug)]
-enum SnapshotPolicy {
-    /// Create a snapshot after every command.
-    Always,
-    /// Create a snapshot every N events.
-    EveryNEvents(u64),
-    /// Never create snapshots (load-only mode).
-    Never,
-}
-
-impl SnapshotPolicy {
-    const fn should_snapshot(&self, events_since: u64) -> bool {
-        match self {
-            Self::Always => true,
-            Self::EveryNEvents(threshold) => events_since >= *threshold,
-            Self::Never => false,
-        }
-    }
+    /// Serialization error.
+    #[error("serialization error: {0}")]
+    Serialization(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
+    /// Deserialization error.
+    #[error("deserialization error: {0}")]
+    Deserialization(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
 }
 
 /// A PostgreSQL-backed snapshot store with configurable policy.
@@ -84,7 +39,7 @@ impl SnapshotPolicy {
 ///     aggregate_kind TEXT NOT NULL,
 ///     aggregate_id   UUID NOT NULL,
 ///     position       BIGINT NOT NULL,
-///     data           BYTEA NOT NULL,
+///     data           JSONB NOT NULL,
 ///     created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
 ///     PRIMARY KEY (aggregate_kind, aggregate_id)
 /// )
@@ -93,11 +48,12 @@ impl SnapshotPolicy {
 /// # Example
 ///
 /// ```ignore
-/// use sourcery_postgres::{Store, SnapshotStore};
+/// use sourcery_postgres::{Store as EventStore};
+/// use sourcery_postgres::snapshot::Store as SnapshotStore;
 /// use sourcery_core::Repository;
 ///
 /// let pool = PgPool::connect("postgres://...").await?;
-/// let event_store = Store::new(pool.clone(), JsonCodec);
+/// let event_store = EventStore::new(pool.clone());
 /// let snapshot_store = SnapshotStore::every(pool, 100);
 ///
 /// // Run migrations
@@ -174,7 +130,7 @@ impl Store {
                 aggregate_kind TEXT NOT NULL,
                 aggregate_id   UUID NOT NULL,
                 position       BIGINT NOT NULL,
-                data           BYTEA NOT NULL,
+                data           JSONB NOT NULL,
                 created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
                 PRIMARY KEY (aggregate_kind, aggregate_id)
             )
@@ -192,11 +148,14 @@ impl SnapshotStore<uuid::Uuid> for Store {
     type Position = i64;
 
     #[tracing::instrument(skip(self))]
-    async fn load<'a>(
-        &'a self,
-        kind: &'a str,
-        id: &'a uuid::Uuid,
-    ) -> Result<Option<Snapshot<Self::Position>>, Self::Error> {
+    async fn load<T>(
+        &self,
+        kind: &str,
+        id: &uuid::Uuid,
+    ) -> Result<Option<Snapshot<Self::Position, T>>, Self::Error>
+    where
+        T: DeserializeOwned,
+    {
         let result = sqlx::query(
             r"
             SELECT position, data
@@ -209,81 +168,85 @@ impl SnapshotStore<uuid::Uuid> for Store {
         .fetch_optional(&self.pool)
         .await?;
 
-        let snapshot = result.map(|row| {
-            let position: i64 = row.get("position");
-            let data: Vec<u8> = row.get("data");
-            Snapshot { position, data }
-        });
+        let snapshot = result
+            .map(|row| {
+                let position: i64 = row.get("position");
+                let data: sqlx::types::Json<serde_json::Value> = row.get("data");
+                serde_json::from_value::<T>(data.0)
+                    .map(|decoded| Snapshot {
+                        position,
+                        data: decoded,
+                    })
+                    .map_err(|e| Error::Deserialization(Box::new(e)))
+            })
+            .transpose()?;
 
         tracing::trace!(found = snapshot.is_some(), "snapshot lookup");
         Ok(snapshot)
     }
 
     #[tracing::instrument(skip(self, create_snapshot))]
-    fn offer_snapshot<'a, CE, Create>(
-        &'a self,
-        kind: &'a str,
-        id: &'a uuid::Uuid,
+    async fn offer_snapshot<CE, T, Create>(
+        &self,
+        kind: &str,
+        id: &uuid::Uuid,
         events_since_last_snapshot: u64,
         create_snapshot: Create,
-    ) -> impl std::future::Future<
-        Output = Result<SnapshotOffer, OfferSnapshotError<Self::Error, CE>>,
-    > + Send
-    + 'a
+    ) -> Result<SnapshotOffer, OfferSnapshotError<Self::Error, CE>>
     where
         CE: std::error::Error + Send + Sync + 'static,
-        Create: FnOnce() -> Result<Snapshot<Self::Position>, CE> + 'a,
+        T: Serialize,
+        Create: FnOnce() -> Result<Snapshot<Self::Position, T>, CE>,
     {
-        // Evaluate policy and create snapshot synchronously before entering async block
-        // This avoids capturing the non-Send Create closure across await points
-        let snapshot_result = if self.policy.should_snapshot(events_since_last_snapshot) {
-            Some(create_snapshot())
+        let prepared = if self.policy.should_snapshot(events_since_last_snapshot) {
+            match create_snapshot() {
+                Ok(snapshot) => serde_json::to_value(&snapshot.data)
+                    .map(|data| Some((snapshot.position, data)))
+                    .map_err(|e| OfferSnapshotError::Snapshot(Error::Serialization(Box::new(e)))),
+                Err(e) => Err(OfferSnapshotError::Create(e)),
+            }
         } else {
-            None
+            Ok(None)
+        }?;
+
+        let Some((position, data)) = prepared else {
+            return Ok(SnapshotOffer::Declined);
         };
 
-        async move {
-            let snapshot = match snapshot_result {
-                None => return Ok(SnapshotOffer::Declined),
-                Some(Ok(snapshot)) => snapshot,
-                Some(Err(e)) => return Err(OfferSnapshotError::Create(e)),
-            };
+        // Use ON CONFLICT to upsert, but only if the new position is greater
+        // than the existing one. This prevents race conditions where an older
+        // snapshot could overwrite a newer one.
+        let result = sqlx::query(
+            r"
+            INSERT INTO es_snapshots (aggregate_kind, aggregate_id, position, data)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (aggregate_kind, aggregate_id)
+            DO UPDATE SET position = EXCLUDED.position, data = EXCLUDED.data, created_at = now()
+            WHERE es_snapshots.position < EXCLUDED.position
+            ",
+        )
+        .bind(kind)
+        .bind(id)
+        .bind(position)
+        .bind(sqlx::types::Json(data))
+        .execute(&self.pool)
+        .await
+        .map_err(|e| OfferSnapshotError::Snapshot(Error::Database(e)))?;
 
-            // Use ON CONFLICT to upsert, but only if the new position is greater
-            // than the existing one. This prevents race conditions where an older
-            // snapshot could overwrite a newer one.
-            let result = sqlx::query(
-                r"
-                INSERT INTO es_snapshots (aggregate_kind, aggregate_id, position, data)
-                VALUES ($1, $2, $3, $4)
-                ON CONFLICT (aggregate_kind, aggregate_id)
-                DO UPDATE SET position = EXCLUDED.position, data = EXCLUDED.data, created_at = now()
-                WHERE es_snapshots.position < EXCLUDED.position
-                ",
-            )
-            .bind(kind)
-            .bind(id)
-            .bind(snapshot.position)
-            .bind(&snapshot.data)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| OfferSnapshotError::Snapshot(Error::Database(e)))?;
+        // rows_affected() will be 1 if inserted or updated, 0 if the existing
+        // snapshot has a >= position (declined due to staleness)
+        let offer = if result.rows_affected() > 0 {
+            SnapshotOffer::Stored
+        } else {
+            SnapshotOffer::Declined
+        };
 
-            // rows_affected() will be 1 if inserted or updated, 0 if the existing
-            // snapshot has a >= position (declined due to staleness)
-            let offer = if result.rows_affected() > 0 {
-                SnapshotOffer::Stored
-            } else {
-                SnapshotOffer::Declined
-            };
-
-            tracing::debug!(
-                events_since_last_snapshot,
-                ?offer,
-                "snapshot offer evaluated"
-            );
-            Ok(offer)
-        }
+        tracing::debug!(
+            events_since_last_snapshot,
+            ?offer,
+            "snapshot offer evaluated"
+        );
+        Ok(offer)
     }
 }
 

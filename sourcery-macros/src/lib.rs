@@ -79,6 +79,8 @@ struct AggregateArgs {
     kind: Option<String>,
     #[darling(default)]
     event_enum: Option<String>,
+    #[darling(default)]
+    derives: Option<PathList>,
 }
 
 /// Configuration for the `#[projection(...)]` attribute.
@@ -127,8 +129,8 @@ where
 ///
 /// This macro generates:
 /// - An event enum containing all aggregate event types
+/// - `EventKind` trait implementation for runtime kind dispatch
 /// - `ProjectionEvent` trait implementation for event deserialization
-/// - `SerializableEvent` trait implementation for event serialization
 /// - `From<E>` implementations for each event type
 /// - `Aggregate` trait implementation that dispatches to `Apply<E>` for events
 ///
@@ -148,12 +150,20 @@ where
 ///   name)
 /// - `event_enum = "Name"` - Override generated event enum name (default:
 ///   `{Struct}Event`)
+/// - `derives(Trait1, Trait2, ...)` - Additional derives for the generated
+///   event enum. Always includes `Clone` and `serde::Serialize`. Common
+///   additions: `Debug`, `PartialEq`, `Eq`
 ///
 /// # Example
 ///
 /// ```ignore
 /// #[derive(Aggregate)]
-/// #[aggregate(id = String, error = String, events(FundsDeposited, FundsWithdrawn))]
+/// #[aggregate(
+///     id = String,
+///     error = String,
+///     events(FundsDeposited, FundsWithdrawn),
+///     derives(Debug, PartialEq, Eq)
+/// )]
 /// pub struct Account {
 ///     balance: i64,
 /// }
@@ -196,42 +206,55 @@ fn generate_aggregate_impl(args: AggregateArgs, input: &DeriveInput) -> TokenStr
     let event_types: Vec<&Path> = event_specs.iter().map(|spec| spec.path).collect();
     let variant_names: Vec<&Ident> = event_specs.iter().map(|spec| &spec.variant).collect();
 
+    // Build derives list - always include Clone, add user-specified traits
+    let derives = if let Some(user_derives) = &args.derives {
+        let user_paths: Vec<&Path> = user_derives.iter().collect();
+        quote! { #[derive(Clone, #(#user_paths),*)] }
+    } else {
+        quote! { #[derive(Clone)] }
+    };
+
     let expanded = quote! {
-        #[derive(Clone, ::serde::Serialize, ::serde::Deserialize)]
+        #derives
         #struct_vis enum #event_enum_name {
             #(#variant_names(#event_types)),*
         }
 
-        impl ::sourcery::codec::ProjectionEvent for #event_enum_name {
-            const EVENT_KINDS: &'static [&'static str] = &[#(#event_types::KIND),*];
-
-            fn from_stored<C: ::sourcery::codec::Codec>(
-                kind: &str,
-                data: &[u8],
-                codec: &C,
-            ) -> Result<Self, ::sourcery::codec::EventDecodeError<C::Error>> {
-                match kind {
-                    #(#event_types::KIND => Ok(Self::#variant_names(
-                        codec.deserialize(data).map_err(::sourcery::codec::EventDecodeError::Codec)?
-                    )),)*
-                    _ => Err(::sourcery::codec::EventDecodeError::UnknownKind {
-                        kind: kind.to_string(),
-                        expected: Self::EVENT_KINDS,
-                    }),
+        impl ::sourcery::event::EventKind for #event_enum_name {
+            fn kind(&self) -> &'static str {
+                match self {
+                    #(Self::#variant_names(_) => #event_types::KIND),*
                 }
             }
         }
 
-        impl ::sourcery::codec::SerializableEvent for #event_enum_name {
-            fn to_persistable<C: ::sourcery::codec::Codec, M>(
-                self,
-                codec: &C,
-                metadata: M,
-            ) -> Result<::sourcery::store::PersistableEvent<M>, C::Error> {
-                let (kind, data) = match self {
-                    #(Self::#variant_names(event) => (#event_types::KIND.to_string(), codec.serialize(&event)?)),*
-                };
-                Ok(::sourcery::store::PersistableEvent { kind, data, metadata })
+        impl ::serde::Serialize for #event_enum_name {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: ::serde::Serializer,
+            {
+                match self {
+                    #(Self::#variant_names(inner) => ::serde::Serialize::serialize(inner, serializer)),*
+                }
+            }
+        }
+
+        impl ::sourcery::ProjectionEvent for #event_enum_name {
+            const EVENT_KINDS: &'static [&'static str] = &[#(#event_types::KIND),*];
+
+            fn from_stored<S: ::sourcery::store::EventStore>(
+                stored: &::sourcery::store::StoredEvent<S::Id, S::Position, S::Data, S::Metadata>,
+                store: &S,
+            ) -> Result<Self, ::sourcery::event::EventDecodeError<S::Error>> {
+                match stored.kind() {
+                    #(#event_types::KIND => Ok(Self::#variant_names(
+                        store.decode_event(stored).map_err(::sourcery::event::EventDecodeError::Store)?
+                    )),)*
+                    _ => Err(::sourcery::event::EventDecodeError::UnknownKind {
+                        kind: stored.kind().to_string(),
+                        expected: Self::EVENT_KINDS,
+                    }),
+                }
             }
         }
 

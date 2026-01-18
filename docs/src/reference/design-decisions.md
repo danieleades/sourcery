@@ -62,32 +62,55 @@ trait CommandBus {
 }
 ```
 
-## Versioning at the Codec Layer
+## Event Serialization in Stores
 
-**Decision**: No explicit "upcaster" concept. Event migration happens in the codec or via serde.
+**Decision**: EventStore implementations handle serialization, not a separate Codec trait. The generated event enum provides a method to access the inner event for serialization.
 
 **Why**:
-- Simpler mental model—one place for serialization concerns
-- Works with any serde-compatible migration library
-- Codec can optimize (e.g., cache parsed schemas)
-- Avoids framework lock-in for versioning strategy
+- Eliminates unnecessary abstraction layer (Codec trait)
+- Store can choose optimal format (JSON, JSONB, MessagePack, etc.)
+- Simpler architecture with fewer generic parameters
+- Event enum variants are never serialized as tagged enums - only the inner event is serialized
 
-**How**:
+**How it works**:
 ```rust,ignore
-// Option 1: serde defaults
-#[serde(default)]
-pub marketing_consent: bool,
+// The Aggregate macro generates an event enum with a helper method
+#[derive(Aggregate)]
+#[aggregate(id = String)]
+struct Account { /* ... */ }
 
-// Option 2: serde-evolve
-#[derive(Evolve)]
-#[evolve(ancestors(V1, V2))]
-pub struct Event { /* ... */ }
+// Generated code (simplified):
+enum AccountEvent {
+    Deposited(FundsDeposited),
+    Withdrawn(FundsWithdrawn),
+}
 
-// Option 3: Codec-level
-impl Codec for VersionedCodec {
-    fn deserialize(&self, data: &[u8]) -> Result<E> {
-        // Parse, migrate, return current version
+// Generated helper trait for type-erased serialization
+trait SerializableEvent {
+    fn serialize_event(&self) -> Result<serde_json::Value, serde_json::Error>;
+}
+
+impl SerializableEvent for AccountEvent {
+    fn serialize_event(&self) -> Result<serde_json::Value, serde_json::Error> {
+        match self {
+            Self::Deposited(e) => serde_json::to_value(e),
+            Self::Withdrawn(e) => serde_json::to_value(e),
+        }
     }
+}
+
+// EventStore uses kind() and serialize_event() together
+// - kind() tells which event type it is ("funds-deposited")
+// - serialize_event() serializes just the inner event data
+```
+
+**Event versioning**: Use serde attributes on the event structs themselves:
+```rust,ignore
+#[derive(serde::Serialize, serde::Deserialize)]
+struct FundsDeposited {
+    amount: i64,
+    #[serde(default)]  // Field added in v2
+    currency: String,
 }
 ```
 
