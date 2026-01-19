@@ -4,7 +4,7 @@
 #[cfg(feature = "test-util")]
 mod with_test_util {
     use serde::{Deserialize, Serialize};
-    use sourcery::{Aggregate, Apply, DomainEvent, Handle, test::TestExecutor};
+    use sourcery::{Aggregate, Apply, DomainEvent, Handle, test::TestFramework};
 
     // ============================================================================
     // Test Domain: Bank Account
@@ -138,7 +138,7 @@ mod with_test_util {
 
     #[test]
     fn open_account_produces_event() {
-        TestExecutor::<BankAccount>::given(&[])
+        TestFramework::<BankAccount>::given(&[])
             .when(&OpenAccount {
                 initial_balance: 100,
             })
@@ -150,7 +150,7 @@ mod with_test_util {
 
     #[test]
     fn cannot_open_already_open_account() {
-        TestExecutor::<BankAccount>::given(&[AccountOpened { initial_balance: 0 }.into()])
+        TestFramework::<BankAccount>::given(&[AccountOpened { initial_balance: 0 }.into()])
             .when(&OpenAccount {
                 initial_balance: 100,
             })
@@ -159,7 +159,7 @@ mod with_test_util {
 
     #[test]
     fn deposit_increases_balance() {
-        TestExecutor::<BankAccount>::given(&[AccountOpened {
+        TestFramework::<BankAccount>::given(&[AccountOpened {
             initial_balance: 100,
         }
         .into()])
@@ -169,14 +169,14 @@ mod with_test_util {
 
     #[test]
     fn cannot_deposit_to_closed_account() {
-        TestExecutor::<BankAccount>::given(&[])
+        TestFramework::<BankAccount>::given(&[])
             .when(&Deposit { amount: 50 })
             .then_expect_error_message("not open");
     }
 
     #[test]
     fn withdraw_decreases_balance() {
-        TestExecutor::<BankAccount>::given(&[AccountOpened {
+        TestFramework::<BankAccount>::given(&[AccountOpened {
             initial_balance: 100,
         }
         .into()])
@@ -186,7 +186,7 @@ mod with_test_util {
 
     #[test]
     fn cannot_withdraw_more_than_balance() {
-        TestExecutor::<BankAccount>::given(&[AccountOpened {
+        TestFramework::<BankAccount>::given(&[AccountOpened {
             initial_balance: 100,
         }
         .into()])
@@ -196,7 +196,7 @@ mod with_test_util {
 
     #[test]
     fn cannot_withdraw_from_closed_account() {
-        TestExecutor::<BankAccount>::given(&[])
+        TestFramework::<BankAccount>::given(&[])
             .when(&Withdraw { amount: 50 })
             .then_expect_error_message("not open");
     }
@@ -204,7 +204,7 @@ mod with_test_util {
     #[test]
     fn state_is_rebuilt_from_event_history() {
         // Verify that given() properly rebuilds state from events
-        TestExecutor::<BankAccount>::given(&[
+        TestFramework::<BankAccount>::given(&[
             AccountOpened {
                 initial_balance: 100,
             }.into(),
@@ -219,7 +219,7 @@ mod with_test_util {
 
     #[test]
     fn and_allows_building_complex_state() {
-        TestExecutor::<BankAccount>::given(&[AccountOpened {
+        TestFramework::<BankAccount>::given(&[AccountOpened {
             initial_balance: 100,
         }.into()])
         .and(vec![MoneyDeposited {
@@ -235,7 +235,7 @@ mod with_test_util {
 
     #[test]
     fn inspect_result_allows_custom_assertions() {
-        let result = TestExecutor::<BankAccount>::given(&[AccountOpened {
+        let result = TestFramework::<BankAccount>::given(&[AccountOpened {
             initial_balance: 100,
         }
         .into()])

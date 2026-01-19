@@ -42,3 +42,4 @@
 # Reference
 
 - [Design Decisions](reference/design-decisions.md)
+- [How Sourcery Compares](reference/comparison.md)
