@@ -254,11 +254,11 @@ impl<T> RepositoryTestExt for T where T: StoreAccess + Send {}
 /// # Type Parameters
 ///
 /// * `A` - The aggregate type being tested
-pub struct TestExecutor<A: Aggregate> {
+pub struct TestFramework<A: Aggregate> {
     aggregate: A,
 }
 
-impl<A: Aggregate> TestExecutor<A> {
+impl<A: Aggregate> TestFramework<A> {
     /// Start a test scenario with previous events already applied.
     ///
     /// The events are applied in order to rebuild the aggregate state
@@ -275,7 +275,7 @@ impl<A: Aggregate> TestExecutor<A> {
     }
 }
 
-impl<A: Aggregate> TestExecutor<A> {
+impl<A: Aggregate> TestFramework<A> {
     /// Execute a command against the aggregate.
     ///
     /// Returns a `TestResult` that can be used to verify the outcome.
@@ -512,7 +512,7 @@ mod tests {
         }
     }
 
-    type CounterTest = TestExecutor<Counter>;
+    type CounterTest = TestFramework<Counter>;
 
     #[test]
     fn given_no_events_when_add_then_produces_event() {
