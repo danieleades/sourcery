@@ -8,7 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 use sourcery::{
-    Apply, DomainEvent, Handle, Repository, repository::OptimisticCommandError, store::inmemory,
+    Apply, DomainEvent, Handle, Repository, repository::CommandError, store::inmemory,
     test::RepositoryTestExt,
 };
 
@@ -242,7 +242,7 @@ async fn part4_business_rules(repo: &OptimisticRepo, item_id: &String) {
     );
 
     match result.await {
-        Err(OptimisticCommandError::Aggregate(InventoryError::InsufficientStock {
+        Err(CommandError::Aggregate(InventoryError::InsufficientStock {
             requested,
             available,
         })) => {
