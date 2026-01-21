@@ -10,7 +10,7 @@ use std::{
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sourcery::{
     Aggregate, Apply, DomainEvent, Handle, Repository,
-    repository::OptimisticCommandError,
+    repository::CommandError,
     snapshot::{
         OfferSnapshotError, Snapshot, SnapshotOffer, SnapshotStore,
         inmemory::Store as InMemorySnapshotStore,
@@ -319,7 +319,7 @@ async fn retry_surfaces_non_concurrency_errors() {
         .await
         .unwrap_err();
 
-    assert!(matches!(err, OptimisticCommandError::Aggregate(_)));
+    assert!(matches!(err, CommandError::Aggregate(_)));
 }
 
 #[tokio::test]

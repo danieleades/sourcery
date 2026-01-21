@@ -28,7 +28,7 @@
 //! See the [quickstart example](https://github.com/danieleades/sourcery/blob/main/examples/quickstart.rs)
 //! for a complete working example.
 
-use std::marker::PhantomData;
+use std::{convert::Infallible, marker::PhantomData};
 
 use nonempty::NonEmpty;
 use serde::{Serialize, de::DeserializeOwned};
@@ -45,67 +45,18 @@ use crate::{
 
 type LoadError<S> = ProjectionError<<S as EventStore>::Error>;
 
-/// Error type for unchecked command execution (no concurrency variant).
+/// Error type for command execution across all repository modes.
 #[derive(Debug, Error)]
-pub enum CommandError<AggregateError, StoreError>
+pub enum CommandError<AggregateError, ConcurrencyError, StoreError, SnapshotError>
 where
-    StoreError: std::error::Error + 'static,
-{
-    #[error("aggregate rejected command: {0}")]
-    Aggregate(AggregateError),
-    #[error("failed to rebuild aggregate state: {0}")]
-    Projection(#[source] ProjectionError<StoreError>),
-    #[error("failed to persist events: {0}")]
-    Store(#[source] StoreError),
-}
-
-/// Error type for snapshot-enabled unchecked command execution.
-#[derive(Debug, Error)]
-pub enum SnapshotCommandError<AggregateError, StoreError, SnapshotError>
-where
-    StoreError: std::error::Error + 'static,
-    SnapshotError: std::error::Error + 'static,
-{
-    #[error("aggregate rejected command: {0}")]
-    Aggregate(AggregateError),
-    #[error("failed to rebuild aggregate state: {0}")]
-    Projection(#[source] ProjectionError<StoreError>),
-    #[error("failed to persist events: {0}")]
-    Store(#[source] StoreError),
-    #[error("snapshot operation failed: {0}")]
-    Snapshot(#[source] SnapshotError),
-}
-
-/// Error type for optimistic command execution (includes concurrency).
-#[derive(Debug, Error)]
-pub enum OptimisticCommandError<AggregateError, Position, StoreError>
-where
-    Position: std::fmt::Debug,
-    StoreError: std::error::Error + 'static,
-{
-    #[error("aggregate rejected command: {0}")]
-    Aggregate(AggregateError),
-    #[error(transparent)]
-    Concurrency(ConcurrencyConflict<Position>),
-    #[error("failed to rebuild aggregate state: {0}")]
-    Projection(#[source] ProjectionError<StoreError>),
-    #[error("failed to persist events: {0}")]
-    Store(#[source] StoreError),
-}
-
-/// Error type for snapshot-enabled optimistic command execution (includes
-/// concurrency).
-#[derive(Debug, Error)]
-pub enum OptimisticSnapshotCommandError<AggregateError, Position, StoreError, SnapshotError>
-where
-    Position: std::fmt::Debug,
+    ConcurrencyError: std::error::Error + 'static,
     StoreError: std::error::Error + 'static,
     SnapshotError: std::error::Error + 'static,
 {
     #[error("aggregate rejected command: {0}")]
     Aggregate(AggregateError),
     #[error(transparent)]
-    Concurrency(ConcurrencyConflict<Position>),
+    Concurrency(ConcurrencyError),
     #[error("failed to rebuild aggregate state: {0}")]
     Projection(#[source] ProjectionError<StoreError>),
     #[error("failed to persist events: {0}")]
@@ -115,14 +66,17 @@ where
 }
 
 /// Result type alias for unchecked command execution.
-pub type UncheckedCommandResult<A, S> =
-    Result<(), CommandError<<A as Aggregate>::Error, <S as EventStore>::Error>>;
+pub type UncheckedCommandResult<A, S> = Result<
+    (),
+    CommandError<<A as Aggregate>::Error, Infallible, <S as EventStore>::Error, Infallible>,
+>;
 
 /// Result type alias for snapshot-enabled unchecked command execution.
 pub type UncheckedSnapshotCommandResult<A, S, SS> = Result<
     (),
-    SnapshotCommandError<
+    CommandError<
         <A as Aggregate>::Error,
+        Infallible,
         <S as EventStore>::Error,
         <SS as SnapshotStore<<S as EventStore>::Id>>::Error,
     >,
@@ -131,19 +85,20 @@ pub type UncheckedSnapshotCommandResult<A, S, SS> = Result<
 /// Result type alias for optimistic command execution.
 pub type OptimisticCommandResult<A, S> = Result<
     (),
-    OptimisticCommandError<
+    CommandError<
         <A as Aggregate>::Error,
-        <S as EventStore>::Position,
+        ConcurrencyConflict<<S as EventStore>::Position>,
         <S as EventStore>::Error,
+        Infallible,
     >,
 >;
 
 /// Result type alias for snapshot-enabled optimistic command execution.
 pub type OptimisticSnapshotCommandResult<A, S, SS> = Result<
     (),
-    OptimisticSnapshotCommandError<
+    CommandError<
         <A as Aggregate>::Error,
-        <S as EventStore>::Position,
+        ConcurrencyConflict<<S as EventStore>::Position>,
         <S as EventStore>::Error,
         <SS as SnapshotStore<<S as EventStore>::Id>>::Error,
     >,
@@ -152,23 +107,72 @@ pub type OptimisticSnapshotCommandResult<A, S, SS> = Result<
 /// Result type alias for retry operations (optimistic, no snapshots).
 pub type RetryResult<A, S> = Result<
     usize,
-    OptimisticCommandError<
+    CommandError<
         <A as Aggregate>::Error,
-        <S as EventStore>::Position,
+        ConcurrencyConflict<<S as EventStore>::Position>,
         <S as EventStore>::Error,
+        Infallible,
     >,
 >;
 
 /// Result type alias for retry operations (optimistic, snapshots enabled).
 pub type SnapshotRetryResult<A, S, SS> = Result<
     usize,
-    OptimisticSnapshotCommandError<
+    CommandError<
         <A as Aggregate>::Error,
-        <S as EventStore>::Position,
+        ConcurrencyConflict<<S as EventStore>::Position>,
         <S as EventStore>::Error,
         <SS as SnapshotStore<<S as EventStore>::Id>>::Error,
     >,
 >;
+
+#[doc(hidden)]
+pub enum CommitPolicyError<C, S> {
+    Concurrency(C),
+    Store(S),
+}
+
+#[doc(hidden)]
+pub trait CommitPolicy<S: EventStore>: private::Sealed {
+    type ConcurrencyError: std::error::Error + 'static;
+
+    fn commit<E>(
+        store: &S,
+        kind: &str,
+        id: &S::Id,
+        expected: Option<S::Position>,
+        events: NonEmpty<E>,
+        metadata: &S::Metadata,
+    ) -> impl std::future::Future<
+        Output = Result<S::Position, CommitPolicyError<Self::ConcurrencyError, S::Error>>,
+    > + Send
+    where
+        E: EventKind + Serialize + Send + Sync,
+        S::Metadata: Clone;
+}
+
+#[doc(hidden)]
+pub trait SnapshotPolicy<S: EventStore, A: Aggregate<Id = S::Id>>: private::Sealed {
+    type SnapshotError: std::error::Error + 'static;
+    type Prepared;
+
+    fn load_base(
+        &self,
+        kind: &str,
+        id: &S::Id,
+    ) -> impl std::future::Future<Output = (A, Option<S::Position>)> + Send;
+
+    fn prepare_snapshot(&self, aggregate: A, events: &NonEmpty<A::Event>) -> Self::Prepared;
+
+    fn offer_snapshot(
+        &self,
+        kind: &str,
+        id: &S::Id,
+        events_since_snapshot: u64,
+        new_position: S::Position,
+        prepared: Self::Prepared,
+    ) -> impl std::future::Future<Output = Result<(), Self::SnapshotError>> + Send;
+}
 
 struct LoadedAggregate<A, Pos> {
     aggregate: A,
@@ -276,6 +280,172 @@ where
         self.0
             .offer_snapshot(kind, id, events_since_last_snapshot, create_snapshot)
             .await
+    }
+}
+
+mod private {
+    pub trait Sealed {}
+
+    impl Sealed for crate::concurrency::Unchecked {}
+    impl Sealed for crate::concurrency::Optimistic {}
+    impl<Pos> Sealed for crate::snapshot::NoSnapshots<Pos> {}
+    impl<SS> Sealed for super::Snapshots<SS> {}
+}
+
+impl<S> CommitPolicy<S> for Unchecked
+where
+    S: EventStore,
+{
+    type ConcurrencyError = Infallible;
+
+    async fn commit<E>(
+        store: &S,
+        kind: &str,
+        id: &S::Id,
+        _expected: Option<S::Position>,
+        events: NonEmpty<E>,
+        metadata: &S::Metadata,
+    ) -> Result<S::Position, CommitPolicyError<Self::ConcurrencyError, S::Error>>
+    where
+        E: EventKind + Serialize + Send + Sync,
+        S::Metadata: Clone,
+    {
+        let committed = store
+            .commit_events(kind, id, events, metadata)
+            .await
+            .map_err(|e| match e {
+                CommitError::Store(err) | CommitError::Serialization { source: err, .. } => {
+                    CommitPolicyError::Store(err)
+                }
+            })?;
+
+        Ok(committed.last_position)
+    }
+}
+
+impl<S> CommitPolicy<S> for Optimistic
+where
+    S: EventStore,
+{
+    type ConcurrencyError = ConcurrencyConflict<S::Position>;
+
+    async fn commit<E>(
+        store: &S,
+        kind: &str,
+        id: &S::Id,
+        expected: Option<S::Position>,
+        events: NonEmpty<E>,
+        metadata: &S::Metadata,
+    ) -> Result<S::Position, CommitPolicyError<Self::ConcurrencyError, S::Error>>
+    where
+        E: EventKind + Serialize + Send + Sync,
+        S::Metadata: Clone,
+    {
+        let committed = store
+            .commit_events_optimistic(kind, id, expected, events, metadata)
+            .await
+            .map_err(|e| match e {
+                OptimisticCommitError::Conflict(conflict) => {
+                    CommitPolicyError::Concurrency(conflict)
+                }
+                OptimisticCommitError::Store(err)
+                | OptimisticCommitError::Serialization { source: err, .. } => {
+                    CommitPolicyError::Store(err)
+                }
+            })?;
+
+        Ok(committed.last_position)
+    }
+}
+
+impl<S, A> SnapshotPolicy<S, A> for crate::snapshot::NoSnapshots<S::Position>
+where
+    S: EventStore,
+    A: Aggregate<Id = S::Id>,
+{
+    type Prepared = ();
+    type SnapshotError = Infallible;
+
+    async fn load_base(&self, _kind: &str, _id: &S::Id) -> (A, Option<S::Position>) {
+        (A::default(), None)
+    }
+
+    fn prepare_snapshot(&self, _aggregate: A, _events: &NonEmpty<A::Event>) -> Self::Prepared {}
+
+    async fn offer_snapshot(
+        &self,
+        _kind: &str,
+        _id: &S::Id,
+        _events_since_snapshot: u64,
+        _new_position: S::Position,
+        _prepared: Self::Prepared,
+    ) -> Result<(), Self::SnapshotError> {
+        Ok(())
+    }
+}
+
+impl<S, A, SS> SnapshotPolicy<S, A> for Snapshots<SS>
+where
+    S: EventStore,
+    A: Aggregate<Id = S::Id> + Serialize + DeserializeOwned + Send,
+    SS: SnapshotStore<S::Id, Position = S::Position>,
+{
+    type Prepared = A;
+    type SnapshotError = SS::Error;
+
+    async fn load_base(&self, kind: &str, id: &S::Id) -> (A, Option<S::Position>) {
+        let snapshot_result = self
+            .0
+            .load::<A>(kind, id)
+            .await
+            .inspect_err(|e| {
+                tracing::error!(
+                    error = %e,
+                    "failed to load snapshot, falling back to full replay"
+                );
+            })
+            .ok()
+            .flatten();
+
+        if let Some(snapshot) = snapshot_result {
+            (snapshot.data, Some(snapshot.position))
+        } else {
+            (A::default(), None)
+        }
+    }
+
+    fn prepare_snapshot(&self, mut aggregate: A, events: &NonEmpty<A::Event>) -> Self::Prepared {
+        for event in events {
+            aggregate.apply(event);
+        }
+        aggregate
+    }
+
+    async fn offer_snapshot(
+        &self,
+        kind: &str,
+        id: &S::Id,
+        events_since_snapshot: u64,
+        new_position: S::Position,
+        prepared: Self::Prepared,
+    ) -> Result<(), Self::SnapshotError> {
+        let offer_result = self.0.offer_snapshot(
+            kind,
+            id,
+            events_since_snapshot,
+            move || -> Result<Snapshot<S::Position, A>, Infallible> {
+                Ok(Snapshot {
+                    position: new_position,
+                    data: prepared,
+                })
+            },
+        );
+
+        match offer_result.await {
+            Ok(SnapshotOffer::Declined | SnapshotOffer::Stored)
+            | Err(OfferSnapshotError::Create(_)) => Ok(()),
+            Err(OfferSnapshotError::Snapshot(e)) => Err(e),
+        }
     }
 }
 
@@ -457,14 +627,8 @@ where
             _concurrency: PhantomData,
         }
     }
-}
 
-impl<S, C> Repository<S, C, crate::snapshot::NoSnapshots<S::Position>>
-where
-    S: EventStore,
-    C: ConcurrencyStrategy,
-{
-    /// Load an aggregate by replaying all events (no snapshots).
+    /// Load an aggregate, using snapshots when configured.
     ///
     /// # Errors
     ///
@@ -474,6 +638,7 @@ where
     where
         A: Aggregate<Id = S::Id>,
         A::Event: ProjectionEvent,
+        M: SnapshotPolicy<S, A> + Sync,
     {
         Ok(self.load_aggregate::<A>(id).await?.aggregate)
     }
@@ -485,216 +650,9 @@ where
     where
         A: Aggregate<Id = S::Id>,
         A::Event: ProjectionEvent,
+        M: SnapshotPolicy<S, A> + Sync,
     {
-        let filters = aggregate_event_filters::<S, A::Event>(A::KIND, id, None);
-
-        let events = self
-            .store
-            .load_events(&filters)
-            .await
-            .map_err(ProjectionError::Store)?;
-
-        let mut aggregate = A::default();
-        let version = apply_stored_events::<A, S>(&mut aggregate, &self.store, &events)
-            .map_err(ProjectionError::EventDecode)?;
-
-        Ok(LoadedAggregate {
-            aggregate,
-            version,
-            events_since_snapshot: events.len() as u64,
-        })
-    }
-}
-
-impl<S> Repository<S, Unchecked, crate::snapshot::NoSnapshots<S::Position>>
-where
-    S: EventStore,
-{
-    /// Execute a command with last-writer-wins semantics (no concurrency
-    /// checking).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CommandError`] when the aggregate rejects the command, events
-    /// cannot be encoded, the store fails to persist, or the aggregate
-    /// cannot be rebuilt.
-    pub async fn execute_command<A, Cmd>(
-        &self,
-        id: &S::Id,
-        command: &Cmd,
-        metadata: &S::Metadata,
-    ) -> UncheckedCommandResult<A, S>
-    where
-        A: Aggregate<Id = S::Id> + Handle<Cmd>,
-        A::Event: ProjectionEvent + EventKind + serde::Serialize + Send + Sync,
-        Cmd: Sync,
-        S::Metadata: Clone,
-    {
-        let new_events = {
-            let LoadedAggregate { aggregate, .. } = self
-                .load_aggregate::<A>(id)
-                .await
-                .map_err(CommandError::Projection)?;
-            Handle::<Cmd>::handle(&aggregate, command).map_err(CommandError::Aggregate)?
-        };
-
-        let Some(events) = NonEmpty::from_vec(new_events) else {
-            return Ok(());
-        };
-
-        self.store
-            .commit_events(A::KIND, id, events, metadata)
-            .await
-            .map_err(|e| match e {
-                CommitError::Store(err) | CommitError::Serialization { source: err, .. } => {
-                    CommandError::Store(err)
-                }
-            })?;
-
-        Ok(())
-    }
-}
-
-impl<S> Repository<S, Optimistic, crate::snapshot::NoSnapshots<S::Position>>
-where
-    S: EventStore,
-{
-    /// Execute a command using optimistic concurrency control.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`OptimisticCommandError::Concurrency`] if the stream version
-    /// changed between loading and committing. Other variants cover
-    /// aggregate validation, encoding, persistence, and projection rebuild
-    /// errors.
-    pub async fn execute_command<A, Cmd>(
-        &self,
-        id: &S::Id,
-        command: &Cmd,
-        metadata: &S::Metadata,
-    ) -> OptimisticCommandResult<A, S>
-    where
-        A: Aggregate<Id = S::Id> + Handle<Cmd>,
-        A::Event: ProjectionEvent + EventKind + serde::Serialize + Send + Sync,
-        Cmd: Sync,
-        S::Metadata: Clone,
-    {
-        let (version, new_events) = {
-            let LoadedAggregate {
-                aggregate, version, ..
-            } = self
-                .load_aggregate::<A>(id)
-                .await
-                .map_err(OptimisticCommandError::Projection)?;
-            let new_events = Handle::<Cmd>::handle(&aggregate, command)
-                .map_err(OptimisticCommandError::Aggregate)?;
-            (version, new_events)
-        };
-
-        let Some(events) = NonEmpty::from_vec(new_events) else {
-            return Ok(());
-        };
-
-        self.store
-            .commit_events_optimistic(A::KIND, id, version, events, metadata)
-            .await
-            .map_err(|e| match e {
-                OptimisticCommitError::Conflict(c) => OptimisticCommandError::Concurrency(c),
-                OptimisticCommitError::Store(err)
-                | OptimisticCommitError::Serialization { source: err, .. } => {
-                    OptimisticCommandError::Store(err)
-                }
-            })?;
-
-        Ok(())
-    }
-
-    /// Execute a command with automatic retry on concurrency conflicts.
-    ///
-    /// # Errors
-    ///
-    /// Returns the last error if all retries are exhausted, or a
-    /// non-concurrency error immediately.
-    pub async fn execute_with_retry<A, Cmd>(
-        &self,
-        id: &S::Id,
-        command: &Cmd,
-        metadata: &S::Metadata,
-        max_retries: usize,
-    ) -> RetryResult<A, S>
-    where
-        A: Aggregate<Id = S::Id> + Handle<Cmd>,
-        A::Event: ProjectionEvent + EventKind + serde::Serialize + Send + Sync,
-        Cmd: Sync,
-        S::Metadata: Clone,
-    {
-        for attempt in 1..=max_retries {
-            match self.execute_command::<A, Cmd>(id, command, metadata).await {
-                Ok(()) => return Ok(attempt),
-                Err(OptimisticCommandError::Concurrency(_)) => {}
-                Err(e) => return Err(e),
-            }
-        }
-
-        self.execute_command::<A, Cmd>(id, command, metadata)
-            .await
-            .map(|()| max_retries + 1)
-    }
-}
-
-impl<S, SS, C> Repository<S, C, Snapshots<SS>>
-where
-    S: EventStore,
-    SS: SnapshotStore<S::Id, Position = S::Position>,
-    C: ConcurrencyStrategy,
-{
-    #[must_use]
-    pub const fn snapshot_store(&self) -> &SS {
-        &self.snapshots.0
-    }
-
-    /// Load an aggregate using snapshots when available.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ProjectionError`] if the store fails to load events, if an
-    /// event cannot be decoded, or if a stored snapshot cannot be
-    /// deserialized (which indicates snapshot corruption).
-    pub async fn load<A>(&self, id: &S::Id) -> Result<A, LoadError<S>>
-    where
-        A: Aggregate<Id = S::Id> + Serialize + DeserializeOwned + Send,
-        A::Event: ProjectionEvent,
-    {
-        Ok(self.load_aggregate::<A>(id).await?.aggregate)
-    }
-
-    async fn load_aggregate<A>(
-        &self,
-        id: &S::Id,
-    ) -> Result<LoadedAggregate<A, S::Position>, LoadError<S>>
-    where
-        A: Aggregate<Id = S::Id> + Serialize + DeserializeOwned + Send,
-        A::Event: ProjectionEvent,
-    {
-        let snapshot_result = self
-            .snapshots
-            .0
-            .load::<A>(A::KIND, id)
-            .await
-            .inspect_err(|e| {
-                tracing::error!(
-                    error = %e,
-                    "failed to load snapshot, falling back to full replay"
-                );
-            })
-            .ok()
-            .flatten();
-
-        let (mut aggregate, snapshot_position) = if let Some(snapshot) = snapshot_result {
-            (snapshot.data, Some(snapshot.position))
-        } else {
-            (A::default(), None)
-        };
+        let (mut aggregate, snapshot_position) = self.snapshots.load_base(A::KIND, id).await;
 
         let filters =
             aggregate_event_filters::<S, A::Event>(A::KIND, id, snapshot_position.as_ref());
@@ -716,117 +674,29 @@ where
             events_since_snapshot: events.len() as u64,
         })
     }
-}
 
-impl<S, SS> Repository<S, Unchecked, Snapshots<SS>>
-where
-    S: EventStore,
-    SS: SnapshotStore<S::Id, Position = S::Position>,
-{
-    /// Execute a command with last-writer-wins semantics and optional
-    /// snapshotting.
+    /// Execute a command using the repository's configured concurrency and
+    /// snapshot strategy.
     ///
     /// # Errors
     ///
-    /// Returns [`SnapshotCommandError`] when the aggregate rejects the command,
-    /// events cannot be encoded, the store fails to persist, snapshot
-    /// persistence fails, or the aggregate cannot be rebuilt.
+    /// Returns [`CommandError`] when the aggregate rejects the command, events
+    /// cannot be encoded, the store fails to persist, snapshot persistence
+    /// fails, or the aggregate cannot be rebuilt. Optimistic repositories
+    /// return [`CommandError::Concurrency`] on conflicts.
     pub async fn execute_command<A, Cmd>(
         &self,
         id: &S::Id,
         command: &Cmd,
         metadata: &S::Metadata,
-    ) -> UncheckedSnapshotCommandResult<A, S, SS>
+    ) -> Result<(), CommandError<A::Error, C::ConcurrencyError, S::Error, M::SnapshotError>>
     where
-        A: Aggregate<Id = S::Id> + Handle<Cmd> + Serialize + DeserializeOwned + Send,
-        A::Event: ProjectionEvent + EventKind + serde::Serialize + Send + Sync,
+        A: Aggregate<Id = S::Id> + Handle<Cmd>,
+        A::Event: ProjectionEvent + EventKind + Serialize + Send + Sync,
         Cmd: Sync,
         S::Metadata: Clone,
-    {
-        let LoadedAggregate {
-            aggregate,
-            events_since_snapshot,
-            ..
-        } = self
-            .load_aggregate::<A>(id)
-            .await
-            .map_err(SnapshotCommandError::Projection)?;
-
-        let new_events =
-            Handle::<Cmd>::handle(&aggregate, command).map_err(SnapshotCommandError::Aggregate)?;
-
-        let Some(events) = NonEmpty::from_vec(new_events) else {
-            return Ok(());
-        };
-
-        let total_events_since_snapshot = events_since_snapshot + events.len() as u64;
-
-        let mut aggregate = aggregate;
-        for event in &events {
-            aggregate.apply(event);
-        }
-
-        let commit_result = self
-            .store
-            .commit_events(A::KIND, id, events, metadata)
-            .await
-            .map_err(|e| match e {
-                CommitError::Store(err) | CommitError::Serialization { source: err, .. } => {
-                    SnapshotCommandError::Store(err)
-                }
-            })?;
-        let new_position = commit_result.last_position;
-
-        let offer_result = self.snapshots.0.offer_snapshot(
-            A::KIND,
-            id,
-            total_events_since_snapshot,
-            move || -> Result<Snapshot<S::Position, A>, std::convert::Infallible> {
-                Ok(Snapshot {
-                    position: new_position,
-                    data: aggregate,
-                })
-            },
-        );
-
-        match offer_result.await {
-            Ok(SnapshotOffer::Declined | SnapshotOffer::Stored) => {}
-            Err(OfferSnapshotError::Create(_e)) => {
-                // Snapshot serialization failed - log and continue
-                // This is not fatal, we successfully committed events
-            }
-            Err(OfferSnapshotError::Snapshot(e)) => return Err(SnapshotCommandError::Snapshot(e)),
-        }
-
-        Ok(())
-    }
-}
-
-impl<S, SS> Repository<S, Optimistic, Snapshots<SS>>
-where
-    S: EventStore,
-    SS: SnapshotStore<S::Id, Position = S::Position>,
-{
-    /// Execute a command using optimistic concurrency control and optional
-    /// snapshotting.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`OptimisticSnapshotCommandError::Concurrency`] if the stream
-    /// version changed between loading and committing. Other variants cover
-    /// aggregate validation, encoding, persistence, snapshot persistence,
-    /// and projection rebuild errors.
-    pub async fn execute_command<A, Cmd>(
-        &self,
-        id: &S::Id,
-        command: &Cmd,
-        metadata: &S::Metadata,
-    ) -> OptimisticSnapshotCommandResult<A, S, SS>
-    where
-        A: Aggregate<Id = S::Id> + Handle<Cmd> + Serialize + DeserializeOwned + Send,
-        A::Event: ProjectionEvent + EventKind + serde::Serialize + Send + Sync,
-        Cmd: Sync,
-        S::Metadata: Clone,
+        C: CommitPolicy<S>,
+        M: SnapshotPolicy<S, A> + Sync,
     {
         let LoadedAggregate {
             aggregate,
@@ -835,10 +705,10 @@ where
         } = self
             .load_aggregate::<A>(id)
             .await
-            .map_err(OptimisticSnapshotCommandError::Projection)?;
+            .map_err(CommandError::Projection)?;
 
-        let new_events = Handle::<Cmd>::handle(&aggregate, command)
-            .map_err(OptimisticSnapshotCommandError::Aggregate)?;
+        let new_events =
+            Handle::<Cmd>::handle(&aggregate, command).map_err(CommandError::Aggregate)?;
 
         let Some(events) = NonEmpty::from_vec(new_events) else {
             return Ok(());
@@ -846,52 +716,47 @@ where
 
         let total_events_since_snapshot = events_since_snapshot + events.len() as u64;
 
-        let mut aggregate = aggregate;
-        for event in &events {
-            aggregate.apply(event);
-        }
+        let prepared = self.snapshots.prepare_snapshot(aggregate, &events);
 
-        let commit_result = self
-            .store
-            .commit_events_optimistic(A::KIND, id, version, events, metadata)
+        let new_position =
+            C::commit::<A::Event>(&self.store, A::KIND, id, version, events, metadata)
+                .await
+                .map_err(|e| match e {
+                    CommitPolicyError::Concurrency(conflict) => CommandError::Concurrency(conflict),
+                    CommitPolicyError::Store(err) => CommandError::Store(err),
+                })?;
+
+        self.snapshots
+            .offer_snapshot(
+                A::KIND,
+                id,
+                total_events_since_snapshot,
+                new_position,
+                prepared,
+            )
             .await
-            .map_err(|e| match e {
-                OptimisticCommitError::Conflict(c) => {
-                    OptimisticSnapshotCommandError::Concurrency(c)
-                }
-                OptimisticCommitError::Store(err)
-                | OptimisticCommitError::Serialization { source: err, .. } => {
-                    OptimisticSnapshotCommandError::Store(err)
-                }
-            })?;
-        let new_position = commit_result.last_position;
-
-        let offer_result = self.snapshots.0.offer_snapshot(
-            A::KIND,
-            id,
-            total_events_since_snapshot,
-            move || -> Result<Snapshot<S::Position, A>, std::convert::Infallible> {
-                Ok(Snapshot {
-                    position: new_position,
-                    data: aggregate,
-                })
-            },
-        );
-
-        match offer_result.await {
-            Ok(SnapshotOffer::Declined | SnapshotOffer::Stored) => {}
-            Err(OfferSnapshotError::Create(_e)) => {
-                // Snapshot serialization failed - log and continue
-                // This is not fatal, we successfully committed events
-            }
-            Err(OfferSnapshotError::Snapshot(e)) => {
-                return Err(OptimisticSnapshotCommandError::Snapshot(e));
-            }
-        }
+            .map_err(CommandError::Snapshot)?;
 
         Ok(())
     }
+}
 
+impl<S, SS, C> Repository<S, C, Snapshots<SS>>
+where
+    S: EventStore,
+    SS: SnapshotStore<S::Id, Position = S::Position>,
+    C: ConcurrencyStrategy,
+{
+    #[must_use]
+    pub const fn snapshot_store(&self) -> &SS {
+        &self.snapshots.0
+    }
+}
+
+impl<S, M> Repository<S, Optimistic, M>
+where
+    S: EventStore,
+{
     /// Execute a command with automatic retry on concurrency conflicts.
     ///
     /// # Errors
@@ -904,17 +769,21 @@ where
         command: &Cmd,
         metadata: &S::Metadata,
         max_retries: usize,
-    ) -> SnapshotRetryResult<A, S, SS>
+    ) -> Result<
+        usize,
+        CommandError<A::Error, ConcurrencyConflict<S::Position>, S::Error, M::SnapshotError>,
+    >
     where
-        A: Aggregate<Id = S::Id> + Handle<Cmd> + Serialize + DeserializeOwned + Send,
+        A: Aggregate<Id = S::Id> + Handle<Cmd>,
         A::Event: ProjectionEvent + EventKind + serde::Serialize + Send + Sync,
         Cmd: Sync,
         S::Metadata: Clone,
+        M: SnapshotPolicy<S, A> + Sync,
     {
         for attempt in 1..=max_retries {
             match self.execute_command::<A, Cmd>(id, command, metadata).await {
                 Ok(()) => return Ok(attempt),
-                Err(OptimisticSnapshotCommandError::Concurrency(_)) => {}
+                Err(CommandError::Concurrency(_)) => {}
                 Err(e) => return Err(e),
             }
         }
@@ -933,7 +802,7 @@ mod tests {
 
     #[test]
     fn command_error_display_mentions_aggregate() {
-        let error: CommandError<String, io::Error> =
+        let error: CommandError<String, Infallible, io::Error, Infallible> =
             CommandError::Aggregate("invalid state".to_string());
         let msg = error.to_string();
         assert!(msg.contains("aggregate rejected command"));
@@ -942,7 +811,7 @@ mod tests {
 
     #[test]
     fn command_error_store_has_source() {
-        let error: CommandError<String, io::Error> =
+        let error: CommandError<String, Infallible, io::Error, Infallible> =
             CommandError::Store(io::Error::other("store error"));
         assert!(error.source().is_some());
     }
@@ -953,8 +822,8 @@ mod tests {
             expected: Some(1u64),
             actual: Some(2u64),
         };
-        let error: OptimisticCommandError<String, u64, io::Error> =
-            OptimisticCommandError::Concurrency(conflict);
+        let error: CommandError<String, ConcurrencyConflict<u64>, io::Error, Infallible> =
+            CommandError::Concurrency(conflict);
         let msg = error.to_string();
         assert!(msg.contains("concurrency conflict"));
         assert!(error.source().is_none());

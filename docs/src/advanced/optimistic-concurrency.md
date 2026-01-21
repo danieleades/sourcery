@@ -34,22 +34,22 @@ The two concurrency strategies use different error types:
 
 | Strategy | Error Type | Includes Concurrency Variant? |
 |----------|------------|-------------------------------|
-| `Optimistic` (default) | `OptimisticCommandError` | Yes |
-| `Unchecked` | `CommandError` | No |
+| `Optimistic` (default) | `CommandError` | Yes |
+| `Unchecked` | `CommandError` | No (Concurrency = `Infallible`) |
 
 When using optimistic concurrency, `execute_command` returns
-`OptimisticCommandError::Concurrency(conflict)` if the stream version changed between
+`CommandError::Concurrency(conflict)` if the stream version changed between
 loading and committing:
 
 ```rust,ignore
-use sourcery::OptimisticCommandError;
+use sourcery::repository::CommandError;
 
 match repo
     .execute_command::<MyAggregate, MyCommand>(&id, &command, &metadata)
     .await
 {
     Ok(()) => println!("Success!"),
-    Err(OptimisticCommandError::Concurrency(conflict)) => {
+    Err(CommandError::Concurrency(conflict)) => {
         println!(
             "Conflict: expected version {:?}, actual {:?}",
             conflict.expected,
