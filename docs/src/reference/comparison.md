@@ -26,7 +26,7 @@ No explicit "upcaster" concept. Instead, migrate historical events transparently
 
 ## Type-Safe Optimistic Concurrency
 
-Repositories use version-checked mutations by default. Conflicts are detected at the type level—the `Optimistic` strategy returns `OptimisticCommandError::Concurrency` when the stream version changes between load and commit.
+Repositories use version-checked mutations by default. Conflicts are detected at the type level—the `Optimistic` strategy returns `CommandError::Concurrency` when the stream version changes between load and commit.
 
 ```rust,ignore
 let attempts = repo

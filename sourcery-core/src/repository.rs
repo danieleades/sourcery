@@ -935,7 +935,6 @@ where
     /// ```ignore
     /// let subscription = repo
     ///     .subscribe::<Dashboard>(())
-    ///     .on_catchup_complete(|| println!("ready"))
     ///     .on_update(|d| println!("{d:?}"))
     ///     .start()
     ///     .await?;

@@ -149,10 +149,9 @@ impl ProjectionEvent for AccountEvent {
     ];
 
     fn from_stored<S: EventStore>(
-        stored: &S::StoredEvent,
+        stored: &StoredEvent<S::Id, S::Position, S::Data, S::Metadata>,
         store: &S,
     ) -> Result<Self, EventDecodeError<S::Error>> {
-        use sourcery::store::StoredEventView;
         match stored.kind() {
             FundsDeposited::KIND => Ok(Self::FundsDeposited(
                 store.decode_event(stored)?

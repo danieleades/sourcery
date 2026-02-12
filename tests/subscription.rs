@@ -4,7 +4,7 @@
 
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicU32, Ordering},
+    atomic::{AtomicU32, Ordering},
 };
 
 use serde::{Deserialize, Serialize};
@@ -128,14 +128,8 @@ async fn subscription_replays_historical_events() {
     let update_count = Arc::new(AtomicU32::new(0));
     let update_count_clone = update_count.clone();
 
-    let catchup_complete = Arc::new(AtomicBool::new(false));
-    let catchup_clone = catchup_complete.clone();
-
     let subscription = repo
         .subscribe::<ItemCount>(())
-        .on_catchup_complete(move || {
-            catchup_clone.store(true, Ordering::SeqCst);
-        })
         .on_update(move |projection| {
             update_count_clone.store(projection.count, Ordering::SeqCst);
         })
@@ -143,10 +137,6 @@ async fn subscription_replays_historical_events() {
         .await
         .unwrap();
 
-    // Give the subscription a moment to process
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    assert!(catchup_complete.load(Ordering::SeqCst));
     assert_eq!(update_count.load(Ordering::SeqCst), 2);
 
     subscription.stop().await.unwrap();
@@ -192,14 +182,8 @@ async fn subscription_catches_up_then_receives_live() {
     let update_count = Arc::new(AtomicU32::new(0));
     let update_count_clone = update_count.clone();
 
-    let catchup_complete = Arc::new(AtomicBool::new(false));
-    let catchup_clone = catchup_complete.clone();
-
     let subscription = repo
         .subscribe::<ItemCount>(())
-        .on_catchup_complete(move || {
-            catchup_clone.store(true, Ordering::SeqCst);
-        })
         .on_update(move |projection| {
             update_count_clone.store(projection.count, Ordering::SeqCst);
         })
@@ -207,8 +191,6 @@ async fn subscription_catches_up_then_receives_live() {
         .await
         .unwrap();
 
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    assert!(catchup_complete.load(Ordering::SeqCst));
     assert_eq!(update_count.load(Ordering::SeqCst), 1);
 
     add_item(&repo, "inv1", "live").await;
@@ -230,24 +212,12 @@ async fn subscription_stop_shuts_down_cleanly() {
 }
 
 #[tokio::test]
-async fn on_catchup_complete_fires_when_no_events() {
+async fn subscription_start_returns_when_no_events() {
     let store: inmemory::Store<String, ()> = inmemory::Store::new();
     let repo = Repository::new(store);
 
-    let catchup_complete = Arc::new(AtomicBool::new(false));
-    let catchup_clone = catchup_complete.clone();
-
-    let subscription = repo
-        .subscribe::<ItemCount>(())
-        .on_catchup_complete(move || {
-            catchup_clone.store(true, Ordering::SeqCst);
-        })
-        .start()
-        .await
-        .unwrap();
-
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    assert!(catchup_complete.load(Ordering::SeqCst));
+    let subscription = repo.subscribe::<ItemCount>(()).start().await.unwrap();
+    assert!(subscription.is_running());
 
     subscription.stop().await.unwrap();
 }

@@ -10,14 +10,13 @@
 //! A subscription:
 //! 1. Replays historical events (catch-up phase)
 //! 2. Transitions to processing live events as they are committed
-//! 3. Fires callbacks on each update and when catch-up completes
+//! 3. Fires callbacks on each update
 //!
 //! # Example
 //!
 //! ```ignore
 //! let subscription = repository
 //!     .subscribe::<Dashboard>(())
-//!     .on_catchup_complete(|| println!("ready"))
 //!     .on_update(|dashboard| println!("{dashboard:?}"))
 //!     .start()
 //!     .await?;
@@ -106,6 +105,9 @@ where
     /// An event could not be decoded.
     #[error("failed to decode event: {0}")]
     EventDecode(#[source] EventDecodeError<StoreError>),
+    /// The subscription ended before completing catch-up.
+    #[error("subscription ended before catch-up completed")]
+    CatchupInterrupted,
     /// The subscription task panicked.
     #[error("subscription task panicked")]
     TaskPanicked,
@@ -113,8 +115,8 @@ where
 
 /// Handle to a running subscription.
 ///
-/// Dropping the handle does **not** stop the subscription. Call [`stop()`] for
-/// graceful shutdown.
+/// Dropping the handle sends a best-effort stop signal. Call [`stop()`] for
+/// graceful shutdown and to observe task errors.
 ///
 /// [`stop()`]: SubscriptionHandle::stop
 pub struct SubscriptionHandle<StoreError>
@@ -122,7 +124,7 @@ where
     StoreError: std::error::Error + 'static,
 {
     stop_tx: Option<tokio::sync::oneshot::Sender<()>>,
-    task: JoinHandle<Result<(), SubscriptionError<StoreError>>>,
+    task: Option<JoinHandle<Result<(), SubscriptionError<StoreError>>>>,
 }
 
 impl<StoreError> SubscriptionHandle<StoreError>
@@ -139,6 +141,8 @@ where
             let _ = tx.send(());
         }
         self.task
+            .take()
+            .expect("subscription task missing")
             .await
             .map_err(|_| SubscriptionError::TaskPanicked)?
     }
@@ -146,7 +150,28 @@ where
     /// Check if the subscription task is still running.
     #[must_use]
     pub fn is_running(&self) -> bool {
-        !self.task.is_finished()
+        self.task.as_ref().is_some_and(|task| !task.is_finished())
+    }
+}
+
+impl<StoreError> Drop for SubscriptionHandle<StoreError>
+where
+    StoreError: std::error::Error + 'static,
+{
+    fn drop(&mut self) {
+        if self
+            .task
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished)
+        {
+            return;
+        }
+        tracing::warn!(
+            "subscription handle dropped without stop(); signaling background task to stop"
+        );
+        if let Some(tx) = self.stop_tx.take() {
+            let _ = tx.send(());
+        }
     }
 }
 
@@ -155,13 +180,11 @@ type UpdateCallback<P> = Box<dyn Fn(&P) + Send + Sync + 'static>;
 
 /// Builder for configuring and starting a subscription.
 ///
-/// Created via [`Repository::subscribe()`]. Use [`on_update()`] and
-/// [`on_catchup_complete()`] to register callbacks, then call [`start()`] to
-/// begin processing events.
+/// Created via [`Repository::subscribe()`]. Use [`on_update()`] to register
+/// callbacks, then call [`start()`] to begin processing events.
 ///
 /// [`Repository::subscribe()`]: crate::repository::Repository::subscribe
 /// [`on_update()`]: SubscriptionBuilder::on_update
-/// [`on_catchup_complete()`]: SubscriptionBuilder::on_catchup_complete
 /// [`start()`]: SubscriptionBuilder::start
 pub struct SubscriptionBuilder<S, P, SS>
 where
@@ -172,7 +195,6 @@ where
     snapshots: SS,
     instance_id: P::InstanceId,
     on_update: Option<UpdateCallback<P>>,
-    on_catchup_complete: Option<Box<dyn FnOnce() + Send + 'static>>,
 }
 
 impl<S, P, SS> SubscriptionBuilder<S, P, SS>
@@ -192,7 +214,6 @@ where
             snapshots,
             instance_id,
             on_update: None,
-            on_catchup_complete: None,
         }
     }
 
@@ -210,28 +231,16 @@ where
         self
     }
 
-    /// Register a one-shot callback fired when the catch-up phase completes
-    /// and the subscription transitions to processing live events.
-    ///
-    /// Useful for signalling readiness (e.g., start serving traffic only
-    /// after the projection is current).
-    #[must_use]
-    pub fn on_catchup_complete<F>(mut self, callback: F) -> Self
-    where
-        F: FnOnce() + Send + 'static,
-    {
-        self.on_catchup_complete = Some(Box::new(callback));
-        self
-    }
-
     /// Start the subscription.
+    ///
+    /// This method returns only after catch-up completes.
     ///
     /// Spawns a background task that:
     /// 1. Loads the most recent snapshot (if available)
     /// 2. Subscribes to the event stream from the snapshot position
     /// 3. Replays historical events (catch-up phase)
-    /// 4. Transitions to live events, firing `on_catchup_complete`
-    /// 5. Applies each event and fires `on_update`
+    /// 4. Waits until catch-up is complete
+    /// 5. Continues processing live events and firing `on_update`
     ///
     /// # Errors
     ///
@@ -243,7 +252,6 @@ where
             snapshots,
             instance_id,
             on_update,
-            mut on_catchup_complete,
         } = self;
 
         let (mut projection, snapshot_position) =
@@ -294,8 +302,17 @@ where
 
         // Spawn live subscription task
         let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
 
         let task = tokio::spawn(async move {
+            let mut ready_tx = Some(ready_tx);
+
+            let signal_ready = |ready_tx: &mut Option<tokio::sync::oneshot::Sender<()>>| {
+                if let Some(tx) = ready_tx.take() {
+                    let _ = tx.send(());
+                }
+            };
+
             // Build filters for live stream from our current position
             let filters = P::filters::<S>(&instance_id);
             let (live_filters, handlers) = filters.into_event_filters(last_position.as_ref());
@@ -315,11 +332,9 @@ where
                 .map(|e| e.position.clone())
                 .or(catchup_target_position);
 
-            // If already caught up (no pending gap events), fire immediately
-            if (catchup_target.is_none() || last_position >= catchup_target)
-                && let Some(callback) = on_catchup_complete.take()
-            {
-                callback();
+            // If already caught up (no pending gap events), signal immediately.
+            if catchup_target.is_none() || last_position >= catchup_target {
+                signal_ready(&mut ready_tx);
             }
 
             loop {
@@ -356,16 +371,10 @@ where
                             callback(&projection);
                         }
 
-                        // Fire catch-up complete once we've processed past the
-                        // effective target (includes gap events). This fires
-                        // after on_update so state is published before readiness
-                        // is signaled.
-                        if on_catchup_complete.is_some()
-                            && (catchup_target.is_none()
-                                || last_position >= catchup_target)
-                            && let Some(callback) = on_catchup_complete.take()
-                        {
-                            callback();
+                        // Signal catch-up completion once we've processed
+                        // past the effective target (includes gap events).
+                        if catchup_target.is_none() || last_position >= catchup_target {
+                            signal_ready(&mut ready_tx);
                         }
 
                         // Periodically offer snapshots
@@ -403,10 +412,17 @@ where
             Ok(())
         });
 
-        Ok(SubscriptionHandle {
-            stop_tx: Some(stop_tx),
-            task,
-        })
+        match ready_rx.await {
+            Ok(()) => Ok(SubscriptionHandle {
+                stop_tx: Some(stop_tx),
+                task: Some(task),
+            }),
+            Err(_) => match task.await {
+                Ok(Ok(())) => Err(SubscriptionError::CatchupInterrupted),
+                Ok(Err(error)) => Err(error),
+                Err(_) => Err(SubscriptionError::TaskPanicked),
+            },
+        }
     }
 }
 

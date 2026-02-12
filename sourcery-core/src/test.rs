@@ -2,22 +2,22 @@
 //!
 //! This module provides testing utilities for event-sourced systems:
 //!
-//! - [`TestExecutor`]: BDD-style unit testing for aggregates in isolation
+//! - [`TestFramework`]: BDD-style unit testing for aggregates in isolation
 //! - [`RepositoryTestExt`]: Extension trait for integration testing with real
 //!   repositories
 //!
-//! # Unit Testing with [`TestExecutor`]
+//! # Unit Testing with [`TestFramework`]
 //!
-//! The [`TestExecutor`] is inspired by [cqrs-es](https://crates.io/crates/cqrs-es)
+//! The [`TestFramework`] is inspired by [cqrs-es](https://crates.io/crates/cqrs-es)
 //! for testing aggregate behavior in isolation, without requiring a real event
 //! store.
 //!
 //! ```ignore
-//! use sourcery::test::TestExecutor;
+//! use sourcery::test::TestFramework;
 //!
 //! #[test]
 //! fn adding_value_produces_event() {
-//!     TestExecutor::<Counter>::given(&[])
+//!     TestFramework::<Counter>::given(&[])
 //!         .when(&AddValue { amount: 10 })
 //!         .then_expect_events(&[
 //!             CounterEvent::Added(ValueAdded { amount: 10 })
@@ -26,7 +26,7 @@
 //!
 //! #[test]
 //! fn cannot_subtract_more_than_balance() {
-//!     TestExecutor::<Counter>::given(&[
+//!     TestFramework::<Counter>::given(&[
 //!         CounterEvent::Added(ValueAdded { amount: 10 })
 //!     ])
 //!     .when(&SubtractValue { amount: 20 })

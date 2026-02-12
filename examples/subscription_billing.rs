@@ -15,9 +15,8 @@
 //!
 //! - **`subscribe()` / `on_update()`** – the projection updates in real time as
 //!   commands are executed, with zero per-query replay cost.
-//! - **`on_catchup_complete()`** – the example waits until historical events
-//!   are replayed before serving traffic, guaranteeing the projection is
-//!   current.
+//! - **Catch-up on start** – `start()` returns only after historical events are
+//!   replayed, so the projection is current before commands execute.
 //! - **Guard conditions from live state** – the command side reads the
 //!   subscription-maintained projection (via `Arc<Mutex<_>>`) to decide whether
 //!   cancellation is safe.
@@ -475,7 +474,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //
     // The subscription replays any historical events first (catch-up phase),
     // then transitions to processing live events as they are committed.
-    // `on_catchup_complete` fires once the historical replay is done.
+    // `start()` returns only after catch-up completes.
     // `on_update` fires after every event is applied.
     // -------------------------------------------------------------------------
 
@@ -483,13 +482,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let live_projection = Arc::new(Mutex::new(CustomerBillingProjection::default()));
     let projection_for_callback = live_projection.clone();
 
-    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-
     let subscription = repository
         .subscribe::<CustomerBillingProjection>(())
-        .on_catchup_complete(move || {
-            let _ = ready_tx.send(());
-        })
         .on_update(move |projection| {
             // Capture the latest state so the command side can read it.
             *projection_for_callback.lock().expect("lock poisoned") = projection.clone();
@@ -501,9 +495,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .start()
         .await?;
 
-    // Wait until the catch-up phase is complete before executing commands.
-    // In a real service this is where you'd start accepting HTTP traffic.
-    ready_rx.await?;
     println!("Subscription caught up – ready to process commands.\n");
 
     // -------------------------------------------------------------------------
