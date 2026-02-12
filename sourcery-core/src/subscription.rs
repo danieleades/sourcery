@@ -352,18 +352,20 @@ where
                         last_position = Some(stored.position());
                         events_since_snapshot += 1;
 
+                        if let Some(ref callback) = on_update {
+                            callback(&projection);
+                        }
+
                         // Fire catch-up complete once we've processed past the
-                        // effective target (includes gap events)
+                        // effective target (includes gap events). This fires
+                        // after on_update so state is published before readiness
+                        // is signaled.
                         if on_catchup_complete.is_some()
                             && (catchup_target.is_none()
                                 || last_position >= catchup_target)
                             && let Some(callback) = on_catchup_complete.take()
                         {
                             callback();
-                        }
-
-                        if let Some(ref callback) = on_update {
-                            callback(&projection);
                         }
 
                         // Periodically offer snapshots
