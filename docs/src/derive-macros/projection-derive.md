@@ -1,28 +1,80 @@
 # The Projection Derive
 
 The `#[derive(Projection)]` macro implements the `Projection` trait for a
-struct with sensible defaults, so you can focus on `ApplyProjection<E>`
-handlers and builder configuration.
+struct, generating the `KIND` constant. You implement `Subscribable` and
+`ApplyProjection<E>` manually.
+
+## What Gets Generated
+
+The macro generates only:
+
+```rust,ignore
+impl Projection for MyProjection {
+    const KIND: &'static str = "my-projection"; // kebab-case by default
+}
+```
 
 ## Attributes
 
-All configuration happens via the `#[projection(...)]` attribute:
+All attributes are optional:
 
-- `id = Type` (**required**) — Aggregate ID type the projection reads.
-- `metadata = Type` (optional, default `()`) — Metadata type passed to
-  `ApplyProjection<E>` handlers.
-- `instance_id = Type` (optional, default `()`) — Projection instance identifier
-  type used for snapshots.
-- `kind = "name"` (optional, default kebab-case struct name) — Projection kind
-  identifier.
+| Attribute | Default | Description |
+|-----------|---------|-------------|
+| `kind = "name"` | kebab-case struct name | Projection type identifier for snapshots |
 
-## Example
+## Minimal Example
 
 ```rust,ignore
 #[derive(Default, sourcery::Projection)]
-#[projection(id = String)]
+pub struct AccountLedger {
+    total: i64,
+}
+```
+
+This generates `impl Projection for AccountLedger` with `KIND = "account-ledger"`.
+
+## Custom Kind
+
+```rust,ignore
+#[derive(Default, sourcery::Projection)]
+#[projection(kind = "audit-log")]
+pub struct AuditLog {
+    entries: Vec<AuditEntry>,
+}
+```
+
+## Complete Projection Setup
+
+The derive only generates the `Projection` impl. You must also implement
+`Subscribable` (for filter configuration) and `ApplyProjection<E>` (for event
+handlers):
+
+```rust,ignore
+use sourcery::{ApplyProjection, Filters, Subscribable, store::EventStore};
+
+#[derive(Debug, Default, sourcery::Projection)]
 pub struct AccountSummary {
     totals: HashMap<String, i64>,
+}
+
+impl Subscribable for AccountSummary {
+    type Id = String;
+    type InstanceId = ();
+    type Metadata = ();
+
+    fn init((): &()) -> Self {
+        Self::default()
+    }
+
+    fn filters<S>((): &()) -> Filters<S, Self>
+    where
+        S: EventStore<Id = String>,
+        S::Metadata: Clone + Into<()>,
+    {
+        Filters::new()
+            .event::<FundsDeposited>()
+            .event::<FundsWithdrawn>()
+    }
 }
 
 impl ApplyProjection<FundsDeposited> for AccountSummary {
@@ -32,26 +84,13 @@ impl ApplyProjection<FundsDeposited> for AccountSummary {
 }
 ```
 
-## Metadata + Custom Kind
+## Loading
 
-```rust,ignore
-#[derive(Default, sourcery::Projection)]
-#[projection(id = String, metadata = EventMetadata, kind = "audit-log")]
-pub struct AuditLog {
-    entries: Vec<AuditEntry>,
-}
-```
-
-## Event Registration
-
-The derive does **not** register events. Use the builder API to pick which
-events are applied:
+Since filters are defined centrally in `Subscribable::filters()`, loading is a
+single call:
 
 ```rust,ignore
 let projection = repository
-    .build_projection::<AccountSummary>()
-    .event::<FundsDeposited>()
-    .event::<FundsWithdrawn>()
-    .load()
+    .load_projection::<AccountSummary>(&())
     .await?;
 ```

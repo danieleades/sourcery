@@ -24,10 +24,9 @@ pub struct EventMetadata {
 Configure your store with the metadata type:
 
 ```rust,ignore
-use sourcery::store::{inmemory, JsonCodec};
+use sourcery::store::inmemory;
 
-let store: inmemory::Store<String, JsonCodec, EventMetadata> =
-    inmemory::Store::new(JsonCodec);
+let store: inmemory::Store<String, EventMetadata> = inmemory::Store::new();
 ```
 
 ## Passing Metadata to Commands
@@ -54,13 +53,30 @@ Each event produced by the command receives this metadata.
 
 ## Accessing Metadata in Projections
 
-Projections receive metadata as the third parameter:
+Set the `Metadata` associated type on `Subscribable` and receive it in `ApplyProjection`:
 
 ```rust,ignore
+use sourcery::{ApplyProjection, Filters, Subscribable, store::EventStore};
+
 #[derive(Debug, Default, sourcery::Projection)]
-#[projection(id = String, metadata = EventMetadata)]
 pub struct AuditLog {
     pub entries: Vec<AuditEntry>,
+}
+
+impl Subscribable for AuditLog {
+    type Id = String;
+    type InstanceId = ();
+    type Metadata = EventMetadata;
+
+    fn init((): &()) -> Self { Self::default() }
+
+    fn filters<S>((): &()) -> Filters<S, Self>
+    where
+        S: EventStore<Id = String>,
+        S::Metadata: Clone + Into<EventMetadata>,
+    {
+        Filters::new().event::<FundsDeposited>()
+    }
 }
 
 impl ApplyProjection<FundsDeposited> for AuditLog {
@@ -79,6 +95,8 @@ impl ApplyProjection<FundsDeposited> for AuditLog {
     }
 }
 ```
+
+The store's metadata type must implement `Into<P::Metadata>`. When they're the same type, this is automatic.
 
 ## Correlation and Causation
 
@@ -102,7 +120,7 @@ let follow_up_metadata = EventMetadata {
 If you don't need metadata, use `()`:
 
 ```rust,ignore
-let store: inmemory::Store<String, JsonCodec, ()> = inmemory::Store::new(JsonCodec);
+let store: inmemory::Store<String, ()> = inmemory::Store::new();
 
 repository
     .execute_command::<Account, Deposit>(&id, &cmd, &())
@@ -133,11 +151,31 @@ pub struct TenantMetadata {
 }
 
 #[derive(Default, sourcery::Projection)]
-#[projection(id = String, metadata = TenantMetadata)]
 pub struct TenantDashboard {
     tenant_id: String,
     order_count: u64,
     total_revenue: i64,
+}
+
+impl Subscribable for TenantDashboard {
+    type Id = String;
+    type InstanceId = String;
+    type Metadata = TenantMetadata;
+
+    fn init(tenant_id: &String) -> Self {
+        Self {
+            tenant_id: tenant_id.clone(),
+            ..Self::default()
+        }
+    }
+
+    fn filters<S>(_tenant_id: &String) -> Filters<S, Self>
+    where
+        S: EventStore<Id = String>,
+        S::Metadata: Clone + Into<TenantMetadata>,
+    {
+        Filters::new().event::<OrderPlaced>()
+    }
 }
 
 impl ApplyProjection<OrderPlaced> for TenantDashboard {

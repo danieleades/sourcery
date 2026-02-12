@@ -101,16 +101,16 @@ fn rejects_invalid_deposit() {
 
 ## Testing Projections
 
-Projections don't use `TestExecutor`. Test them directly:
+Projections don't use `TestExecutor`. Test them directly by calling `init()` and `apply_projection()`:
 
 ```rust,ignore
 #[test]
 fn projection_aggregates_deposits() {
-    let mut proj = AccountSummary::default();
+    let mut proj = AccountSummary::init(&());
 
-    proj.apply_projection("ACC-001", &FundsDeposited { amount: 100 }, &());
-    proj.apply_projection("ACC-002", &FundsDeposited { amount: 50 }, &());
-    proj.apply_projection("ACC-001", &FundsDeposited { amount: 25 }, &());
+    proj.apply_projection(&"ACC-001".to_string(), &FundsDeposited { amount: 100 }, &());
+    proj.apply_projection(&"ACC-002".to_string(), &FundsDeposited { amount: 50 }, &());
+    proj.apply_projection(&"ACC-001".to_string(), &FundsDeposited { amount: 25 }, &());
 
     assert_eq!(proj.accounts.get("ACC-001"), Some(&125));
     assert_eq!(proj.accounts.get("ACC-002"), Some(&50));

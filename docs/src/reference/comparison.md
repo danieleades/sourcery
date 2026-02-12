@@ -10,7 +10,7 @@ Instead of immediately wrapping events in aggregate-specific enums, each `Domain
 
 ## Projections Decoupled from Aggregates
 
-Read models don't depend on a particular aggregate enum or repository type. You declare the events you care about—potentially from several aggregate kinds—and compose them via the `ProjectionBuilder`.
+Read models don't depend on a particular aggregate enum or repository type. You declare the events you care about—potentially from several aggregate kinds—by implementing the `Subscribable` trait's `filters()` method.
 
 ## Metadata Outside Domain Objects
 

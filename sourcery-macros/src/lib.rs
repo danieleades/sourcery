@@ -56,16 +56,6 @@ impl FromMeta for TypePath {
     }
 }
 
-/// Wrapper for `syn::Type` that parses from `key = Type` syntax.
-#[derive(Debug)]
-struct TypeValue(syn::Type);
-
-impl FromMeta for TypeValue {
-    fn from_meta(item: &syn::Meta) -> darling::Result<Self> {
-        parse_name_value_type(item).map(Self)
-    }
-}
-
 /// Configuration for the `#[aggregate(...)]` attribute.
 #[derive(Debug, FromDeriveInput)]
 #[darling(attributes(aggregate), supports(struct_any))]
@@ -88,11 +78,6 @@ struct AggregateArgs {
 #[darling(attributes(projection), supports(struct_any))]
 struct ProjectionArgs {
     ident: Ident,
-    id: TypeValue,
-    #[darling(default)]
-    metadata: Option<TypeValue>,
-    #[darling(default)]
-    instance_id: Option<TypeValue>,
     #[darling(default)]
     kind: Option<String>,
 }
@@ -286,25 +271,25 @@ fn generate_aggregate_impl(args: AggregateArgs, input: &DeriveInput) -> TokenStr
 /// Derives the `Projection` trait for a struct.
 ///
 /// This macro generates:
-/// - `Projection` trait implementation
+/// - `Projection` trait implementation with `KIND` constant
+///
+/// The struct must also implement [`Subscribable`] (manually), which defines
+/// associated types (`Id`, `InstanceId`, `Metadata`) and the `init`/`filters`
+/// methods.
 ///
 /// # Attributes
 ///
-/// ## Required
-/// - `id = Type` - Aggregate ID type
-///
 /// ## Optional
-/// - `metadata = Type` - Metadata type (default: `()`)
-/// - `instance_id = Type` - Projection instance identifier type (default: `()`)
-/// - `kind = "name"` - Projection type identifier (default: lowercase struct
+/// - `kind = "name"` - Projection type identifier (default: kebab-case struct
 ///   name)
 ///
 /// # Example
 ///
 /// ```ignore
-/// #[derive(Projection)]
-/// #[projection(id = String)]
-/// pub struct AccountLedger;
+/// #[derive(Default, Projection)]
+/// pub struct AccountLedger {
+///     total: i64,
+/// }
 /// ```
 #[proc_macro_derive(Projection, attributes(projection))]
 pub fn derive_projection(input: TokenStream) -> TokenStream {
@@ -321,26 +306,12 @@ fn derive_projection_impl(input: &DeriveInput) -> TokenStream2 {
 /// Generate the projection derive implementation tokens.
 fn generate_projection_impl(args: ProjectionArgs, input: &DeriveInput) -> TokenStream2 {
     let struct_name = &args.ident;
-    let id_type = &args.id.0;
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
-    let default_metadata: syn::Type = syn::parse_quote!(());
-    let default_instance_id: syn::Type = syn::parse_quote!(());
-    let metadata_type = args
-        .metadata
-        .as_ref()
-        .map_or(&default_metadata, |value| &value.0);
-    let instance_id_type = args
-        .instance_id
-        .as_ref()
-        .map_or(&default_instance_id, |value| &value.0);
     let kind = default_kind(struct_name, args.kind);
 
     quote! {
         impl #impl_generics ::sourcery::Projection for #struct_name #ty_generics #where_clause {
             const KIND: &'static str = #kind;
-            type Id = #id_type;
-            type Metadata = #metadata_type;
-            type InstanceId = #instance_id_type;
         }
     }
 }
@@ -432,18 +403,9 @@ mod tests {
     }
 
     #[test]
-    /// Verifies `TypeValue` accepts name-value type syntax.
-    fn type_value_parses_name_value_type() {
-        let meta: syn::Meta = parse_quote!(id = ());
-        let parsed = TypeValue::from_meta(&meta).unwrap();
-        assert_eq!(parsed.0, parse_quote!(()));
-    }
-
-    #[test]
-    /// Confirms default kind and type defaults for projections.
-    fn generate_projection_impl_uses_default_kind_and_types() {
+    /// Confirms default kind for projections (no attributes required).
+    fn generate_projection_impl_uses_default_kind() {
         let input: DeriveInput = parse_quote! {
-            #[projection(id = String)]
             pub struct AccountLedger;
         };
 
@@ -452,28 +414,19 @@ mod tests {
 
         assert!(compact.contains("impl::sourcery::ProjectionforAccountLedger"));
         assert!(compact.contains("constKIND:&'staticstr=\"account-ledger\""));
-        assert!(compact.contains("typeMetadata=()"));
-        assert!(compact.contains("typeInstanceId=()"));
     }
 
     #[test]
-    /// Confirms projection overrides are honored.
-    fn generate_projection_impl_respects_overrides() {
+    /// Confirms projection kind override is honored.
+    fn generate_projection_impl_respects_kind_override() {
         let input: DeriveInput = parse_quote! {
-            #[projection(
-                id = String,
-                metadata = RequestMetadata,
-                instance_id = ProjectionKey,
-                kind = "account-ledger"
-            )]
+            #[projection(kind = "custom-ledger")]
             pub struct AccountLedger;
         };
 
         let expanded = derive_projection_impl(&input);
         let compact = compact(&expanded);
 
-        assert!(compact.contains("constKIND:&'staticstr=\"account-ledger\""));
-        assert!(compact.contains("typeMetadata=RequestMetadata"));
-        assert!(compact.contains("typeInstanceId=ProjectionKey"));
+        assert!(compact.contains("constKIND:&'staticstr=\"custom-ledger\""));
     }
 }

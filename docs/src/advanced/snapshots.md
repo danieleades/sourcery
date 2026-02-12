@@ -92,25 +92,26 @@ The `position` indicates which event this snapshot was taken after. When loading
 ## Projection Snapshots
 
 Projection snapshots use the same store and are keyed by `(P::KIND, instance_id)`.
-Singleton projections use `InstanceId = ()` and call `.load()`; multi-instance
-projections use `.load_for(&id)`.
+Use `load_projection_with_snapshot` on a repository configured with snapshots:
 
 ```rust,ignore
 #[derive(Default, Serialize, Deserialize, sourcery::Projection)]
-#[projection(id = String, kind = "loyalty.summary")]
+#[projection(kind = "loyalty.summary")]
 struct LoyaltySummary {
     total_earned: u64,
 }
 
+// (Subscribable impl defines filters and associated types)
+
 let repo = Repository::new(store).with_snapshots(inmemory::Store::every(100));
 
 let summary: LoyaltySummary = repo
-    .build_projection::<LoyaltySummary>()
-    .event::<PointsEarned>()
-    .with_snapshot()
-    .load()
+    .load_projection_with_snapshot::<LoyaltySummary>(&instance_id)
     .await?;
 ```
+
+Singleton projections use `InstanceId = ()` and pass `&()`. Instance projections
+pass their instance identifier.
 
 Projection snapshots require a globally ordered store (`S: GloballyOrderedStore`)
 and `P: Serialize + DeserializeOwned`.

@@ -6,8 +6,11 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use sourcery::{
-    Aggregate, Apply, ApplyProjection, DomainEvent, EventKind, Handle, Projection, Repository,
-    projection::ProjectionError, store::inmemory, test::RepositoryTestExt,
+    Aggregate, Apply, ApplyProjection, DomainEvent, EventKind, Filters, Handle, Projection,
+    Repository, Subscribable,
+    projection::ProjectionError,
+    store::{EventStore, inmemory},
+    test::RepositoryTestExt,
 };
 
 // ============================================================================
@@ -83,12 +86,67 @@ impl Handle<AddValue> for Counter {
 // ============================================================================
 
 #[derive(Debug, Default, Projection)]
-#[projection(id = String)]
 struct TotalsProjection {
     totals: HashMap<String, i32>,
 }
 
+impl Subscribable for TotalsProjection {
+    type Id = String;
+    type InstanceId = ();
+    type Metadata = ();
+
+    fn init((): &()) -> Self {
+        Self::default()
+    }
+
+    fn filters<S>((): &()) -> Filters<S, Self>
+    where
+        S: EventStore<Id = String>,
+        S::Metadata: Clone + Into<()>,
+    {
+        Filters::new().event::<ValueAdded>()
+    }
+}
+
 impl ApplyProjection<ValueAdded> for TotalsProjection {
+    fn apply_projection(
+        &mut self,
+        aggregate_id: &Self::Id,
+        event: &ValueAdded,
+        &(): &Self::Metadata,
+    ) {
+        *self.totals.entry(aggregate_id.clone()).or_insert(0) += event.amount;
+    }
+}
+
+// ============================================================================
+// Filtered projection for event_for tests
+// ============================================================================
+
+#[derive(Debug, Default, Projection)]
+struct FilteredTotalsProjection {
+    totals: HashMap<String, i32>,
+}
+
+impl Subscribable for FilteredTotalsProjection {
+    type Id = String;
+    type InstanceId = String;
+    type Metadata = ();
+
+    fn init(_id: &String) -> Self {
+        Self::default()
+    }
+
+    fn filters<S>(aggregate_id: &String) -> Filters<S, Self>
+    where
+        S: EventStore<Id = String>,
+        S::Metadata: Clone + Into<()>,
+    {
+        Filters::new().event_for::<Counter, ValueAdded>(aggregate_id)
+    }
+}
+
+impl ApplyProjection<ValueAdded> for FilteredTotalsProjection {
     fn apply_projection(
         &mut self,
         aggregate_id: &Self::Id,
@@ -115,12 +173,8 @@ async fn event_for_filters_by_aggregate() {
         .await
         .unwrap();
 
-    let projection: TotalsProjection = repo
-        .build_projection()
-        .event_for::<Counter, ValueAdded>(&"c1".to_string())
-        .load()
-        .await
-        .unwrap();
+    let projection: FilteredTotalsProjection =
+        repo.load_projection(&"c1".to_string()).await.unwrap();
 
     assert_eq!(projection.totals.get("c1"), Some(&10));
     assert!(!projection.totals.contains_key("c2"));
@@ -137,9 +191,7 @@ async fn load_surfaces_deserialization_error() {
         .unwrap();
 
     let err = repo
-        .build_projection::<TotalsProjection>()
-        .event::<ValueAdded>()
-        .load()
+        .load_projection::<TotalsProjection>(&())
         .await
         .unwrap_err();
 
@@ -226,55 +278,91 @@ impl Handle<ResetValue> for MultiEventCounter {
     }
 }
 
-/// Projection that handles multiple event types via aggregate event enum
+/// Projection using `events()` to load via the aggregate's event enum
 #[derive(Debug, Default, Projection)]
-#[projection(id = String)]
-struct MultiEventProjection {
+struct EnumProjection {
     additions: i32,
     resets: i32,
     last_value: Option<i32>,
 }
 
-impl ApplyProjection<ValueAdded> for MultiEventProjection {
-    fn apply_projection(
-        &mut self,
-        _aggregate_id: &Self::Id,
-        event: &ValueAdded,
-        &(): &Self::Metadata,
-    ) {
-        self.additions += event.amount;
+impl Subscribable for EnumProjection {
+    type Id = String;
+    type InstanceId = ();
+    type Metadata = ();
+
+    fn init((): &()) -> Self {
+        Self::default()
+    }
+
+    fn filters<S>((): &()) -> Filters<S, Self>
+    where
+        S: EventStore<Id = String>,
+        S::Metadata: Clone + Into<()>,
+    {
+        Filters::new().events::<MultiEventCounterEvent>()
     }
 }
 
-impl ApplyProjection<ValueReset> for MultiEventProjection {
+impl ApplyProjection<MultiEventCounterEvent> for EnumProjection {
     fn apply_projection(
         &mut self,
         _aggregate_id: &Self::Id,
-        event: &ValueReset,
-        &(): &Self::Metadata,
-    ) {
-        self.resets += 1;
-        self.last_value = Some(event.new_value);
-    }
-}
-
-/// Implementation for the aggregate event enum - required only when using
-/// `.events::<MultiEventCounterEvent>()` or
-/// `.events_for::<MultiEventCounter>()`. Dispatches to the individual event
-/// handlers above.
-impl ApplyProjection<MultiEventCounterEvent> for MultiEventProjection {
-    fn apply_projection(
-        &mut self,
-        aggregate_id: &Self::Id,
         event: &MultiEventCounterEvent,
-        metadata: &Self::Metadata,
+        &(): &Self::Metadata,
     ) {
         match event {
             MultiEventCounterEvent::ValueAdded(e) => {
-                self.apply_projection(aggregate_id, e, metadata);
+                self.additions += e.amount;
             }
             MultiEventCounterEvent::ValueReset(e) => {
-                self.apply_projection(aggregate_id, e, metadata);
+                self.resets += 1;
+                self.last_value = Some(e.new_value);
+            }
+        }
+    }
+}
+
+/// Projection using `events_for()` to load from a specific aggregate instance
+#[derive(Debug, Default, Projection)]
+struct EventsForProjection {
+    additions: i32,
+    resets: i32,
+    last_value: Option<i32>,
+}
+
+impl Subscribable for EventsForProjection {
+    type Id = String;
+    type InstanceId = String;
+    type Metadata = ();
+
+    fn init(_id: &String) -> Self {
+        Self::default()
+    }
+
+    fn filters<S>(aggregate_id: &String) -> Filters<S, Self>
+    where
+        S: EventStore<Id = String>,
+        S::Metadata: Clone + Into<()>,
+    {
+        Filters::new().events_for::<MultiEventCounter>(aggregate_id)
+    }
+}
+
+impl ApplyProjection<MultiEventCounterEvent> for EventsForProjection {
+    fn apply_projection(
+        &mut self,
+        _aggregate_id: &Self::Id,
+        event: &MultiEventCounterEvent,
+        &(): &Self::Metadata,
+    ) {
+        match event {
+            MultiEventCounterEvent::ValueAdded(e) => {
+                self.additions += e.amount;
+            }
+            MultiEventCounterEvent::ValueReset(e) => {
+                self.resets += 1;
+                self.last_value = Some(e.new_value);
             }
         }
     }
@@ -310,13 +398,8 @@ async fn events_loads_all_events_from_aggregate_enum() {
     .await
     .unwrap();
 
-    // Use events() to load via the aggregate's event enum
-    let projection: MultiEventProjection = repo
-        .build_projection()
-        .events::<MultiEventCounterEvent>()
-        .load()
-        .await
-        .unwrap();
+    // Use events() via the EnumProjection's Subscribable impl
+    let projection: EnumProjection = repo.load_projection(&()).await.unwrap();
 
     assert_eq!(projection.additions, 13); // 10 + 3
     assert_eq!(projection.resets, 1);
@@ -353,13 +436,8 @@ async fn events_for_loads_events_for_specific_aggregate_instance() {
     .await
     .unwrap();
 
-    // Use events_for() to load only events for c1
-    let projection: MultiEventProjection = repo
-        .build_projection()
-        .events_for::<MultiEventCounter>(&"c1".to_string())
-        .load()
-        .await
-        .unwrap();
+    // Use events_for() via the EventsForProjection's Subscribable impl
+    let projection: EventsForProjection = repo.load_projection(&"c1".to_string()).await.unwrap();
 
     assert_eq!(projection.additions, 10); // only c1's addition
     assert_eq!(projection.resets, 1);
@@ -373,10 +451,27 @@ async fn events_for_loads_events_for_specific_aggregate_instance() {
 /// Projection with Serialize/Deserialize for snapshot support.
 /// Uses String as both aggregate ID and instance ID for simplicity.
 #[derive(Debug, Default, Serialize, Deserialize, Projection)]
-#[projection(id = String, instance_id = String)]
 struct SnapshotProjection {
     total: i32,
     event_count: u32,
+}
+
+impl Subscribable for SnapshotProjection {
+    type Id = String;
+    type InstanceId = String;
+    type Metadata = ();
+
+    fn init(_id: &String) -> Self {
+        Self::default()
+    }
+
+    fn filters<S>(_id: &String) -> Filters<S, Self>
+    where
+        S: EventStore<Id = String>,
+        S::Metadata: Clone + Into<()>,
+    {
+        Filters::new().event::<ValueAdded>()
+    }
 }
 
 impl ApplyProjection<ValueAdded> for SnapshotProjection {
@@ -409,12 +504,9 @@ async fn projection_with_snapshot_exercises_snapshots_wrapper_load() {
         .await
         .unwrap();
 
-    // Build projection with snapshot support - exercises Snapshots::load()
+    // Build projection with snapshot support
     let projection: SnapshotProjection = repo
-        .build_projection()
-        .event::<ValueAdded>()
-        .with_snapshot()
-        .load_for(&"proj-instance".to_string())
+        .load_projection_with_snapshot(&"proj-instance".to_string())
         .await
         .unwrap();
 
@@ -438,10 +530,7 @@ async fn projection_with_snapshot_offers_snapshot_after_load() {
     // Load projection with snapshot - this should offer a snapshot after load
     let instance_id = "proj-instance".to_string();
     let projection: SnapshotProjection = repo
-        .build_projection()
-        .event::<ValueAdded>()
-        .with_snapshot()
-        .load_for(&instance_id)
+        .load_projection_with_snapshot(&instance_id)
         .await
         .unwrap();
 
@@ -454,10 +543,7 @@ async fn projection_with_snapshot_offers_snapshot_after_load() {
 
     // Load again - should now use the snapshot from before
     let projection: SnapshotProjection = repo
-        .build_projection()
-        .event::<ValueAdded>()
-        .with_snapshot()
-        .load_for(&instance_id)
+        .load_projection_with_snapshot(&instance_id)
         .await
         .unwrap();
 

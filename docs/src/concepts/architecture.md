@@ -65,7 +65,7 @@ Repo -> Snap: "offer_snapshot()?"
 Repo -> App: "Ok(())" {style.stroke-dash: 3}
 ```
 
-## Projection Building Flow
+## Projection Loading Flow
 
 ```d2
 shape: sequence_diagram
@@ -75,17 +75,17 @@ Repo: Repository
 Store: EventStore
 Proj: Projection
 
-App -> Repo: "build_projection()"
-App -> Repo: ".event::<E1>().event::<E2>()"
-App -> Repo: ".load()"
+App -> Repo: "load_projection::<P>(&instance_id)"
+Repo -> Proj: "P::filters(&instance_id)"
+Proj -> Repo: "Filters (event filters + handlers)" {style.stroke-dash: 3}
 Repo -> Store: "load_events(filters)"
 Store -> Repo: "Vec<StoredEvent>" {style.stroke-dash: 3}
-Repo -> Proj: "default()"
+Repo -> Proj: "P::init(&instance_id)"
 Repo -> Proj: "apply_projection(id, event, meta) [For each event]"
 Repo -> App: "Projection" {style.stroke-dash: 3}
 ```
 
-Projections specify which events they care about. The repository loads only those events and replays them into the projection.
+Projections define their event filters centrally in the `Subscribable` trait. The repository calls `filters()` to determine which events to load, then replays them into the projection.
 
 ## Key Types
 
@@ -94,9 +94,12 @@ Projections specify which events they care about. The repository loads only thos
 | `Repository<S>` | Orchestrates aggregates and projections (no snapshots) |
 | `Repository<S, C, Snapshots<SS>>` | Snapshot-enabled repository orchestration |
 | `EventStore` | Trait for event persistence |
-| `SnapshotStore` | Trait for aggregate snapshots |
+| `SnapshotStore` | Trait for aggregate/projection snapshots |
 | `Aggregate` | Trait for command-side entities |
-| `Projection` | Trait for read-side views |
+| `Subscribable` | Base trait for event subscribers (projections) |
+| `Projection` | Extends `Subscribable` with a `KIND` for snapshots |
+| `ApplyProjection<E>` | Per-event handler for projections |
+| `Filters` | Builder for event filter specs + handler closures |
 | `DomainEvent` | Marker trait for event structs |
 
 ## Next

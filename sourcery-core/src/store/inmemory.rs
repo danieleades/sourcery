@@ -13,10 +13,12 @@
 
 use std::{
     collections::HashMap,
+    pin::Pin,
     sync::{Arc, RwLock},
 };
 
 use nonempty::NonEmpty;
+use tokio::sync::broadcast;
 
 use crate::{
     concurrency::ConcurrencyConflict,
@@ -24,6 +26,7 @@ use crate::{
         CommitError, Committed, EventFilter, EventStore, GloballyOrderedStore, LoadEventsResult,
         OptimisticCommitError, StoredEvent, StreamKey,
     },
+    subscription::SubscribableStore,
 };
 
 /// Event stream stored in memory with fixed position and data types.
@@ -48,15 +51,20 @@ pub struct Store<Id, M> {
 struct Inner<Id, M> {
     streams: HashMap<StreamKey<Id>, InMemoryStream<Id, M>>,
     next_position: u64,
+    /// Broadcasts the position of newly committed events. Subscribers use this
+    /// to detect live writes without polling.
+    notify_tx: broadcast::Sender<u64>,
 }
 
 impl<Id, M> Store<Id, M> {
     #[must_use]
     pub fn new() -> Self {
+        let (notify_tx, _) = broadcast::channel(1024);
         Self {
             inner: Arc::new(RwLock::new(Inner {
                 streams: HashMap::new(),
                 next_position: 0,
+                notify_tx,
             })),
         }
     }
@@ -160,7 +168,11 @@ where
             }
 
             inner.streams.entry(stream_key).or_default().extend(stored);
+            let notify_tx = inner.notify_tx.clone();
             drop(inner);
+            // Notify subscribers of the new position (ignore send errors -- no
+            // receivers is fine)
+            let _ = notify_tx.send(last_position);
             tracing::debug!(events_appended = events.len(), "events committed to stream");
             Ok(Committed { last_position })
         })();
@@ -249,7 +261,9 @@ where
             }
 
             inner.streams.entry(stream_key).or_default().extend(stored);
+            let notify_tx = inner.notify_tx.clone();
             drop(inner);
+            let _ = notify_tx.send(last_position);
             tracing::debug!(
                 events_appended = events.len(),
                 "events committed to stream (optimistic)"
@@ -361,6 +375,185 @@ where
     Id: Clone + Eq + std::hash::Hash + Send + Sync + 'static,
     M: Clone + Send + Sync + 'static,
 {
+}
+
+impl<Id, M> SubscribableStore for Store<Id, M>
+where
+    Id: Clone + Eq + std::hash::Hash + Send + Sync + 'static,
+    M: Clone + Send + Sync + 'static,
+{
+    fn subscribe(
+        &self,
+        filters: &[EventFilter<Self::Id, Self::Position>],
+        from_position: Option<Self::Position>,
+    ) -> Pin<
+        Box<
+            dyn futures_core::Stream<
+                    Item = Result<
+                        StoredEvent<Self::Id, Self::Position, Self::Data, Self::Metadata>,
+                        Self::Error,
+                    >,
+                > + Send
+                + '_,
+        >,
+    >
+    where
+        Self::Position: Ord,
+    {
+        let filters = filters.to_vec();
+        let inner = self.inner.clone();
+
+        // Subscribe to broadcast FIRST to avoid missing events committed
+        // between the historical load and live listening.
+        let mut rx = {
+            let guard = inner.read().expect("in-memory store lock poisoned");
+            guard.notify_tx.subscribe()
+        };
+
+        Box::pin(async_stream::stream! {
+            // 1. Load and yield historical events
+            let historical = {
+                let guard = inner.read().expect("in-memory store lock poisoned");
+                load_matching_events(&guard, &filters)
+            };
+
+            let mut last_position = from_position;
+
+            for event in historical {
+                // Skip events at or before our starting position
+                if let Some(ref lp) = last_position
+                    && event.position <= *lp
+                {
+                    continue;
+                }
+                last_position = Some(event.position);
+                yield Ok(event);
+            }
+
+            // 2. Process live events from broadcast
+            loop {
+                match rx.recv().await {
+                    Ok(notified_position) => {
+                        // Skip positions we've already seen
+                        if let Some(ref lp) = last_position
+                            && notified_position <= *lp
+                        {
+                            continue;
+                        }
+
+                        // Load the event at this position and check filters
+                        let events = {
+                            let guard = inner.read().expect("in-memory store lock poisoned");
+                            load_matching_events(&guard, &filters)
+                        };
+
+                        for event in events {
+                            if let Some(ref lp) = last_position
+                                && event.position <= *lp
+                            {
+                                continue;
+                            }
+                            last_position = Some(event.position);
+                            yield Ok(event);
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        // We missed some notifications. Re-load from our last
+                        // known position to catch up.
+                        let events = {
+                            let guard = inner.read().expect("in-memory store lock poisoned");
+                            load_matching_events(&guard, &filters)
+                        };
+
+                        for event in events {
+                            if let Some(ref lp) = last_position
+                                && event.position <= *lp
+                            {
+                                continue;
+                            }
+                            last_position = Some(event.position);
+                            yield Ok(event);
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        // Store dropped, end stream
+                        break;
+                    }
+                }
+            }
+        })
+    }
+}
+
+/// Load all events matching the given filters, sorted by position.
+fn load_matching_events<Id, M>(
+    inner: &Inner<Id, M>,
+    filters: &[EventFilter<Id, u64>],
+) -> Vec<StoredEvent<Id, u64, serde_json::Value, M>>
+where
+    Id: Clone + Eq + std::hash::Hash,
+    M: Clone,
+{
+    use std::collections::HashSet;
+
+    let mut result = Vec::new();
+    let mut seen: HashSet<(StreamKey<Id>, String)> = HashSet::new();
+
+    let mut all_kinds: HashMap<String, Option<u64>> = HashMap::new();
+    let mut by_aggregate: HashMap<StreamKey<Id>, HashMap<String, Option<u64>>> = HashMap::new();
+
+    for filter in filters {
+        if let (Some(kind), Some(id)) = (&filter.aggregate_kind, &filter.aggregate_id) {
+            by_aggregate
+                .entry(StreamKey::new(kind.clone(), id.clone()))
+                .or_default()
+                .insert(filter.event_kind.clone(), filter.after_position);
+        } else {
+            all_kinds.insert(filter.event_kind.clone(), filter.after_position);
+        }
+    }
+
+    let passes_position_filter =
+        |event: &StoredEvent<Id, u64, serde_json::Value, M>, after_position: Option<u64>| -> bool {
+            after_position.is_none_or(|after| event.position > after)
+        };
+
+    for (stream_key, kinds) in &by_aggregate {
+        if let Some(stream) = inner.streams.get(stream_key) {
+            for event in stream {
+                if let Some(&after_pos) = kinds.get(&event.kind)
+                    && passes_position_filter(event, after_pos)
+                {
+                    seen.insert((
+                        StreamKey::new(event.aggregate_kind.clone(), event.aggregate_id.clone()),
+                        event.kind.clone(),
+                    ));
+                    result.push(event.clone());
+                }
+            }
+        }
+    }
+
+    if !all_kinds.is_empty() {
+        for stream in inner.streams.values() {
+            for event in stream {
+                if let Some(&after_pos) = all_kinds.get(&event.kind)
+                    && passes_position_filter(event, after_pos)
+                {
+                    let key = (
+                        StreamKey::new(event.aggregate_kind.clone(), event.aggregate_id.clone()),
+                        event.kind.clone(),
+                    );
+                    if !seen.contains(&key) {
+                        result.push(event.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    result.sort_by_key(|event| event.position);
+    result
 }
 
 #[cfg(test)]

@@ -122,9 +122,38 @@ pub mod codec {
     pub use super::event::{EventDecodeError, ProjectionEvent};
 }
 
-pub trait Projection {
-    const KIND: &'static str;
+pub trait Subscribable: Sized {
     type Id;
-    type Metadata;
     type InstanceId;
+    type Metadata;
+
+    fn init(instance_id: &Self::InstanceId) -> Self;
+
+    fn filters<S>(instance_id: &Self::InstanceId) -> Filters<S, Self>
+    where
+        S: store::EventStore<Id = Self::Id>,
+        S::Metadata: Clone + Into<Self::Metadata>;
+}
+
+pub trait Projection: Subscribable {
+    const KIND: &'static str;
+}
+
+/// Stub Filters type for trybuild tests.
+pub struct Filters<S, P> {
+    _s: std::marker::PhantomData<S>,
+    _p: std::marker::PhantomData<P>,
+}
+
+impl<S, P> Filters<S, P>
+where
+    S: store::EventStore,
+    P: Subscribable<Id = S::Id>,
+{
+    pub fn new() -> Self {
+        Self {
+            _s: std::marker::PhantomData,
+            _p: std::marker::PhantomData,
+        }
+    }
 }

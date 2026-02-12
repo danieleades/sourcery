@@ -5,7 +5,7 @@
 //! 1. Load aggregate state by replaying events
 //! 2. Execute commands via [`Handle<C>`](crate::aggregate::Handle)
 //! 3. Persist resulting events transactionally
-//! 4. Build projections from event streams
+//! 4. Load projections from event streams
 //!
 //! # Quick Example
 //!
@@ -18,11 +18,8 @@
 //! // Load aggregate state
 //! let account: Account = repo.load(&id).await?;
 //!
-//! // Build a projection
-//! let report = repo.build_projection::<Report>()
-//!     .event::<ProductRestocked>()
-//!     .load()
-//!     .await?;
+//! // Load a projection
+//! let report = repo.load_projection::<Report>(&()).await?;
 //! ```
 //!
 //! See the [quickstart example](https://github.com/danieleades/sourcery/blob/main/examples/quickstart.rs)
@@ -38,9 +35,13 @@ use crate::{
     aggregate::{Aggregate, Handle},
     concurrency::{ConcurrencyConflict, ConcurrencyStrategy, Optimistic, Unchecked},
     event::{EventKind, ProjectionEvent},
-    projection::{Projection, ProjectionBuilder, ProjectionError},
+    projection::{HandlerError, Projection, ProjectionError, Subscribable},
     snapshot::{OfferSnapshotError, Snapshot, SnapshotOffer, SnapshotStore},
-    store::{CommitError, EventFilter, EventStore, OptimisticCommitError, StoredEvents},
+    store::{
+        CommitError, EventFilter, EventStore, GloballyOrderedStore, OptimisticCommitError,
+        StoredEvents,
+    },
+    subscription::{SubscribableStore, SubscriptionBuilder},
 };
 
 type LoadError<S> = ProjectionError<<S as EventStore>::Error>;
@@ -521,11 +522,8 @@ pub type OptimisticSnapshotRepository<S, SS> = Repository<S, Optimistic, SS>;
 /// // Load aggregate state
 /// let account: Account = repo.load(&id).await?;
 ///
-/// // Build projections
-/// let report = repo.build_projection::<InventoryReport>()
-///     .event::<ProductRestocked>()
-///     .load()
-///     .await?;
+/// // Load projections
+/// let report = repo.load_projection::<InventoryReport>(&()).await?;
 ///
 /// // Enable snapshots for faster loading
 /// let repo_with_snaps = repo.with_snapshots(snapshot_store);
@@ -554,7 +552,7 @@ pub type OptimisticSnapshotRepository<S, SS> = Repository<S, Optimistic, SS>;
 ///   - Complete workflow
 /// - [`execute_command()`](Self::execute_command) - Command execution
 /// - [`load()`](Self::load) - Aggregate loading
-/// - [`build_projection()`](Self::build_projection) - Projection building
+/// - [`load_projection()`](Self::load_projection) - Projection loading
 pub struct Repository<
     S,
     C = Optimistic,
@@ -607,15 +605,6 @@ where
         &self.store
     }
 
-    pub fn build_projection<P>(&self) -> ProjectionBuilder<'_, S, P, M>
-    where
-        P: Projection<Id = S::Id>,
-        P::InstanceId: Sync,
-        M: SnapshotStore<P::InstanceId, Position = S::Position>,
-    {
-        ProjectionBuilder::new(&self.store, &self.snapshots)
-    }
-
     #[must_use]
     pub fn with_snapshots<SS>(self, snapshots: SS) -> Repository<S, C, Snapshots<SS>>
     where
@@ -626,6 +615,71 @@ where
             snapshots: Snapshots(snapshots),
             _concurrency: PhantomData,
         }
+    }
+
+    /// Load a projection by replaying events (one-shot query, no snapshots).
+    ///
+    /// Filter configuration is defined centrally in the projection's
+    /// [`Subscribable`] implementation. The `instance_id` parameterizes
+    /// which events to load.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectionError`] when the store fails to load events or when
+    /// an event cannot be deserialized.
+    #[tracing::instrument(
+        skip(self, instance_id),
+        fields(
+            projection_type = std::any::type_name::<P>(),
+        )
+    )]
+    pub async fn load_projection<P>(
+        &self,
+        instance_id: &P::InstanceId,
+    ) -> Result<P, ProjectionError<S::Error>>
+    where
+        P: Subscribable<Id = S::Id>,
+        P::InstanceId: Send + Sync,
+        S::Metadata: Clone + Into<P::Metadata>,
+        M: Sync,
+    {
+        tracing::debug!("loading projection");
+
+        let filters = P::filters::<S>(instance_id);
+        let (event_filters, handlers) = filters.into_event_filters(None);
+
+        let events = self
+            .store
+            .load_events(&event_filters)
+            .await
+            .map_err(ProjectionError::Store)?;
+
+        let mut projection = P::init(instance_id);
+        let event_count = events.len();
+        tracing::debug!(
+            events_to_replay = event_count,
+            "replaying events into projection"
+        );
+
+        for stored in &events {
+            let aggregate_id = stored.aggregate_id();
+            let kind = stored.kind();
+            let metadata = stored.metadata();
+
+            if let Some(handler) = handlers.get(kind) {
+                (handler)(&mut projection, aggregate_id, stored, metadata, &self.store).map_err(
+                    |error| match error {
+                        HandlerError::Store(error) => ProjectionError::EventDecode(
+                            crate::event::EventDecodeError::Store(error),
+                        ),
+                        HandlerError::EventDecode(error) => ProjectionError::EventDecode(error),
+                    },
+                )?;
+            }
+        }
+
+        tracing::info!(events_applied = event_count, "projection loaded");
+        Ok(projection)
     }
 
     /// Load an aggregate, using snapshots when configured.
@@ -741,6 +795,113 @@ where
     }
 }
 
+impl<S, C, SS> Repository<S, C, Snapshots<SS>>
+where
+    S: EventStore + GloballyOrderedStore,
+    S::Position: Ord,
+    C: ConcurrencyStrategy,
+{
+    /// Load a projection with snapshot support.
+    ///
+    /// Loads the most recent snapshot (if available), replays events from that
+    /// position, and offers a new snapshot after loading.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectionError`] when the store fails to load events or when
+    /// an event cannot be deserialized.
+    #[tracing::instrument(
+        skip(self, instance_id),
+        fields(
+            projection_type = std::any::type_name::<P>(),
+        )
+    )]
+    pub async fn load_projection_with_snapshot<P>(
+        &self,
+        instance_id: &P::InstanceId,
+    ) -> Result<P, ProjectionError<S::Error>>
+    where
+        P: Projection<Id = S::Id> + Serialize + DeserializeOwned + Sync,
+        P::InstanceId: Send + Sync,
+        S::Metadata: Clone + Into<P::Metadata>,
+        SS: SnapshotStore<P::InstanceId, Position = S::Position>,
+    {
+        tracing::debug!("loading projection with snapshot");
+
+        let snapshot_result = self
+            .snapshots
+            .0
+            .load::<P>(P::KIND, instance_id)
+            .await
+            .inspect_err(|e| {
+                tracing::error!(error = %e, "failed to load projection snapshot");
+            })
+            .ok()
+            .flatten();
+
+        let (mut projection, snapshot_position) = if let Some(snapshot) = snapshot_result {
+            (snapshot.data, Some(snapshot.position))
+        } else {
+            (P::init(instance_id), None)
+        };
+
+        let filters = P::filters::<S>(instance_id);
+        let (event_filters, handlers) = filters.into_event_filters(snapshot_position.as_ref());
+
+        let events = self
+            .store
+            .load_events(&event_filters)
+            .await
+            .map_err(ProjectionError::Store)?;
+
+        let event_count = events.len();
+        let mut last_position = None;
+
+        for stored in &events {
+            let aggregate_id = stored.aggregate_id();
+            let kind = stored.kind();
+            let metadata = stored.metadata();
+            let position = stored.position();
+
+            if let Some(handler) = handlers.get(kind) {
+                (handler)(&mut projection, aggregate_id, stored, metadata, &self.store).map_err(
+                    |error| match error {
+                        HandlerError::Store(error) => ProjectionError::EventDecode(
+                            crate::event::EventDecodeError::Store(error),
+                        ),
+                        HandlerError::EventDecode(error) => ProjectionError::EventDecode(error),
+                    },
+                )?;
+            }
+            last_position = Some(position);
+        }
+
+        if event_count > 0
+            && let Some(position) = last_position
+        {
+            let projection_ref = &projection;
+            let offer = self.snapshots.0.offer_snapshot(
+                P::KIND,
+                instance_id,
+                event_count as u64,
+                move || -> Result<Snapshot<S::Position, &P>, std::convert::Infallible> {
+                    Ok(Snapshot {
+                        position,
+                        data: projection_ref,
+                    })
+                },
+            );
+
+            if let Err(e) = offer.await {
+                tracing::error!(error = %e, "failed to store projection snapshot");
+            }
+        }
+
+        tracing::info!(events_applied = event_count, "projection loaded");
+        Ok(projection)
+    }
+}
+
 impl<S, SS, C> Repository<S, C, Snapshots<SS>>
 where
     S: EventStore,
@@ -750,6 +911,73 @@ where
     #[must_use]
     pub const fn snapshot_store(&self) -> &SS {
         &self.snapshots.0
+    }
+}
+
+impl<S, C, M> Repository<S, C, M>
+where
+    S: EventStore,
+    C: ConcurrencyStrategy,
+{
+    /// Start a continuous subscription for a projection.
+    ///
+    /// Returns a [`SubscriptionBuilder`] that can be configured with callbacks
+    /// before starting. The subscription replays historical events first
+    /// (catch-up phase), then processes live events as they are committed.
+    ///
+    /// Subscription snapshots are disabled. Use [`subscribe_with_snapshots()`]
+    /// to provide a snapshot store for the subscription.
+    ///
+    /// [`subscribe_with_snapshots()`]: Self::subscribe_with_snapshots
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let subscription = repo
+    ///     .subscribe::<Dashboard>(())
+    ///     .on_catchup_complete(|| println!("ready"))
+    ///     .on_update(|d| println!("{d:?}"))
+    ///     .start()
+    ///     .await?;
+    /// ```
+    pub fn subscribe<P>(
+        &self,
+        instance_id: P::InstanceId,
+    ) -> SubscriptionBuilder<S, P, crate::snapshot::NoSnapshots<S::Position>>
+    where
+        S: SubscribableStore + Clone + 'static,
+        S::Position: Ord,
+        P: Projection<Id = S::Id> + Serialize + DeserializeOwned + Send + Sync + 'static,
+        P::InstanceId: Clone + Send + Sync + 'static,
+        P::Metadata: Send,
+        S::Metadata: Clone + Into<P::Metadata>,
+    {
+        SubscriptionBuilder::new(
+            self.store.clone(),
+            crate::snapshot::NoSnapshots::new(),
+            instance_id,
+        )
+    }
+
+    /// Start a continuous subscription with an explicit snapshot store.
+    ///
+    /// The snapshot store is keyed by `P::InstanceId` and tracks the
+    /// subscription's position for faster restart.
+    pub fn subscribe_with_snapshots<P, SS>(
+        &self,
+        instance_id: P::InstanceId,
+        snapshots: SS,
+    ) -> SubscriptionBuilder<S, P, SS>
+    where
+        S: SubscribableStore + Clone + 'static,
+        S::Position: Ord,
+        P: Projection<Id = S::Id> + Serialize + DeserializeOwned + Send + Sync + 'static,
+        P::InstanceId: Clone + Send + Sync + 'static,
+        P::Metadata: Send,
+        S::Metadata: Clone + Into<P::Metadata>,
+        SS: SnapshotStore<P::InstanceId, Position = S::Position> + Send + Sync + 'static,
+    {
+        SubscriptionBuilder::new(self.store.clone(), snapshots, instance_id)
     }
 }
 

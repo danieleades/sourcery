@@ -1,8 +1,8 @@
-//! Advanced projection example using the builder API directly.
+//! Advanced projection example using the `Subscribable` trait.
 //!
 //! This example demonstrates how to compose a projection that mixes
 //! global and scoped event subscriptions without relying on the
-//! aggregate event enums. We manually register:
+//! aggregate event enums. The `Subscribable` impl registers:
 //!
 //! - All `ProductRestocked` events (global)
 //! - `InventoryAdjusted` events scoped to a specific product SKU
@@ -13,7 +13,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use sourcery::{
-    Aggregate, Apply, ApplyProjection, DomainEvent, Repository, store::inmemory,
+    Aggregate, Apply, ApplyProjection, DomainEvent, Filters, Repository, Subscribable,
+    store::{EventStore, inmemory},
     test::RepositoryTestExt,
 };
 
@@ -92,15 +93,45 @@ impl Apply<PromotionApplied> for Promotion {
 }
 
 // =============================================================================
-// Manual projection
+// Projection with mixed global/scoped filters
 // =============================================================================
 
+/// Parameters for the `ProductSummary` projection instance.
+///
+/// Captures the aggregate IDs needed for scoped event subscriptions.
+struct ProductSummaryParams {
+    product: String,
+    sale: String,
+    promotion: String,
+}
+
 #[derive(Debug, Default, sourcery::Projection)]
-#[projection(id = String)]
 struct ProductSummary {
     stock_levels: HashMap<String, i64>,
     sales: HashMap<String, i64>,
     promotion_totals: HashMap<String, i64>,
+}
+
+impl Subscribable for ProductSummary {
+    type Id = String;
+    type InstanceId = ProductSummaryParams;
+    type Metadata = ();
+
+    fn init(_params: &ProductSummaryParams) -> Self {
+        Self::default()
+    }
+
+    fn filters<S>(params: &ProductSummaryParams) -> Filters<S, Self>
+    where
+        S: EventStore<Id = String>,
+        S::Metadata: Clone + Into<()>,
+    {
+        Filters::new()
+            .event::<ProductRestocked>() // global restocks
+            .event_for::<Product, InventoryAdjusted>(&params.product)
+            .event_for::<Sale, SaleCompleted>(&params.sale)
+            .event_for::<Promotion, PromotionApplied>(&params.promotion)
+    }
 }
 
 impl ApplyProjection<ProductRestocked> for ProductSummary {
@@ -206,14 +237,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?;
 
-    // Build the projection with mixed filters.
+    // Load the projection using the centralized filter configuration.
+    let params = ProductSummaryParams {
+        product: product_id.clone(),
+        sale: sale_id.clone(),
+        promotion: promotion_id.clone(),
+    };
     let summary = repository
-        .build_projection::<ProductSummary>()
-        .event::<ProductRestocked>() // global restocks
-        .event_for::<Product, InventoryAdjusted>(&product_id)
-        .event_for::<Sale, SaleCompleted>(&sale_id)
-        .event_for::<Promotion, PromotionApplied>(&promotion_id)
-        .load()
+        .load_projection::<ProductSummary>(&params)
         .await?;
 
     println!("Product summary: {summary:#?}");

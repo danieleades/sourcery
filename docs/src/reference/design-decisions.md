@@ -64,7 +64,7 @@ trait CommandBus {
 
 ## Event Serialization in Stores
 
-**Decision**: EventStore implementations handle serialization, not a separate Codec trait. The generated event enum provides a method to access the inner event for serialization.
+**Decision**: EventStore implementations handle serialization, not a separate Codec trait. The generated event enum implements `serde::Serialize` with custom logic that serializes only the inner event struct.
 
 **Why**:
 - Eliminates unnecessary abstraction layer (Codec trait)
@@ -74,34 +74,31 @@ trait CommandBus {
 
 **How it works**:
 ```rust,ignore
-// The Aggregate macro generates an event enum with a helper method
+// The Aggregate macro generates an event enum
 #[derive(Aggregate)]
-#[aggregate(id = String)]
+#[aggregate(id = String, error = String, events(FundsDeposited, FundsWithdrawn))]
 struct Account { /* ... */ }
 
 // Generated code (simplified):
 enum AccountEvent {
-    Deposited(FundsDeposited),
-    Withdrawn(FundsWithdrawn),
+    FundsDeposited(FundsDeposited),
+    FundsWithdrawn(FundsWithdrawn),
 }
 
-// Generated helper trait for type-erased serialization
-trait SerializableEvent {
-    fn serialize_event(&self) -> Result<serde_json::Value, serde_json::Error>;
-}
-
-impl SerializableEvent for AccountEvent {
-    fn serialize_event(&self) -> Result<serde_json::Value, serde_json::Error> {
+// Generated Serialize impl — serializes only the inner event
+impl serde::Serialize for AccountEvent {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where S: serde::Serializer {
         match self {
-            Self::Deposited(e) => serde_json::to_value(e),
-            Self::Withdrawn(e) => serde_json::to_value(e),
+            Self::FundsDeposited(inner) => inner.serialize(serializer),
+            Self::FundsWithdrawn(inner) => inner.serialize(serializer),
         }
     }
 }
 
-// EventStore uses kind() and serialize_event() together
-// - kind() tells which event type it is ("funds-deposited")
-// - serialize_event() serializes just the inner event data
+// EventStore uses kind() for routing and serde::Serialize for data
+// - kind() returns the event type identifier ("account.deposited")
+// - Serialize serializes just the inner event data
 ```
 
 **Event versioning**: Use serde attributes on the event structs themselves:
@@ -127,8 +124,23 @@ struct FundsDeposited {
 ```rust,ignore
 // Projection consumes from multiple aggregates
 #[derive(Default, sourcery::Projection)]
-#[projection(id = String, kind = "dashboard")]
-struct Dashboard;
+#[projection(kind = "dashboard")]
+struct Dashboard { /* ... */ }
+
+impl Subscribable for Dashboard {
+    type Id = String;
+    type InstanceId = ();
+    type Metadata = ();
+    fn init((): &()) -> Self { Self::default() }
+    fn filters<S>((): &()) -> Filters<S, Self>
+    where S: EventStore<Id = String>, S::Metadata: Clone + Into<()> {
+        Filters::new()
+            .event::<OrderPlaced>()
+            .event::<PaymentReceived>()
+            .event::<ShipmentDispatched>()
+    }
+}
+
 impl ApplyProjection<OrderPlaced> for Dashboard { /* ... */ }
 impl ApplyProjection<PaymentReceived> for Dashboard { /* ... */ }
 impl ApplyProjection<ShipmentDispatched> for Dashboard { /* ... */ }

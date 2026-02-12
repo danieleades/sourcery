@@ -18,10 +18,14 @@ default = []
 test-util = []
 
 [dependencies]
+async-stream = "0.3"
+futures-core = { version = "0.3", default-features = false }
 nonempty = "0.10"
 serde = { version = "1", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
 thiserror = { version = "2", default-features = false, features = ["std"] }
+tokio = { version = "1", default-features = false, features = ["sync", "rt", "macros"] }
+tokio-stream = { version = "0.1", default-features = false }
 tracing = { version = "0.1", default-features = false, features = ["attributes", "std"] }
 
 [dev-dependencies]

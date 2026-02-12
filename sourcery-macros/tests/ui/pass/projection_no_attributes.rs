@@ -7,20 +7,16 @@ pub use support::{codec, store, Aggregate, Apply, Filters, Projection, Subscriba
 
 use sourcery_macros::Projection;
 
-#[derive(Projection)]
-pub struct AccountLedger<'a, T: 'static> {
-    marker: std::marker::PhantomData<&'a T>,
-}
+#[derive(Default, Projection)]
+pub struct AccountLedger {}
 
-impl<'a, T: 'static> Subscribable for AccountLedger<'a, T> {
+impl Subscribable for AccountLedger {
     type Id = String;
     type InstanceId = ();
     type Metadata = ();
 
     fn init(_instance_id: &Self::InstanceId) -> Self {
-        Self {
-            marker: std::marker::PhantomData,
-        }
+        Self::default()
     }
 
     fn filters<S>(_instance_id: &Self::InstanceId) -> Filters<S, Self>

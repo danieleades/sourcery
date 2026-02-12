@@ -47,7 +47,7 @@ serde = { version = "1", default-features = false, features = ["derive", "std"] 
 serde_json = { version = "1", default-features = false, features = ["std"] }
 serde-evolve = "0.1.0"
 thiserror = { version = "2", default-features = false, features = ["std"] }
-tokio = { version = "1", default-features = false, features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", default-features = false, features = ["macros", "rt-multi-thread", "time"] }
 tracing = { version = "0.1", default-features = false, features = ["attributes", "std"] }
 
 [[example]]

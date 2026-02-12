@@ -2,7 +2,7 @@
 //!
 //! Demonstrates the event envelope pattern with pure domain events and
 //! composite aggregate IDs, using the `#[derive(Aggregate)]` macro and the
-//! manual `ProjectionBuilder` API.
+//! `Subscribable` trait.
 //! - **Product aggregate**: Manages inventory with simple string IDs (SKU)
 //! - **Sale aggregate**: Records sales with composite IDs (`SaleId {
 //!   product_sku, sale_number }`)
@@ -16,8 +16,8 @@
 //! - **Shared ID type**: All aggregates in a store must share the same ID type
 //!   (`String`), but domain code can use stronger types like `SaleId` that
 //!   convert to/from the storage format
-//! - **`ApplyProjection` + builder**: Projections access `aggregate_kind`,
-//!   `aggregate_id`, and metadata
+//! - **`ApplyProjection` + `Subscribable`**: Projections access
+//!   `aggregate_kind`, `aggregate_id`, and metadata
 //! - **External IDs**: Aggregates treat IDs as infrastructure metadata supplied
 //!   by the repository
 
@@ -25,7 +25,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use sourcery::{
-    Aggregate, Apply, ApplyProjection, DomainEvent, Handle, Repository, store::inmemory,
+    Aggregate, Apply, ApplyProjection, DomainEvent, Filters, Handle, Repository, Subscribable,
+    store::{EventStore, inmemory},
 };
 
 // =============================================================================
@@ -247,11 +248,10 @@ impl Handle<RefundSale> for Sale {
 }
 
 // =============================================================================
-// Projection constructed manually through ProjectionBuilder
+// Projection with centralized filter configuration
 // =============================================================================
 
 #[derive(Debug, Default, sourcery::Projection)]
-#[projection(id = String)]
 pub struct InventoryReport {
     pub total_products_restocked: i64,
     pub total_items_in_stock: i64,
@@ -268,6 +268,28 @@ pub struct ProductStats {
     pub unit_price_cents: i64,
     pub times_restocked: i64,
     pub units_sold: i64,
+}
+
+impl Subscribable for InventoryReport {
+    type Id = String;
+    type InstanceId = ();
+    type Metadata = ();
+
+    fn init((): &()) -> Self {
+        Self::default()
+    }
+
+    fn filters<S>((): &()) -> Filters<S, Self>
+    where
+        S: EventStore<Id = String>,
+        S::Metadata: Clone + Into<()>,
+    {
+        Filters::new()
+            .event::<ProductRestocked>()
+            .event::<InventoryAdjusted>()
+            .event::<SaleCompleted>()
+            .event::<SaleRefunded>()
+    }
 }
 
 // ApplyProjection implementations - for events that need stream context
@@ -462,14 +484,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Load global report
     println!("\n6. Loading global inventory report...\n");
-    let report = repository
-        .build_projection::<InventoryReport>()
-        .event::<ProductRestocked>()
-        .event::<InventoryAdjusted>()
-        .event::<SaleCompleted>()
-        .event::<SaleRefunded>()
-        .load()
-        .await?;
+    let report = repository.load_projection::<InventoryReport>(&()).await?;
 
     // Display report
     println!("=== INVENTORY REPORT ===");

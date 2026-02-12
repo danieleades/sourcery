@@ -6,7 +6,10 @@
 
 // ANCHOR: full_example
 use serde::{Deserialize, Serialize};
-use sourcery::{Apply, ApplyProjection, DomainEvent, Handle, Repository, store::inmemory};
+use sourcery::{
+    Apply, ApplyProjection, DomainEvent, Filters, Handle, Repository, Subscribable,
+    store::{EventStore, inmemory},
+};
 
 // ANCHOR: events
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,9 +59,26 @@ impl Handle<Deposit> for Account {
 
 // ANCHOR: projection
 #[derive(Debug, Default, sourcery::Projection)]
-#[projection(id = String)]
 pub struct TotalDeposits {
     pub total: i64,
+}
+
+impl Subscribable for TotalDeposits {
+    type Id = String;
+    type InstanceId = ();
+    type Metadata = ();
+
+    fn init((): &()) -> Self {
+        Self::default()
+    }
+
+    fn filters<S>((): &()) -> Filters<S, Self>
+    where
+        S: EventStore<Id = String>,
+        S::Metadata: Clone + Into<()>,
+    {
+        Filters::new().event::<FundsDeposited>()
+    }
 }
 
 impl ApplyProjection<FundsDeposited> for TotalDeposits {
@@ -80,12 +100,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .execute_command::<Account, Deposit>(&"ACC-001".to_string(), &Deposit { amount: 100 }, &())
         .await?;
 
-    // Build a projection
-    let totals = repository
-        .build_projection::<TotalDeposits>()
-        .event::<FundsDeposited>()
-        .load()
-        .await?;
+    // Load a projection
+    let totals = repository.load_projection::<TotalDeposits>(&()).await?;
 
     println!("Total deposits: {}", totals.total);
     assert_eq!(totals.total, 100);
