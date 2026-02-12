@@ -302,10 +302,21 @@ where
 
             let mut stream = store.subscribe(&live_filters, last_position.clone());
 
-            // Fire catch-up callback now that the live stream is attached.
-            // Any events committed during the gap between load_events and
-            // subscribe will be delivered by the stream and deduplicated.
-            if (catchup_target_position.is_none() || last_position >= catchup_target_position)
+            // Determine the effective catch-up target by querying the store
+            // after the live stream is attached. This captures any events
+            // committed during the gap between the initial load_events and
+            // subscribe — those events are buffered in the stream and must
+            // be applied before the projection is truly current.
+            let catchup_target = store
+                .load_events(&live_filters)
+                .await
+                .map_err(SubscriptionError::Store)?
+                .last()
+                .map(|e| e.position.clone())
+                .or(catchup_target_position);
+
+            // If already caught up (no pending gap events), fire immediately
+            if (catchup_target.is_none() || last_position >= catchup_target)
                 && let Some(callback) = on_catchup_complete.take()
             {
                 callback();
@@ -342,11 +353,10 @@ where
                         events_since_snapshot += 1;
 
                         // Fire catch-up complete once we've processed past the
-                        // target position (handles gap events between load_events
-                        // and subscribe)
+                        // effective target (includes gap events)
                         if on_catchup_complete.is_some()
-                            && (catchup_target_position.is_none()
-                                || last_position >= catchup_target_position)
+                            && (catchup_target.is_none()
+                                || last_position >= catchup_target)
                             && let Some(callback) = on_catchup_complete.take()
                         {
                             callback();
