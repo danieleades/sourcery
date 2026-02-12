@@ -53,30 +53,15 @@ Each event produced by the command receives this metadata.
 
 ## Accessing Metadata in Projections
 
-Set the `Metadata` associated type on `Subscribable` and receive it in `ApplyProjection`:
+Set metadata in the derive attribute and receive it in `ApplyProjection`:
 
 ```rust,ignore
-use sourcery::{ApplyProjection, Filters, Subscribable, store::EventStore};
+use sourcery::ApplyProjection;
 
 #[derive(Debug, Default, sourcery::Projection)]
+#[projection(metadata = EventMetadata, events(FundsDeposited))]
 pub struct AuditLog {
     pub entries: Vec<AuditEntry>,
-}
-
-impl Subscribable for AuditLog {
-    type Id = String;
-    type InstanceId = ();
-    type Metadata = EventMetadata;
-
-    fn init((): &()) -> Self { Self::default() }
-
-    fn filters<S>((): &()) -> Filters<S, Self>
-    where
-        S: EventStore<Id = String>,
-        S::Metadata: Clone + Into<EventMetadata>,
-    {
-        Filters::new().event::<FundsDeposited>()
-    }
 }
 
 impl ApplyProjection<FundsDeposited> for AuditLog {
@@ -96,7 +81,7 @@ impl ApplyProjection<FundsDeposited> for AuditLog {
 }
 ```
 
-The store's metadata type must implement `Into<P::Metadata>`. When they're the same type, this is automatic.
+Projection handlers use the same metadata type as the store for that repository.
 
 ## Correlation and Causation
 
@@ -140,44 +125,11 @@ Projections with `type Metadata = ()` ignore the metadata parameter.
 
 Events should be understandable without metadata. Metadata enhances observability.
 
-## Example: Multi-Tenant Metadata
+## Example: Multi-Tenant Filtering
+
+Metadata enables tenant-scoped projections. With `type Metadata = TenantMetadata` on `ProjectionFilters`, the handler can filter by tenant:
 
 ```rust,ignore
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct TenantMetadata {
-    pub tenant_id: String,
-    pub user_id: String,
-    pub request_id: String,
-}
-
-#[derive(Default, sourcery::Projection)]
-pub struct TenantDashboard {
-    tenant_id: String,
-    order_count: u64,
-    total_revenue: i64,
-}
-
-impl Subscribable for TenantDashboard {
-    type Id = String;
-    type InstanceId = String;
-    type Metadata = TenantMetadata;
-
-    fn init(tenant_id: &String) -> Self {
-        Self {
-            tenant_id: tenant_id.clone(),
-            ..Self::default()
-        }
-    }
-
-    fn filters<S>(_tenant_id: &String) -> Filters<S, Self>
-    where
-        S: EventStore<Id = String>,
-        S::Metadata: Clone + Into<TenantMetadata>,
-    {
-        Filters::new().event::<OrderPlaced>()
-    }
-}
-
 impl ApplyProjection<OrderPlaced> for TenantDashboard {
     fn apply_projection(
         &mut self,
@@ -185,7 +137,6 @@ impl ApplyProjection<OrderPlaced> for TenantDashboard {
         event: &OrderPlaced,
         meta: &Self::Metadata,
     ) {
-        // Only count orders for our tenant
         if meta.tenant_id == self.tenant_id {
             self.order_count += 1;
             self.total_revenue += event.total;
@@ -193,6 +144,8 @@ impl ApplyProjection<OrderPlaced> for TenantDashboard {
     }
 }
 ```
+
+The projection follows the same pattern shown in [Accessing Metadata in Projections](#accessing-metadata-in-projections), with `instance_id = String` if each tenant needs its own projection instance.
 
 ## Next
 

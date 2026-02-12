@@ -1,6 +1,11 @@
 # Stores
 
-The crate separates storage concerns into two traits: `EventStore` for event persistence and `SnapshotStore` for aggregate snapshots. Serialization is handled internally by stores using `serde`.
+The crate separates storage concerns into two traits:
+
+- `EventStore` for event persistence
+- `SnapshotStore` for aggregate/projection snapshots
+
+Stores own serialisation and deserialisation.
 
 ## The `EventStore` Trait
 
@@ -15,72 +20,57 @@ For testing and prototyping:
 ```rust,ignore
 use sourcery::store::inmemory;
 
-// With unit metadata
+// Unit metadata
 let store: inmemory::Store<String, ()> = inmemory::Store::new();
 
-// With custom metadata
+// Custom metadata
 let store: inmemory::Store<String, MyMetadata> = inmemory::Store::new();
 ```
 
-Uses JSON serialization via `serde_json` and deduplicates overlapping filters when loading.
+The in-memory store uses `serde_json` and supports globally ordered positions.
 
 ## Committing Events
-
-Events are committed atomically using one of two methods:
 
 ```rust,ignore
 use nonempty::NonEmpty;
 
-// Without version checking (last-writer-wins)
 let events = NonEmpty::singleton(my_event);
-let result = store
-    .commit_events("account", &account_id, events, &metadata)
-    .await?;
 
-// With optimistic concurrency control
-let events = NonEmpty::singleton(my_event);
-let result = store
+// Unchecked (last-writer-wins)
+store.commit_events("account", &account_id, events.clone(), &metadata).await?;
+
+// Optimistic concurrency
+store
     .commit_events_optimistic("account", &account_id, Some(expected_version), events, &metadata)
     .await?;
 ```
 
-The `commit_events_optimistic` method fails with a `ConcurrencyConflict` if:
-- `expected_version` is `Some(v)` and the current stream version differs
-- `expected_version` is `None` and the stream already has events
+`commit_events_optimistic` fails with `ConcurrencyConflict` when the expected and actual stream versions differ.
 
-## Event Filters
-
-Control which events to load:
+## Loading Events with Filters
 
 ```rust,ignore
-// All events of a specific kind (across all aggregates)
+// All events of one kind
 EventFilter::for_event("account.deposited")
 
-// All events for a specific aggregate instance
+// One aggregate instance
 EventFilter::for_aggregate("account.deposited", "account", "ACC-001")
 
-// Events after a position (for incremental loading)
+// Incremental loading
 EventFilter::for_event("account.deposited").after(100)
 ```
 
-## Event Types
+## `StoredEvent` in Practice
 
-### `StoredEvent<Id, Pos, Data, M>`
+`load_events` returns `StoredEvent<Id, Pos, Data, Metadata>`, containing:
 
-An event loaded from the store. Contains the serialized data plus store-assigned metadata. Use `EventStore::decode_event()` to deserialize back to a domain event.
+- envelope fields (`aggregate_kind`, `aggregate_id`, `kind`, `position`)
+- serialised payload (`data`)
+- metadata (`metadata`)
 
-```rust,ignore
-pub struct StoredEvent<Id, Pos, Data, M> {
-    pub aggregate_kind: String,  // Aggregate type identifier
-    pub aggregate_id: Id,        // Aggregate instance identifier
-    pub kind: String,            // Event type identifier
-    pub position: Pos,           // Global position assigned by store
-    pub data: Data,              // Serialized event payload
-    pub metadata: M,             // Infrastructure metadata
-}
-```
+Use `EventStore::decode_event()` to deserialise payloads into domain events.
 
-The `Data` type is generic over the serialization format (e.g., `serde_json::Value` for JSON stores). Store implementations specify their concrete type through the `EventStore::Data` associated type.
+For the exact field layout, see API docs for `StoredEvent`.
 
 ## The `SnapshotStore` Trait
 
@@ -88,11 +78,11 @@ The `Data` type is generic over the serialization format (e.g., `serde_json::Val
 {{#include ../../../sourcery-core/src/snapshot.rs:snapshot_store_trait}}
 ```
 
-See [Snapshots](../advanced/snapshots.md) for details.
+See [Snapshots](../advanced/snapshots.md) for policy and usage guidance.
 
 ## Implementing a Custom Store
 
-See [Custom Stores](../advanced/custom-stores.md) for a guide on implementing `EventStore` for your database.
+See [Custom Stores](../advanced/custom-stores.md) for a practical guide.
 
 ## Next
 

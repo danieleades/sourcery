@@ -10,14 +10,13 @@
 //! A subscription:
 //! 1. Replays historical events (catch-up phase)
 //! 2. Transitions to processing live events as they are committed
-//! 3. Fires callbacks on each update and when catch-up completes
+//! 3. Fires callbacks on each update
 //!
 //! # Example
 //!
 //! ```ignore
 //! let subscription = repository
 //!     .subscribe::<Dashboard>(())
-//!     .on_catchup_complete(|| println!("ready"))
 //!     .on_update(|dashboard| println!("{dashboard:?}"))
 //!     .start()
 //!     .await?;
@@ -28,7 +27,7 @@
 //!
 //! [`Repository::load_projection`]: crate::repository::Repository::load_projection
 
-use std::pin::Pin;
+use std::{collections::HashMap, pin::Pin};
 
 use futures_core::Stream;
 use serde::{Serialize, de::DeserializeOwned};
@@ -38,7 +37,7 @@ use tokio_stream::StreamExt as _;
 
 use crate::{
     event::EventDecodeError,
-    projection::{HandlerError, Projection, Subscribable},
+    projection::{HandlerError, Projection, ProjectionFilters},
     snapshot::{Snapshot, SnapshotStore},
     store::{EventFilter, EventStore, GloballyOrderedStore, StoredEvent},
 };
@@ -106,6 +105,9 @@ where
     /// An event could not be decoded.
     #[error("failed to decode event: {0}")]
     EventDecode(#[source] EventDecodeError<StoreError>),
+    /// The subscription ended before completing catch-up.
+    #[error("subscription ended before catch-up completed")]
+    CatchupInterrupted,
     /// The subscription task panicked.
     #[error("subscription task panicked")]
     TaskPanicked,
@@ -113,8 +115,8 @@ where
 
 /// Handle to a running subscription.
 ///
-/// Dropping the handle does **not** stop the subscription. Call [`stop()`] for
-/// graceful shutdown.
+/// Dropping the handle sends a best-effort stop signal. Call [`stop()`] for
+/// graceful shutdown and to observe task errors.
 ///
 /// [`stop()`]: SubscriptionHandle::stop
 pub struct SubscriptionHandle<StoreError>
@@ -122,7 +124,7 @@ where
     StoreError: std::error::Error + 'static,
 {
     stop_tx: Option<tokio::sync::oneshot::Sender<()>>,
-    task: JoinHandle<Result<(), SubscriptionError<StoreError>>>,
+    task: Option<JoinHandle<Result<(), SubscriptionError<StoreError>>>>,
 }
 
 impl<StoreError> SubscriptionHandle<StoreError>
@@ -134,19 +136,41 @@ where
     /// # Errors
     ///
     /// Returns the subscription's error if it failed before being stopped.
+    #[allow(clippy::missing_panics_doc)]
     pub async fn stop(mut self) -> Result<(), SubscriptionError<StoreError>> {
+        // By taking the tx, we ensure Drop won't try to send it again.
         if let Some(tx) = self.stop_tx.take() {
             let _ = tx.send(());
         }
-        self.task
-            .await
-            .map_err(|_| SubscriptionError::TaskPanicked)?
+
+        // Taking the task ensures that is_running() returns false from here on.
+        if let Some(task) = self.task.take() {
+            return task.await.map_err(|_| SubscriptionError::TaskPanicked)?;
+        }
+
+        Ok(())
     }
 
     /// Check if the subscription task is still running.
     #[must_use]
     pub fn is_running(&self) -> bool {
-        !self.task.is_finished()
+        self.task.as_ref().is_some_and(|task| !task.is_finished())
+    }
+}
+
+impl<StoreError> Drop for SubscriptionHandle<StoreError>
+where
+    StoreError: std::error::Error + 'static,
+{
+    fn drop(&mut self) {
+        if self.is_running() {
+            tracing::warn!(
+                "subscription handle dropped without stop(); signaling background task to stop"
+            );
+            if let Some(tx) = self.stop_tx.take() {
+                let _ = tx.send(());
+            }
+        }
     }
 }
 
@@ -155,24 +179,21 @@ type UpdateCallback<P> = Box<dyn Fn(&P) + Send + Sync + 'static>;
 
 /// Builder for configuring and starting a subscription.
 ///
-/// Created via [`Repository::subscribe()`]. Use [`on_update()`] and
-/// [`on_catchup_complete()`] to register callbacks, then call [`start()`] to
-/// begin processing events.
+/// Created via [`Repository::subscribe()`]. Use [`on_update()`] to register
+/// callbacks, then call [`start()`] to begin processing events.
 ///
 /// [`Repository::subscribe()`]: crate::repository::Repository::subscribe
 /// [`on_update()`]: SubscriptionBuilder::on_update
-/// [`on_catchup_complete()`]: SubscriptionBuilder::on_catchup_complete
 /// [`start()`]: SubscriptionBuilder::start
 pub struct SubscriptionBuilder<S, P, SS>
 where
     S: EventStore,
-    P: Subscribable,
+    P: ProjectionFilters,
 {
     store: S,
     snapshots: SS,
     instance_id: P::InstanceId,
     on_update: Option<UpdateCallback<P>>,
-    on_catchup_complete: Option<Box<dyn FnOnce() + Send + 'static>>,
 }
 
 impl<S, P, SS> SubscriptionBuilder<S, P, SS>
@@ -180,8 +201,14 @@ where
     S: SubscribableStore + Clone + Send + Sync + 'static,
     S::Position: Ord + Send + Sync,
     S::Data: Send,
-    S::Metadata: Clone + Send + Sync + Into<P::Metadata>,
-    P: Projection<Id = S::Id> + Serialize + DeserializeOwned + Send + Sync + 'static,
+    S::Metadata: Send + Sync,
+    P: Projection
+        + ProjectionFilters<Id = S::Id, Metadata = S::Metadata>
+        + Serialize
+        + DeserializeOwned
+        + Send
+        + Sync
+        + 'static,
     P::InstanceId: Clone + Send + Sync + 'static,
     P::Metadata: Send,
     SS: SnapshotStore<P::InstanceId, Position = S::Position> + Send + Sync + 'static,
@@ -192,7 +219,6 @@ where
             snapshots,
             instance_id,
             on_update: None,
-            on_catchup_complete: None,
         }
     }
 
@@ -210,28 +236,16 @@ where
         self
     }
 
-    /// Register a one-shot callback fired when the catch-up phase completes
-    /// and the subscription transitions to processing live events.
-    ///
-    /// Useful for signalling readiness (e.g., start serving traffic only
-    /// after the projection is current).
-    #[must_use]
-    pub fn on_catchup_complete<F>(mut self, callback: F) -> Self
-    where
-        F: FnOnce() + Send + 'static,
-    {
-        self.on_catchup_complete = Some(Box::new(callback));
-        self
-    }
-
     /// Start the subscription.
+    ///
+    /// This method returns only after catch-up completes.
     ///
     /// Spawns a background task that:
     /// 1. Loads the most recent snapshot (if available)
     /// 2. Subscribes to the event stream from the snapshot position
     /// 3. Replays historical events (catch-up phase)
-    /// 4. Transitions to live events, firing `on_catchup_complete`
-    /// 5. Applies each event and fires `on_update`
+    /// 4. Waits until catch-up is complete
+    /// 5. Continues processing live events and firing `on_update`
     ///
     /// # Errors
     ///
@@ -243,7 +257,6 @@ where
             snapshots,
             instance_id,
             on_update,
-            mut on_catchup_complete,
         } = self;
 
         let (mut projection, snapshot_position) =
@@ -265,16 +278,15 @@ where
         let mut events_since_snapshot: u64 = 0;
 
         for stored in &current_events {
-            let kind = stored.kind();
-            if let Some(handler) = handlers.get(kind) {
-                apply_handler(handler, &mut projection, stored, &store)?;
-            }
-            last_position = Some(stored.position());
-            events_since_snapshot += 1;
-
-            if let Some(ref callback) = on_update {
-                callback(&projection);
-            }
+            process_subscription_event(
+                &mut projection,
+                stored,
+                &handlers,
+                &store,
+                on_update.as_ref(),
+                &mut last_position,
+                &mut events_since_snapshot,
+            )?;
         }
 
         // Offer snapshot after catch-up (preserve counter if declined)
@@ -294,8 +306,17 @@ where
 
         // Spawn live subscription task
         let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
 
         let task = tokio::spawn(async move {
+            let mut ready_tx = Some(ready_tx);
+
+            let signal_ready = |ready_tx: &mut Option<tokio::sync::oneshot::Sender<()>>| {
+                if let Some(tx) = ready_tx.take() {
+                    let _ = tx.send(());
+                }
+            };
+
             // Build filters for live stream from our current position
             let filters = P::filters::<S>(&instance_id);
             let (live_filters, handlers) = filters.into_event_filters(last_position.as_ref());
@@ -315,11 +336,9 @@ where
                 .map(|e| e.position.clone())
                 .or(catchup_target_position);
 
-            // If already caught up (no pending gap events), fire immediately
-            if (catchup_target.is_none() || last_position >= catchup_target)
-                && let Some(callback) = on_catchup_complete.take()
-            {
-                callback();
+            // If already caught up (no pending gap events), signal immediately.
+            if catchup_target.is_none() || last_position >= catchup_target {
+                signal_ready(&mut ready_tx);
             }
 
             loop {
@@ -344,28 +363,20 @@ where
                             continue;
                         }
 
-                        let kind = stored.kind();
-                        if let Some(handler) = handlers.get(kind) {
-                            apply_handler(handler, &mut projection, &stored, &store)?;
-                        }
+                        process_subscription_event(
+                            &mut projection,
+                            &stored,
+                            &handlers,
+                            &store,
+                            on_update.as_ref(),
+                            &mut last_position,
+                            &mut events_since_snapshot,
+                        )?;
 
-                        last_position = Some(stored.position());
-                        events_since_snapshot += 1;
-
-                        if let Some(ref callback) = on_update {
-                            callback(&projection);
-                        }
-
-                        // Fire catch-up complete once we've processed past the
-                        // effective target (includes gap events). This fires
-                        // after on_update so state is published before readiness
-                        // is signaled.
-                        if on_catchup_complete.is_some()
-                            && (catchup_target.is_none()
-                                || last_position >= catchup_target)
-                            && let Some(callback) = on_catchup_complete.take()
-                        {
-                            callback();
+                        // Signal catch-up completion once we've processed
+                        // past the effective target (includes gap events).
+                        if catchup_target.is_none() || last_position >= catchup_target {
+                            signal_ready(&mut ready_tx);
                         }
 
                         // Periodically offer snapshots
@@ -403,10 +414,17 @@ where
             Ok(())
         });
 
-        Ok(SubscriptionHandle {
-            stop_tx: Some(stop_tx),
-            task,
-        })
+        match ready_rx.await {
+            Ok(()) => Ok(SubscriptionHandle {
+                stop_tx: Some(stop_tx),
+                task: Some(task),
+            }),
+            Err(_) => match task.await {
+                Ok(Ok(())) => Err(SubscriptionError::CatchupInterrupted),
+                Ok(Err(error)) => Err(error),
+                Err(_) => Err(SubscriptionError::TaskPanicked),
+            },
+        }
     }
 }
 
@@ -415,7 +433,7 @@ async fn load_snapshot<P, SS>(
     instance_id: &P::InstanceId,
 ) -> (P, Option<SS::Position>)
 where
-    P: Projection + DeserializeOwned,
+    P: Projection + ProjectionFilters + DeserializeOwned,
     P::InstanceId: Sync,
     SS: SnapshotStore<P::InstanceId>,
 {
@@ -442,7 +460,7 @@ fn apply_handler<P, S>(
     store: &S,
 ) -> Result<(), SubscriptionError<S::Error>>
 where
-    P: Subscribable<Id = S::Id>,
+    P: ProjectionFilters<Id = S::Id>,
     S: EventStore,
 {
     (handler)(
@@ -460,6 +478,34 @@ where
     })
 }
 
+fn process_subscription_event<P, S>(
+    projection: &mut P,
+    stored: &StoredEvent<S::Id, S::Position, S::Data, S::Metadata>,
+    handlers: &HashMap<&'static str, crate::projection::EventHandler<P, S>>,
+    store: &S,
+    on_update: Option<&UpdateCallback<P>>,
+    last_position: &mut Option<S::Position>,
+    events_since_snapshot: &mut u64,
+) -> Result<(), SubscriptionError<S::Error>>
+where
+    P: ProjectionFilters<Id = S::Id>,
+    S: EventStore,
+    S::Position: Clone,
+{
+    if let Some(handler) = handlers.get(stored.kind()) {
+        apply_handler(handler, projection, stored, store)?;
+    }
+
+    *last_position = Some(stored.position());
+    *events_since_snapshot += 1;
+
+    if let Some(callback) = on_update {
+        callback(projection);
+    }
+
+    Ok(())
+}
+
 async fn offer_projection_snapshot<P, SS>(
     snapshots: &SS,
     instance_id: &P::InstanceId,
@@ -468,7 +514,7 @@ async fn offer_projection_snapshot<P, SS>(
     projection: &P,
 ) -> bool
 where
-    P: Projection + Serialize + Sync,
+    P: Projection + ProjectionFilters + Serialize + Sync,
     P::InstanceId: Sync,
     SS: SnapshotStore<P::InstanceId>,
     SS::Position: Clone,
@@ -515,5 +561,14 @@ mod tests {
     fn subscription_error_task_panicked_displays() {
         let err: SubscriptionError<io::Error> = SubscriptionError::TaskPanicked;
         assert!(err.to_string().contains("panicked"));
+    }
+
+    #[test]
+    fn subscription_not_alive_after_stop_consumes_task_handle() {
+        let handle: SubscriptionHandle<io::Error> = SubscriptionHandle {
+            stop_tx: None,
+            task: None,
+        };
+        assert!(!handle.is_running());
     }
 }

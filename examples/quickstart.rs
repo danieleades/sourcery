@@ -6,10 +6,7 @@
 
 // ANCHOR: full_example
 use serde::{Deserialize, Serialize};
-use sourcery::{
-    Apply, ApplyProjection, DomainEvent, Filters, Handle, Repository, Subscribable,
-    store::{EventStore, inmemory},
-};
+use sourcery::{Apply, ApplyProjection, DomainEvent, Handle, Repository, store::inmemory};
 
 // ANCHOR: events
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,26 +56,9 @@ impl Handle<Deposit> for Account {
 
 // ANCHOR: projection
 #[derive(Debug, Default, sourcery::Projection)]
+#[projection(events(FundsDeposited))]
 pub struct TotalDeposits {
     pub total: i64,
-}
-
-impl Subscribable for TotalDeposits {
-    type Id = String;
-    type InstanceId = ();
-    type Metadata = ();
-
-    fn init((): &()) -> Self {
-        Self::default()
-    }
-
-    fn filters<S>((): &()) -> Filters<S, Self>
-    where
-        S: EventStore<Id = String>,
-        S::Metadata: Clone + Into<()>,
-    {
-        Filters::new().event::<FundsDeposited>()
-    }
 }
 
 impl ApplyProjection<FundsDeposited> for TotalDeposits {

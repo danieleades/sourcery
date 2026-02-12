@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use sourcery::{
     Aggregate, Apply, ApplyProjection, DomainEvent, EventKind, Filters, Handle, Projection,
-    Repository, Subscribable,
+    ProjectionFilters, Repository,
     projection::ProjectionError,
     store::{EventStore, inmemory},
     test::RepositoryTestExt,
@@ -26,8 +26,8 @@ impl DomainEvent for ValueAdded {
     const KIND: &'static str = "value-added";
 }
 
-/// Test helper that serializes to invalid JSON for testing deserialization
-/// error handling. Uses the same KIND as `ValueAdded` but serializes to a
+/// Test helper that serialises to invalid JSON for testing deserialisation
+/// error handling. Uses the same KIND as `ValueAdded` but serialises to a
 /// string instead of an object.
 struct InvalidValueAdded;
 
@@ -86,26 +86,9 @@ impl Handle<AddValue> for Counter {
 // ============================================================================
 
 #[derive(Debug, Default, Projection)]
+#[projection(events(ValueAdded))]
 struct TotalsProjection {
     totals: HashMap<String, i32>,
-}
-
-impl Subscribable for TotalsProjection {
-    type Id = String;
-    type InstanceId = ();
-    type Metadata = ();
-
-    fn init((): &()) -> Self {
-        Self::default()
-    }
-
-    fn filters<S>((): &()) -> Filters<S, Self>
-    where
-        S: EventStore<Id = String>,
-        S::Metadata: Clone + Into<()>,
-    {
-        Filters::new().event::<ValueAdded>()
-    }
 }
 
 impl ApplyProjection<ValueAdded> for TotalsProjection {
@@ -128,7 +111,7 @@ struct FilteredTotalsProjection {
     totals: HashMap<String, i32>,
 }
 
-impl Subscribable for FilteredTotalsProjection {
+impl ProjectionFilters for FilteredTotalsProjection {
     type Id = String;
     type InstanceId = String;
     type Metadata = ();
@@ -139,8 +122,7 @@ impl Subscribable for FilteredTotalsProjection {
 
     fn filters<S>(aggregate_id: &String) -> Filters<S, Self>
     where
-        S: EventStore<Id = String>,
-        S::Metadata: Clone + Into<()>,
+        S: EventStore<Id = String, Metadata = ()>,
     {
         Filters::new().event_for::<Counter, ValueAdded>(aggregate_id)
     }
@@ -216,7 +198,7 @@ async fn load_surfaces_deserialization_error() {
 // - A projection is tightly coupled to one aggregate and wants all its events
 //
 // For most projections, prefer chaining `.event::<E>()` calls instead - this
-// subscribes to specific event types without needing the enum dispatch impl.
+// targets specific event types without needing the enum dispatch impl.
 // ============================================================================
 
 /// Second event type to test multi-event aggregate enums
@@ -286,7 +268,7 @@ struct EnumProjection {
     last_value: Option<i32>,
 }
 
-impl Subscribable for EnumProjection {
+impl ProjectionFilters for EnumProjection {
     type Id = String;
     type InstanceId = ();
     type Metadata = ();
@@ -297,8 +279,7 @@ impl Subscribable for EnumProjection {
 
     fn filters<S>((): &()) -> Filters<S, Self>
     where
-        S: EventStore<Id = String>,
-        S::Metadata: Clone + Into<()>,
+        S: EventStore<Id = String, Metadata = ()>,
     {
         Filters::new().events::<MultiEventCounterEvent>()
     }
@@ -331,7 +312,7 @@ struct EventsForProjection {
     last_value: Option<i32>,
 }
 
-impl Subscribable for EventsForProjection {
+impl ProjectionFilters for EventsForProjection {
     type Id = String;
     type InstanceId = String;
     type Metadata = ();
@@ -342,8 +323,7 @@ impl Subscribable for EventsForProjection {
 
     fn filters<S>(aggregate_id: &String) -> Filters<S, Self>
     where
-        S: EventStore<Id = String>,
-        S::Metadata: Clone + Into<()>,
+        S: EventStore<Id = String, Metadata = ()>,
     {
         Filters::new().events_for::<MultiEventCounter>(aggregate_id)
     }
@@ -398,7 +378,7 @@ async fn events_loads_all_events_from_aggregate_enum() {
     .await
     .unwrap();
 
-    // Use events() via the EnumProjection's Subscribable impl
+    // Use events() via the EnumProjection's ProjectionFilters impl
     let projection: EnumProjection = repo.load_projection(&()).await.unwrap();
 
     assert_eq!(projection.additions, 13); // 10 + 3
@@ -436,7 +416,7 @@ async fn events_for_loads_events_for_specific_aggregate_instance() {
     .await
     .unwrap();
 
-    // Use events_for() via the EventsForProjection's Subscribable impl
+    // Use events_for() via the EventsForProjection's ProjectionFilters impl
     let projection: EventsForProjection = repo.load_projection(&"c1".to_string()).await.unwrap();
 
     assert_eq!(projection.additions, 10); // only c1's addition
@@ -451,27 +431,10 @@ async fn events_for_loads_events_for_specific_aggregate_instance() {
 /// Projection with Serialize/Deserialize for snapshot support.
 /// Uses String as both aggregate ID and instance ID for simplicity.
 #[derive(Debug, Default, Serialize, Deserialize, Projection)]
+#[projection(instance_id = String, events(ValueAdded))]
 struct SnapshotProjection {
     total: i32,
     event_count: u32,
-}
-
-impl Subscribable for SnapshotProjection {
-    type Id = String;
-    type InstanceId = String;
-    type Metadata = ();
-
-    fn init(_id: &String) -> Self {
-        Self::default()
-    }
-
-    fn filters<S>(_id: &String) -> Filters<S, Self>
-    where
-        S: EventStore<Id = String>,
-        S::Metadata: Clone + Into<()>,
-    {
-        Filters::new().event::<ValueAdded>()
-    }
 }
 
 impl ApplyProjection<ValueAdded> for SnapshotProjection {

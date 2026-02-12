@@ -32,7 +32,7 @@ use sourcery::{
 /// Current domain event for order placement.
 ///
 /// This is what the application code works with. The versioned crate handles
-/// deserializing historical versions and migrating them to this structure.
+/// deserialising historical versions and migrating them to this structure.
 #[derive(Clone, Debug, PartialEq, Eq, Versioned)]
 #[versioned(
     mode = "infallible",

@@ -288,82 +288,10 @@ where
         >,
     > + Send
     + 'a {
-        use std::collections::HashSet;
-
-        let inner = self.inner.read().expect("in-memory store lock poisoned");
-        let mut result = Vec::new();
-        let mut seen: HashSet<(StreamKey<Id>, String)> = HashSet::new(); // (stream key, event kind)
-
-        // Group filters by aggregate ID, tracking each filter's individual position
-        // constraint Maps event_kind -> after_position for that specific filter
-        let mut all_kinds: HashMap<String, Option<u64>> = HashMap::new(); // Filters with no aggregate restriction
-        let mut by_aggregate: HashMap<StreamKey<Id>, HashMap<String, Option<u64>>> = HashMap::new(); // Filters targeting a specific aggregate
-
-        for filter in filters {
-            if let (Some(kind), Some(id)) = (&filter.aggregate_kind, &filter.aggregate_id) {
-                by_aggregate
-                    .entry(StreamKey::new(kind.clone(), id.clone()))
-                    .or_default()
-                    .insert(filter.event_kind.clone(), filter.after_position);
-            } else {
-                all_kinds.insert(filter.event_kind.clone(), filter.after_position);
-            }
-        }
-
-        // Helper to check position filter for a specific after_position constraint
-        let passes_position_filter =
-            |event: &StoredEvent<Id, u64, serde_json::Value, M>,
-             after_position: Option<u64>|
-             -> bool { after_position.is_none_or(|after| event.position > after) };
-
-        // Load events for specific aggregates
-        for (stream_key, kinds) in &by_aggregate {
-            if let Some(stream) = inner.streams.get(stream_key) {
-                for event in stream {
-                    // Check if this event kind is requested AND passes its specific position filter
-                    if let Some(&after_pos) = kinds.get(&event.kind)
-                        && passes_position_filter(event, after_pos)
-                    {
-                        // Track that we've seen this (aggregate_kind, aggregate_id, kind) triple
-                        seen.insert((
-                            StreamKey::new(
-                                event.aggregate_kind.clone(),
-                                event.aggregate_id.clone(),
-                            ),
-                            event.kind.clone(),
-                        ));
-                        result.push(event.clone());
-                    }
-                }
-            }
-        }
-
-        // Load events from all aggregates for unfiltered kinds
-        // Skip events we've already loaded for specific aggregates
-        if !all_kinds.is_empty() {
-            for stream in inner.streams.values() {
-                for event in stream {
-                    // Check if this event kind is requested AND passes its specific position filter
-                    if let Some(&after_pos) = all_kinds.get(&event.kind)
-                        && passes_position_filter(event, after_pos)
-                    {
-                        let key = (
-                            StreamKey::new(
-                                event.aggregate_kind.clone(),
-                                event.aggregate_id.clone(),
-                            ),
-                            event.kind.clone(),
-                        );
-                        if !seen.contains(&key) {
-                            result.push(event.clone());
-                        }
-                    }
-                }
-            }
-        }
-
-        // Sort by position for chronological ordering across streams
-        result.sort_by_key(|event| event.position);
+        let result = load_matching_events(
+            &self.inner.read().expect("in-memory store lock poisoned"),
+            filters,
+        );
 
         tracing::debug!(events_loaded = result.len(), "loaded events from store");
         std::future::ready(Ok(result))

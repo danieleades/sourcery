@@ -3,7 +3,7 @@
 //! This crate provides the foundational abstractions for event sourcing:
 //!
 //! - [`aggregate`] - Command-side primitives (`Aggregate`, `Apply`, `Handle`)
-//! - [`projection`] - Read-side primitives (`Projection`, `Subscribable`,
+//! - [`projection`] - Read-side primitives (`Projection`, `ProjectionFilters`,
 //!   `ApplyProjection`, `Filters`)
 //! - [`repository`] - Command execution and aggregate lifecycle (`Repository`)
 //! - [`store`] - Event persistence abstraction (`EventStore`)

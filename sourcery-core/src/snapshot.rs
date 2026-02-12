@@ -1,4 +1,4 @@
-//! Snapshot support for optimized aggregate loading.
+//! Snapshot support for optimised aggregate loading.
 //!
 //! Snapshots persist aggregate state at a point in time, reducing the number of
 //! events that need to be replayed when loading an aggregate. This module
@@ -21,7 +21,7 @@ pub mod inmemory;
 /// was taken. When loading an aggregate, only events after this position need
 /// to be replayed.
 ///
-/// Schema evolution is handled at the serialization layer (e.g., via
+/// Schema evolution is handled at the serialisation layer (e.g., via
 /// `serde_evolve`), so no version field is needed here.
 ///
 /// # Type Parameters
@@ -80,7 +80,7 @@ pub trait SnapshotStore<Id: Sync>: Send + Sync {
     /// passing `events_since_last_snapshot` and a `create_snapshot`
     /// callback. Implementations may decline without invoking
     /// `create_snapshot`, avoiding unnecessary snapshot creation cost
-    /// (serialization, extra I/O, etc.).
+    /// (serialisation, extra I/O, etc.).
     ///
     /// Returning [`SnapshotOffer::Stored`] indicates that the snapshot was
     /// persisted. Returning [`SnapshotOffer::Declined`] indicates that no
@@ -122,7 +122,7 @@ where
     SnapshotError: std::error::Error + 'static,
     CreateError: std::error::Error + 'static,
 {
-    /// Snapshot creation failed (e.g., serialization, extra I/O, etc.).
+    /// Snapshot creation failed (e.g., serialisation, extra I/O, etc.).
     #[error("failed to create snapshot: {0}")]
     Create(#[source] CreateError),
     /// Snapshot persistence failed.

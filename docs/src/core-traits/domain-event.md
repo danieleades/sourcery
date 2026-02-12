@@ -1,17 +1,10 @@
 # Domain Events
 
-Events are the heart of event sourcing. They represent facts—things that have happened. In this crate, events are first-class structs, not just enum variants.
+Events are facts: things that already happened.
 
-## The `DomainEvent` Trait
+## Basic Usage
 
-```rust,ignore
-pub trait DomainEvent {
-    /// Unique identifier for this event type (used for serialization routing)
-    const KIND: &'static str;
-}
-```
-
-Every event struct implements this trait:
+Define a plain struct and implement `DomainEvent` with a stable `KIND`.
 
 ```rust,ignore
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -26,42 +19,43 @@ impl DomainEvent for OrderPlaced {
 }
 ```
 
+## Rules of Thumb
+
+- Use past tense names (`OrderPlaced`, not `PlaceOrder`)
+- Keep `KIND` stable forever once persisted
+- Keep payload focused on a single fact
+
 ## Why First-Class Structs?
 
-This crate keeps events as separate structs rather than enum variants. Benefits:
+This crate keeps events as standalone structs rather than forcing enum variants:
 
-- **Reuse** — Same event type in multiple aggregates
-- **Decoupling** — Projections subscribe to event types, not aggregate enums
-- **Smaller scope** — Import individual event structs
+- Reuse across aggregates
+- Decoupled projections by event type
+- Smaller, explicit imports
 
-The derive macro generates the aggregate's event enum internally—you get the best of both worlds.
+The aggregate derive still generates an internal event enum for replay and storage routing.
 
-## Naming Conventions
-
-Events are **past tense** because they describe things that already happened:
-
-| Good | Bad |
-|------|-----|
-| `OrderPlaced` | `PlaceOrder` |
-| `FundsDeposited` | `DepositFunds` |
-| `UserRegistered` | `RegisterUser` |
-| `PasswordChanged` | `ChangePassword` |
-
-Use `KIND` constants that are stable and namespaced:
+## `KIND` Naming Guidance
 
 ```rust,ignore
-const KIND: &'static str = "order.placed";      // Good
-const KIND: &'static str = "OrderPlaced";       // OK
-const KIND: &'static str = "placed";            // Too generic
+const KIND: &'static str = "order.placed"; // Good
+const KIND: &'static str = "OrderPlaced";  // Acceptable
+const KIND: &'static str = "placed";       // Too generic
 ```
-
-The `KIND` is stored in the event log and used for deserialization, so it must never change for existing events.
 
 ## Event Design Guidelines
 
-1. **Include all necessary data** — Capture values at event time (e.g., price when ordered)
-2. **Avoid aggregate IDs** — They travel in the envelope, not the event payload
-3. **Keep events small** — One fact per event (prefer `AddressChanged` + `PhoneChanged` over `ContactInfoChanged`)
+1. Include values needed to replay decisions later.
+2. Keep aggregate IDs in the envelope, not event payload.
+3. Prefer multiple specific events over one broad event.
+
+## Trait Reference
+
+```rust,ignore
+pub trait DomainEvent {
+    const KIND: &'static str;
+}
+```
 
 ## Next
 

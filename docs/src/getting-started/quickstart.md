@@ -19,7 +19,7 @@ Build a simple bank account aggregate in a compact, end-to-end example. This exa
 
 - **Events are past tense facts** — `FundsDeposited`, not `DepositFunds`
 - **Commands are imperative** — `Deposit`, not `Deposited`
-- **The derive macro generates** — The event enum, `From` impls, serialization
+- **The derive macro generates** — The event enum, `From` impls, serialisation
 - **Projections are decoupled** — They receive events, not aggregate types
 - **IDs are infrastructure** — Passed to the repository, not embedded in events
 

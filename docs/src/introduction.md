@@ -8,8 +8,8 @@ Event sourcing shines when you need:
 
 - **Complete audit trails** — every state change is recorded
 - **Time travel** — reconstruct state at any point in history
-- **Decoupled read models** — optimize queries independently of writes
-- **Complex domain logic** — model behavior as a sequence of facts
+- **Decoupled read models** — optimise queries independently of writes
+- **Complex domain logic** — model behaviour as a sequence of facts
 
 It adds complexity, so consider simpler approaches for CRUD-heavy applications with minimal business logic.
 
@@ -43,7 +43,7 @@ impl Handle<Deposit> for Account {
 }
 ```
 
-The derive macro generates the event enum and serialization glue. You focus on domain behavior.
+The derive macro generates the event enum and serialisation glue. You focus on domain behaviour.
 
 ## Next Steps
 

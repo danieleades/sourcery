@@ -15,7 +15,7 @@ This project is available under two licensing options:
 - You must provide source code to users of your software
 - See [LICENSE](LICENSE) for full terms
 
-**This is the default license** - if you're using Sourcery without a separate commercial agreement, you're using it under GPL v3.
+**This is the default licence** - if you're using Sourcery without a separate commercial agreement, you're using it under GPL v3.
 
 ## Option 2: Commercial License
 
@@ -27,12 +27,12 @@ This project is available under two licensing options:
 - No requirement to license your software under GPL v3
 - No obligation to provide source code to your users
 
-**To obtain a commercial license:**
+**To obtain a commercial licence:**
 
 - Contact: <danieleades@hotmail.com>
 - Include: Brief description of your intended use case
 - Commercial licensing terms are negotiated on a case-by-case basis
-- Commercial licenses are typically free or priced nominally for individuals and small teams
+- Commercial licences are typically free or priced nominally for individuals and small teams
 - For well-funded organisations, we may request a very modest fee to support ongoing maintenance
 - We may ask a few follow-up questions; in rare cases we may decline a commercial licensing request
 

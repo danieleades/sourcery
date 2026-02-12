@@ -122,7 +122,7 @@ pub mod codec {
     pub use super::event::{EventDecodeError, ProjectionEvent};
 }
 
-pub trait Subscribable: Sized {
+pub trait ProjectionFilters: Sized {
     type Id;
     type InstanceId;
     type Metadata;
@@ -131,11 +131,10 @@ pub trait Subscribable: Sized {
 
     fn filters<S>(instance_id: &Self::InstanceId) -> Filters<S, Self>
     where
-        S: store::EventStore<Id = Self::Id>,
-        S::Metadata: Clone + Into<Self::Metadata>;
+        S: store::EventStore<Id = Self::Id, Metadata = Self::Metadata>;
 }
 
-pub trait Projection: Subscribable {
+pub trait Projection {
     const KIND: &'static str;
 }
 
@@ -148,7 +147,7 @@ pub struct Filters<S, P> {
 impl<S, P> Filters<S, P>
 where
     S: store::EventStore,
-    P: Subscribable<Id = S::Id>,
+    P: ProjectionFilters<Id = S::Id>,
 {
     pub fn new() -> Self {
         Self {
@@ -156,4 +155,17 @@ where
             _p: std::marker::PhantomData,
         }
     }
+
+    pub fn event<E>(self) -> Self
+    where
+        E: event::DomainEvent + serde::de::DeserializeOwned,
+        P: ApplyProjection<E>,
+        S: store::EventStore<Metadata = P::Metadata>,
+    {
+        self
+    }
+}
+
+pub trait ApplyProjection<E>: ProjectionFilters {
+    fn apply_projection(&mut self, aggregate_id: &Self::Id, event: &E, metadata: &Self::Metadata);
 }

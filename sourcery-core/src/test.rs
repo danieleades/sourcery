@@ -2,22 +2,22 @@
 //!
 //! This module provides testing utilities for event-sourced systems:
 //!
-//! - [`TestExecutor`]: BDD-style unit testing for aggregates in isolation
+//! - [`TestFramework`]: BDD-style unit testing for aggregates in isolation
 //! - [`RepositoryTestExt`]: Extension trait for integration testing with real
 //!   repositories
 //!
-//! # Unit Testing with [`TestExecutor`]
+//! # Unit Testing with [`TestFramework`]
 //!
-//! The [`TestExecutor`] is inspired by [cqrs-es](https://crates.io/crates/cqrs-es)
-//! for testing aggregate behavior in isolation, without requiring a real event
+//! The [`TestFramework`] is inspired by [cqrs-es](https://crates.io/crates/cqrs-es)
+//! for testing aggregate behaviour in isolation, without requiring a real event
 //! store.
 //!
 //! ```ignore
-//! use sourcery::test::TestExecutor;
+//! use sourcery::test::TestFramework;
 //!
 //! #[test]
 //! fn adding_value_produces_event() {
-//!     TestExecutor::<Counter>::given(&[])
+//!     TestFramework::<Counter>::given(&[])
 //!         .when(&AddValue { amount: 10 })
 //!         .then_expect_events(&[
 //!             CounterEvent::Added(ValueAdded { amount: 10 })
@@ -26,7 +26,7 @@
 //!
 //! #[test]
 //! fn cannot_subtract_more_than_balance() {
-//!     TestExecutor::<Counter>::given(&[
+//!     TestFramework::<Counter>::given(&[
 //!         CounterEvent::Added(ValueAdded { amount: 10 })
 //!     ])
 //!     .when(&SubtractValue { amount: 20 })
@@ -129,7 +129,7 @@ where
 pub trait RepositoryTestExt: StoreAccess + Send {
     /// Seed events for an aggregate, bypassing command handlers.
     ///
-    /// Events are serialized through the store, ensuring they can be loaded
+    /// Events are serialised through the store, ensuring they can be loaded
     /// correctly. This is useful for setting up test fixtures without
     /// executing commands.
     ///
@@ -175,7 +175,7 @@ pub trait RepositoryTestExt: StoreAccess + Send {
     ///
     /// This simulates what happens when another process appends events
     /// to the same aggregate stream. The event goes through the store's
-    /// serialization path.
+    /// serialisation path.
     ///
     /// Use this to test optimistic concurrency conflict detection.
     ///
@@ -200,7 +200,7 @@ pub trait RepositoryTestExt: StoreAccess + Send {
         self.seed_events::<A>(id, vec![event])
     }
 
-    /// Inject an event directly into the store using its serialization.
+    /// Inject an event directly into the store using its serialisation.
     ///
     /// This bypasses repository logic and appends a single event to the
     /// aggregate stream. To simulate malformed payloads, use a custom
@@ -211,7 +211,7 @@ pub trait RepositoryTestExt: StoreAccess + Send {
     /// * `aggregate_kind` - The aggregate type identifier (e.g.,
     ///   `Aggregate::KIND`)
     /// * `id` - The aggregate instance identifier
-    /// * `event` - Event to serialize and persist
+    /// * `event` - Event to serialise and persist
     /// * `metadata` - Event metadata to persist
     ///
     /// # Errors
@@ -248,7 +248,7 @@ impl<T> RepositoryTestExt for T where T: StoreAccess + Send {}
 
 /// Test executor for aggregate testing using a given-when-then pattern.
 ///
-/// This allows testing aggregate behavior without persistence,
+/// This allows testing aggregate behaviour without persistence,
 /// focusing on the pure command handling logic.
 ///
 /// # Type Parameters

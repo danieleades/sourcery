@@ -2,7 +2,7 @@
 
 The crate provides two testing utilities:
 
-- **`TestExecutor`**: Unit testing aggregates in isolation (no stores, no serialization)
+- **`TestFramework`**: Unit testing aggregates in isolation (no stores, no serialization)
 - **`RepositoryTestExt`**: Integration testing with real repositories (seeding data, simulating concurrency)
 
 ## Enabling the Test Framework
@@ -17,11 +17,11 @@ sourcery = { version = "0.1", features = ["test-util"] }
 ## Basic Usage
 
 ```rust,ignore
-use sourcery::test::TestExecutor;
+use sourcery::test::TestFramework;
 
 #[test]
 fn deposit_increases_balance() {
-    TestExecutor::<Account>::given(&[FundsDeposited { amount: 100 }.into()])
+    TestFramework::<Account>::given(&[FundsDeposited { amount: 100 }.into()])
         .when(&Deposit { amount: 50 })
         .then_expect_events(&[FundsDeposited { amount: 50 }.into()]);
 }
@@ -33,13 +33,13 @@ Set up initial state with `given(events)`:
 
 ```rust,ignore
 // With existing events
-TestExecutor::<Account>::given(&[
+TestFramework::<Account>::given(&[
     FundsDeposited { amount: 100 }.into(),
     FundsWithdrawn { amount: 30 }.into(),
 ])  // Balance is now 70
 
 // Fresh aggregate (pass empty slice)
-TestExecutor::<Account>::given(&[])  // Balance is 0
+TestFramework::<Account>::given(&[])  // Balance is 0
 ```
 
 ## When Methods
@@ -70,30 +70,30 @@ Assert outcomes with these methods:
 .then_expect_error_eq(&AccountError::InsufficientFunds)
 ```
 
-Additional methods: `then_expect_error_message(substring)` for substring matching, `inspect_result(closure)` for custom assertions.
+Additional methods: `then_expect_error_message(substring)` for substring matching, `inspect_result()` to get the raw `Result` for custom assertions.
 
 ## Complete Test Suite Example
 
 ```rust,ignore
-use sourcery::test::TestExecutor;
+use sourcery::test::TestFramework;
 
 #[test]
 fn deposits_positive_amount() {
-    TestExecutor::<Account>::given(&[])
+    TestFramework::<Account>::given(&[])
         .when(&Deposit { amount: 100 })
         .then_expect_events(&[FundsDeposited { amount: 100 }.into()]);
 }
 
 #[test]
 fn rejects_overdraft() {
-    TestExecutor::<Account>::given(&[FundsDeposited { amount: 100 }.into()])
+    TestFramework::<Account>::given(&[FundsDeposited { amount: 100 }.into()])
         .when(&Withdraw { amount: 150 })
         .then_expect_error_eq(&AccountError::InsufficientFunds);
 }
 
 #[test]
 fn rejects_invalid_deposit() {
-    TestExecutor::<Account>::given(&[])
+    TestFramework::<Account>::given(&[])
         .when(&Deposit { amount: -50 })
         .then_expect_error();
 }
@@ -101,7 +101,7 @@ fn rejects_invalid_deposit() {
 
 ## Testing Projections
 
-Projections don't use `TestExecutor`. Test them directly by calling `init()` and `apply_projection()`:
+Projections don't use `TestFramework`. Test them directly by calling `init()` and `apply_projection()`:
 
 ```rust,ignore
 #[test]

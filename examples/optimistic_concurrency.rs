@@ -112,7 +112,7 @@ type OptimisticRepo = Repository<inmemory::Store<String, ()>>;
 
 /// Part 1: Basic optimistic concurrency usage.
 ///
-/// Demonstrates initializing inventory and making reservations without
+/// Demonstrates initialising inventory and making reservations without
 /// conflicts.
 async fn part1_basic_usage() -> Result<(OptimisticRepo, String), Box<dyn std::error::Error>> {
     println!("PART 1: Basic optimistic concurrency usage\n");

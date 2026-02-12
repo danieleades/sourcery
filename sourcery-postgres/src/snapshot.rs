@@ -15,10 +15,10 @@ pub enum Error {
     /// Database error during snapshot operations.
     #[error("database error: {0}")]
     Database(#[from] sqlx::Error),
-    /// Serialization error.
+    /// Serialisation error.
     #[error("serialization error: {0}")]
     Serialization(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
-    /// Deserialization error.
+    /// Deserialisation error.
     #[error("deserialization error: {0}")]
     Deserialization(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
 }

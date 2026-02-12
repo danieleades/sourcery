@@ -3,14 +3,14 @@ extern crate self as sourcery;
 #[path = "../common.rs"]
 mod support;
 
-pub use support::{codec, store, Aggregate, Apply, Filters, Projection, Subscribable};
+pub use support::{codec, store, Aggregate, Apply, Filters, Projection, ProjectionFilters};
 
 use sourcery_macros::Projection;
 
 #[derive(Default, Projection)]
 pub struct AccountLedger {}
 
-impl Subscribable for AccountLedger {
+impl ProjectionFilters for AccountLedger {
     type Id = String;
     type InstanceId = ();
     type Metadata = ();
@@ -21,8 +21,7 @@ impl Subscribable for AccountLedger {
 
     fn filters<S>(_instance_id: &Self::InstanceId) -> Filters<S, Self>
     where
-        S: store::EventStore<Id = String>,
-        S::Metadata: Clone + Into<Self::Metadata>,
+        S: store::EventStore<Id = String, Metadata = Self::Metadata>,
     {
         Filters::new()
     }

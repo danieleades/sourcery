@@ -2,13 +2,28 @@
 
 While `load_projection` rebuilds a projection from scratch on each call, **subscriptions** maintain an in-memory projection that updates in real time as events are committed.
 
+## Basic Usage
+
+Use `Repository::subscribe` to create a `SubscriptionBuilder`, configure callbacks, then call `start()`:
+
+```rust,ignore
+let subscription = repository
+    .subscribe::<Dashboard>(())
+    .on_update(|dashboard| println!("{dashboard:?}"))
+    .start()
+    .await?;
+```
+
+The instance ID argument matches the projection's `InstanceId` type. For singleton projections (`InstanceId = ()`), pass `()`.
+`start()` returns only after catch-up completes.
+
 ## How Subscriptions Work
 
 A subscription:
 
 1. **Catch-up phase** — Replays all historical events matching the projection's filters
 2. **Live phase** — Transitions to processing events as they are committed
-3. **Callbacks** — Fires `on_update` after each event and `on_catchup_complete` once
+3. **Callbacks** — Fires `on_update` after each event
 
 ```d2
 shape: sequence_diagram
@@ -21,26 +36,11 @@ App -> Sub: "subscribe::<P>(instance_id)"
 Sub -> Store: "load_events(filters)"
 Store -> Sub: "Historical events" {style.stroke-dash: 3}
 Sub -> Sub: "Replay events (catch-up)"
-Sub -> App: "on_catchup_complete()" {style.stroke-dash: 3}
+Sub -> App: "start() returns (caught up)" {style.stroke-dash: 3}
 Store -> Sub: "Live event" {style.stroke-dash: 3}
 Sub -> Sub: "apply_projection()"
 Sub -> App: "on_update(&projection)" {style.stroke-dash: 3}
 ```
-
-## Starting a Subscription
-
-Use `Repository::subscribe` to create a `SubscriptionBuilder`, configure callbacks, then call `start()`:
-
-```rust,ignore
-let subscription = repository
-    .subscribe::<Dashboard>(())
-    .on_catchup_complete(|| println!("ready"))
-    .on_update(|dashboard| println!("{dashboard:?}"))
-    .start()
-    .await?;
-```
-
-The instance ID argument matches the projection's `InstanceId` type. For singleton projections (`InstanceId = ()`), pass `()`.
 
 ## Callbacks
 
@@ -57,25 +57,6 @@ Called after every event is applied to the projection. Receives an immutable ref
 
 Callbacks must complete quickly. Long-running work should be dispatched to a separate task via a channel.
 
-### `on_catchup_complete`
-
-A one-shot callback fired when the catch-up phase completes and the subscription transitions to live events:
-
-```rust,ignore
-let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-
-let subscription = repository
-    .subscribe::<Dashboard>(())
-    .on_catchup_complete(move || {
-        let _ = ready_tx.send(());
-    })
-    .start()
-    .await?;
-
-// Wait until projection is current before serving traffic
-ready_rx.await?;
-```
-
 ## Stopping a Subscription
 
 The `start()` method returns a `SubscriptionHandle`. Call `stop()` for graceful shutdown:
@@ -84,7 +65,7 @@ The `start()` method returns a `SubscriptionHandle`. Call `stop()` for graceful 
 subscription.stop().await?;
 ```
 
-The subscription processes any remaining events, offers a final snapshot, then terminates. Dropping the handle does **not** stop the subscription — you must call `stop()` explicitly.
+The subscription processes any remaining events, offers a final snapshot, then terminates. Dropping the handle sends a best-effort stop signal, but use `stop()` when you need deterministic shutdown and error handling.
 
 ## Subscription Snapshots
 
@@ -154,7 +135,7 @@ let current = live_state.lock().unwrap().clone();
 
 See [`examples/subscription_billing.rs`](https://github.com/danieleades/sourcery/blob/main/examples/subscription_billing.rs) for a complete working example demonstrating:
 
-- Live subscription with `on_update` and `on_catchup_complete`
+- Live subscription with `on_update`
 - Multi-aggregate projection (Subscription + Invoice)
 - Guard conditions from live state
 - Graceful shutdown

@@ -4,7 +4,7 @@ When multiple processes or threads write to the same aggregate simultaneously, y
 losing updates. Optimistic concurrency control detects these conflicts by checking that
 the stream version hasn't changed between loading the aggregate and committing new events.
 
-## Default Behavior
+## Default Behaviour
 
 By default, repositories use **optimistic concurrency**—version checking is performed on every write. This is the safe default for production systems.
 
@@ -67,7 +67,7 @@ The most common pattern for handling conflicts is to **retry** the operation.
 The repository provides a helper for this: `execute_with_retry`.
 
 ```rust,ignore
-use sourcery::RetryResult;
+use sourcery::repository::RetryResult;
 
 let attempts: RetryResult<MyAggregate, MyStore> =
     repo.execute_with_retry::<MyAggregate, MyCommand>(&id, &command, &metadata, 3).await?;

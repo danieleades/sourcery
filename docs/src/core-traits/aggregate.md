@@ -1,30 +1,22 @@
 # Aggregates
 
-An **aggregate** is a cluster of domain objects treated as a single unit for data changes. In event sourcing, aggregates rebuild their state by replaying events and validate commands to produce new events.
+An **aggregate** rebuilds state from events and validates commands to produce new events.
 
-## The `Aggregate` Trait
+## Basic Usage
 
-```rust,ignore
-{{#include ../../../sourcery-core/src/aggregate.rs:aggregate_trait}}
-```
+For most aggregates:
 
-The `#[derive(Aggregate)]` macro generates most of this—you implement `Apply<E>` for each event and `Handle<C>` for each command.
-
-## Snapshots and `serde`
-
-Snapshots are opt-in. If you enable snapshots (via `Repository::with_snapshots`), the aggregate state must be serializable (`Serialize + DeserializeOwned`).
-
-## The `Apply<E>` Trait
-
-When using `#[derive(Aggregate)]`, implement `Apply<E>` for each event type:
+1. `#[derive(Aggregate)]`
+2. Implement `Apply<E>` per event
+3. Implement `Handle<C>` per command
 
 ```rust,ignore
-{{#include ../../../sourcery-core/src/aggregate.rs:apply_trait}}
-```
+#[derive(Default, sourcery::Aggregate)]
+#[aggregate(id = String, error = AccountError, events(FundsDeposited, FundsWithdrawn))]
+pub struct Account {
+    balance: i64,
+}
 
-This is where state mutation happens:
-
-```rust,ignore
 impl Apply<FundsDeposited> for Account {
     fn apply(&mut self, event: &FundsDeposited) {
         self.balance += event.amount;
@@ -38,9 +30,38 @@ impl Apply<FundsWithdrawn> for Account {
 }
 ```
 
-**Key rules:** `apply` must be infallible (events are facts) and deterministic (same events → same state).
+## Loading Aggregates
 
-## Event Replay
+```rust,ignore
+let account: Account = repository
+    .load(&account_id)
+    .await?;
+```
+
+This replays events for that aggregate ID. If snapshots are configured, replay starts from the latest snapshot.
+
+## Trait Reference
+
+### The `Aggregate` Trait
+
+```rust,ignore
+{{#include ../../../sourcery-core/src/aggregate.rs:aggregate_trait}}
+```
+
+`#[derive(Aggregate)]` generates most of this.
+
+### The `Apply<E>` Trait
+
+```rust,ignore
+{{#include ../../../sourcery-core/src/aggregate.rs:apply_trait}}
+```
+
+`apply` should be:
+
+- Infallible (events are facts)
+- Deterministic (same events -> same state)
+
+## Event Replay Model
 
 ```d2
 shape: sequence_diagram
@@ -57,21 +78,11 @@ Store -> Agg: "apply(FundsDeposited { amount: 50 })"
 Agg: "balance = 120" {shape: text}
 ```
 
-The aggregate starts in its `Default` state. Each event is applied in order. The final state matches what would exist if you had executed all the original commands.
+## Snapshots and `serde`
 
-## Loading Aggregates
+Snapshots are opt-in via `Repository::with_snapshots()`.
 
-Use `Repository::load` to load an aggregate's current state:
-
-```rust,ignore
-let account: Account = repository
-    .load(&account_id)
-    .await?;
-
-println!("Current balance: {}", account.balance);
-```
-
-This replays all events for that aggregate ID. When the repository is configured with snapshots (via `with_snapshots()`), it loads a snapshot first (when present) and replays only the delta.
+If enabled, aggregate state must implement `Serialize + DeserializeOwned`.
 
 ## Next
 

@@ -11,10 +11,10 @@
 /// plumbing automatically, while keeping your state struct focused on domain
 /// behaviour.
 ///
-/// Aggregates are domain objects and do not require serialization by default.
+/// Aggregates are domain objects and do not require serialisation by default.
 ///
 /// If you enable snapshots (via `Repository::with_snapshots`), the aggregate
-/// state must be serializable (`Serialize + DeserializeOwned`).
+/// state must be serialisable (`Serialize + DeserializeOwned`).
 // ANCHOR: aggregate_trait
 pub trait Aggregate: Default {
     /// Aggregate type identifier used by the event store.

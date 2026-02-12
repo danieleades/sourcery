@@ -19,7 +19,7 @@ use crate::{
 /// The `filters()` method returns both the event filters AND the handlers
 /// needed to process those events. It is generic over the store type `S`,
 /// allowing the same projection to work with any store that shares the
-/// same `Id` type.
+/// same `Id` and `Metadata` types.
 ///
 /// `filters()` must be **pure and deterministic**: given the same
 /// `instance_id`, it must always return the same filter set.
@@ -27,8 +27,8 @@ use crate::{
 /// `init()` constructs a fresh instance from the instance identifier.
 /// This replaces the `Default` constraint, allowing instance-aware
 /// projections to capture their identity at construction time.
-// ANCHOR: subscribable_trait
-pub trait Subscribable: Sized {
+// ANCHOR: projection_filters_trait
+pub trait ProjectionFilters: Sized {
     /// Aggregate identifier type this subscriber is compatible with.
     type Id;
     /// Instance identifier for this subscriber.
@@ -48,18 +48,20 @@ pub trait Subscribable: Sized {
     /// Build the filter set and handler map for this subscriber.
     fn filters<S>(instance_id: &Self::InstanceId) -> Filters<S, Self>
     where
-        S: EventStore<Id = Self::Id>,
-        S::Metadata: Clone + Into<Self::Metadata>;
+        S: EventStore<Id = Self::Id, Metadata = Self::Metadata>;
 }
-// ANCHOR_END: subscribable_trait
+// ANCHOR_END: projection_filters_trait
 
 /// Trait implemented by read models that can be constructed from an event
 /// stream.
 ///
-/// Extends [`Subscribable`] with a stable `KIND` identifier for snapshot
-/// storage. Derivable via `#[derive(Projection)]`.
+/// Contains a stable `KIND` identifier for snapshot storage.
+///
+/// `Projection` is intentionally independent from [`ProjectionFilters`], so
+/// `#[derive(Projection)]` can always be used while filter behaviour remains an
+/// explicit opt-in via `ProjectionFilters`.
 // ANCHOR: projection_trait
-pub trait Projection: Subscribable {
+pub trait Projection {
     /// Stable identifier for this projection type.
     const KIND: &'static str;
 }
@@ -79,7 +81,7 @@ pub trait Projection: Subscribable {
 /// }
 /// ```
 // ANCHOR: apply_projection_trait
-pub trait ApplyProjection<E>: Subscribable {
+pub trait ApplyProjection<E>: ProjectionFilters {
     fn apply_projection(&mut self, aggregate_id: &Self::Id, event: &E, metadata: &Self::Metadata);
 }
 // ANCHOR_END: apply_projection_trait
@@ -136,7 +138,7 @@ pub(crate) type PositionedFilters<S, P> = (
 /// Combined filter configuration and handler map for a subscriber.
 ///
 /// `Filters` captures both the event filters (which events to load) and the
-/// handler closures (how to apply them). It is parameterized by the store
+/// handler closures (how to apply them). It is parameterised by the store
 /// type `S` to enable store-mediated decoding.
 ///
 /// Filters are constructed without positions. Positions are applied at
@@ -152,7 +154,7 @@ where
 impl<S, P> Default for Filters<S, P>
 where
     S: EventStore,
-    P: Subscribable<Id = S::Id>,
+    P: ProjectionFilters<Id = S::Id, Metadata = S::Metadata>,
 {
     fn default() -> Self {
         Self::new()
@@ -162,7 +164,7 @@ where
 impl<S, P> Filters<S, P>
 where
     S: EventStore,
-    P: Subscribable<Id = S::Id>,
+    P: ProjectionFilters<Id = S::Id, Metadata = S::Metadata>,
 {
     /// Create an empty filter set.
     #[must_use]
@@ -179,15 +181,13 @@ where
     where
         E: DomainEvent + serde::de::DeserializeOwned,
         P: ApplyProjection<E>,
-        S::Metadata: Clone + Into<P::Metadata>,
     {
         self.specs.push(EventFilter::for_event(E::KIND));
         self.handlers.insert(
             E::KIND,
             Box::new(|proj, agg_id, stored, metadata, store| {
                 let event: E = store.decode_event(stored)?;
-                let metadata_converted: P::Metadata = metadata.clone().into();
-                ApplyProjection::apply_projection(proj, agg_id, &event, &metadata_converted);
+                ApplyProjection::apply_projection(proj, agg_id, &event, metadata);
                 Ok(())
             }),
         );
@@ -201,7 +201,6 @@ where
     where
         E: ProjectionEvent,
         P: ApplyProjection<E>,
-        S::Metadata: Clone + Into<P::Metadata>,
     {
         for &kind in E::EVENT_KINDS {
             self.specs.push(EventFilter::for_event(kind));
@@ -209,8 +208,7 @@ where
                 kind,
                 Box::new(move |proj, agg_id, stored, metadata, store| {
                     let event = E::from_stored(stored, store).map_err(HandlerError::EventDecode)?;
-                    let metadata_converted: P::Metadata = metadata.clone().into();
-                    ApplyProjection::apply_projection(proj, agg_id, &event, &metadata_converted);
+                    ApplyProjection::apply_projection(proj, agg_id, &event, metadata);
                     Ok(())
                 }),
             );
@@ -225,7 +223,6 @@ where
         A: Aggregate<Id = S::Id>,
         E: DomainEvent + serde::de::DeserializeOwned,
         P: ApplyProjection<E>,
-        S::Metadata: Clone + Into<P::Metadata>,
     {
         self.specs.push(EventFilter::for_aggregate(
             E::KIND,
@@ -236,8 +233,7 @@ where
             E::KIND,
             Box::new(|proj, agg_id, stored, metadata, store| {
                 let event: E = store.decode_event(stored)?;
-                let metadata_converted: P::Metadata = metadata.clone().into();
-                ApplyProjection::apply_projection(proj, agg_id, &event, &metadata_converted);
+                ApplyProjection::apply_projection(proj, agg_id, &event, metadata);
                 Ok(())
             }),
         );
@@ -251,7 +247,6 @@ where
         A: Aggregate<Id = S::Id>,
         A::Event: ProjectionEvent,
         P: ApplyProjection<A::Event>,
-        S::Metadata: Clone + Into<P::Metadata>,
     {
         for &kind in <A::Event as ProjectionEvent>::EVENT_KINDS {
             self.specs.push(EventFilter::for_aggregate(
@@ -264,8 +259,7 @@ where
                 Box::new(move |proj, agg_id, stored, metadata, store| {
                     let event = <A::Event as ProjectionEvent>::from_stored(stored, store)
                         .map_err(HandlerError::EventDecode)?;
-                    let metadata_converted: P::Metadata = metadata.clone().into();
-                    ApplyProjection::apply_projection(proj, agg_id, &event, &metadata_converted);
+                    ApplyProjection::apply_projection(proj, agg_id, &event, metadata);
                     Ok(())
                 }),
             );
