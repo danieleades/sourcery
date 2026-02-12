@@ -29,7 +29,7 @@ App.Projection Definition -> Crate.Repository
 
 **You define**: Aggregates, events, commands, projections
 
-**The crate provides**: Repository orchestration, store abstraction, serialization
+**The crate provides**: Repository orchestration, store abstraction, serialisation
 
 ## The Envelope Pattern
 
@@ -37,7 +37,7 @@ Events travel with metadata, but domain types stay pure:
 
 - **Aggregates** receive only the pure event—no IDs or metadata
 - **Projections** receive the full envelope—aggregate ID and metadata included
-- **Stores** persist the envelope but deserialize only what's needed
+- **Stores** persist the envelope but deserialise only what's needed
 
 This keeps domain logic free of infrastructure concerns.
 
@@ -85,7 +85,7 @@ Repo -> Proj: "apply_projection(id, event, meta) [For each event]"
 Repo -> App: "Projection" {style.stroke-dash: 3}
 ```
 
-Projections define their event filters centrally in the `Subscribable` trait. The repository calls `filters()` to determine which events to load, then replays them into the projection.
+Projections define their event filters centrally in the `ProjectionFilters` trait. The repository calls `filters()` to determine which events to load, then replays them into the projection.
 
 ## Key Types
 
@@ -96,8 +96,8 @@ Projections define their event filters centrally in the `Subscribable` trait. Th
 | `EventStore` | Trait for event persistence |
 | `SnapshotStore` | Trait for aggregate/projection snapshots |
 | `Aggregate` | Trait for command-side entities |
-| `Subscribable` | Base trait for event subscribers (projections) |
-| `Projection` | Extends `Subscribable` with a `KIND` for snapshots |
+| `ProjectionFilters` | Base trait for event subscribers (projections) |
+| `Projection` | Stable `KIND` identifier for projection snapshot storage |
 | `ApplyProjection<E>` | Per-event handler for projections |
 | `Filters` | Builder for event filter specs + handler closures |
 | `DomainEvent` | Marker trait for event structs |

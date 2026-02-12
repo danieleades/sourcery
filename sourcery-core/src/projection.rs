@@ -27,8 +27,8 @@ use crate::{
 /// `init()` constructs a fresh instance from the instance identifier.
 /// This replaces the `Default` constraint, allowing instance-aware
 /// projections to capture their identity at construction time.
-// ANCHOR: subscribable_trait
-pub trait Subscribable: Sized {
+// ANCHOR: projection_filters_trait
+pub trait ProjectionFilters: Sized {
     /// Aggregate identifier type this subscriber is compatible with.
     type Id;
     /// Instance identifier for this subscriber.
@@ -51,15 +51,18 @@ pub trait Subscribable: Sized {
         S: EventStore<Id = Self::Id>,
         S::Metadata: Clone + Into<Self::Metadata>;
 }
-// ANCHOR_END: subscribable_trait
+// ANCHOR_END: projection_filters_trait
 
 /// Trait implemented by read models that can be constructed from an event
 /// stream.
 ///
-/// Extends [`Subscribable`] with a stable `KIND` identifier for snapshot
-/// storage. Derivable via `#[derive(Projection)]`.
+/// Contains a stable `KIND` identifier for snapshot storage.
+///
+/// `Projection` is intentionally independent from [`ProjectionFilters`], so
+/// `#[derive(Projection)]` can always be used while filter behaviour remains an
+/// explicit opt-in via `ProjectionFilters`.
 // ANCHOR: projection_trait
-pub trait Projection: Subscribable {
+pub trait Projection {
     /// Stable identifier for this projection type.
     const KIND: &'static str;
 }
@@ -79,7 +82,7 @@ pub trait Projection: Subscribable {
 /// }
 /// ```
 // ANCHOR: apply_projection_trait
-pub trait ApplyProjection<E>: Subscribable {
+pub trait ApplyProjection<E>: ProjectionFilters {
     fn apply_projection(&mut self, aggregate_id: &Self::Id, event: &E, metadata: &Self::Metadata);
 }
 // ANCHOR_END: apply_projection_trait
@@ -136,7 +139,7 @@ pub(crate) type PositionedFilters<S, P> = (
 /// Combined filter configuration and handler map for a subscriber.
 ///
 /// `Filters` captures both the event filters (which events to load) and the
-/// handler closures (how to apply them). It is parameterized by the store
+/// handler closures (how to apply them). It is parameterised by the store
 /// type `S` to enable store-mediated decoding.
 ///
 /// Filters are constructed without positions. Positions are applied at
@@ -152,7 +155,7 @@ where
 impl<S, P> Default for Filters<S, P>
 where
     S: EventStore,
-    P: Subscribable<Id = S::Id>,
+    P: ProjectionFilters<Id = S::Id>,
 {
     fn default() -> Self {
         Self::new()
@@ -162,7 +165,7 @@ where
 impl<S, P> Filters<S, P>
 where
     S: EventStore,
-    P: Subscribable<Id = S::Id>,
+    P: ProjectionFilters<Id = S::Id>,
 {
     /// Create an empty filter set.
     #[must_use]

@@ -29,7 +29,7 @@ struct PaymentReceived { /* ... */ }
 **Why**:
 - Domain events stay pure (no infrastructure metadata)
 - Same event type works with different ID schemes
-- Command handlers focus on behavior, not identity
+- Command handlers focus on behaviour, not identity
 - IDs travel in the envelope alongside events
 
 **Trade-off**: You can't access the ID inside `Handle<C>`. If needed, include relevant IDs in the command.
@@ -62,15 +62,15 @@ trait CommandBus {
 }
 ```
 
-## Event Serialization in Stores
+## Event Serialisation in Stores
 
-**Decision**: EventStore implementations handle serialization, not a separate Codec trait. The generated event enum implements `serde::Serialize` with custom logic that serializes only the inner event struct.
+**Decision**: EventStore implementations handle serialisation, not a separate Codec trait. The generated event enum implements `serde::Serialize` with custom logic that serialises only the inner event struct.
 
 **Why**:
 - Eliminates unnecessary abstraction layer (Codec trait)
 - Store can choose optimal format (JSON, JSONB, MessagePack, etc.)
 - Simpler architecture with fewer generic parameters
-- Event enum variants are never serialized as tagged enums - only the inner event is serialized
+- Event enum variants are never serialised as tagged enums - only the inner event is serialised
 
 **How it works**:
 ```rust,ignore
@@ -85,7 +85,7 @@ enum AccountEvent {
     FundsWithdrawn(FundsWithdrawn),
 }
 
-// Generated Serialize impl — serializes only the inner event
+// Generated Serialize impl — serialises only the inner event
 impl serde::Serialize for AccountEvent {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where S: serde::Serializer {
@@ -98,7 +98,7 @@ impl serde::Serialize for AccountEvent {
 
 // EventStore uses kind() for routing and serde::Serialize for data
 // - kind() returns the event type identifier ("account.deposited")
-// - Serialize serializes just the inner event data
+// - Serialize serialises just the inner event data
 ```
 
 **Event versioning**: Use serde attributes on the event structs themselves:
@@ -127,7 +127,7 @@ struct FundsDeposited {
 #[projection(kind = "dashboard")]
 struct Dashboard { /* ... */ }
 
-impl Subscribable for Dashboard {
+impl ProjectionFilters for Dashboard {
     type Id = String;
     type InstanceId = ();
     type Metadata = ();
@@ -152,7 +152,6 @@ impl ApplyProjection<ShipmentDispatched> for Dashboard { /* ... */ }
 
 **Why**:
 - Event sourcing is the foundation; infrastructure varies by use case
-- Async runtimes differ (tokio, async-std, sync-only)
 - Message brokers differ (Kafka, RabbitMQ, NATS, none)
 - Database choices affect outbox patterns
 - Keeps dependencies minimal

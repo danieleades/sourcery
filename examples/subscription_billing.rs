@@ -31,8 +31,8 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use sourcery::{
-    Aggregate, Apply, ApplyProjection, DomainEvent, Filters, Handle, Projection, Repository,
-    Subscribable,
+    Aggregate, Apply, ApplyProjection, DomainEvent, Filters, Handle, Projection, ProjectionFilters,
+    Repository,
     store::{EventStore, inmemory},
 };
 
@@ -340,7 +340,7 @@ pub struct CustomerBillingProjection {
     customers: HashMap<String, CustomerSnapshot>,
 }
 
-impl Subscribable for CustomerBillingProjection {
+impl ProjectionFilters for CustomerBillingProjection {
     type Id = String;
     type InstanceId = ();
     type Metadata = EventMetadata;

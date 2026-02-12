@@ -14,9 +14,9 @@
 //! DomainEvent ◀──decode_event()── StoredEvent ◀──load_events()─┘
 //! ```
 //!
-//! [`StoredEvent`] contains the serialized event data plus store-assigned
+//! [`StoredEvent`] contains the serialised event data plus store-assigned
 //! metadata (position, aggregate info). Use [`EventStore::decode_event`] to
-//! deserialize back to a domain event.
+//! deserialise back to a domain event.
 use std::future::Future;
 
 pub use nonempty::NonEmpty;
@@ -28,15 +28,15 @@ pub mod inmemory;
 
 /// An event loaded from the store.
 ///
-/// Contains the serialized event data plus store-assigned metadata. Returned by
-/// [`EventStore::load_events`]. Use [`EventStore::decode_event`] to deserialize
+/// Contains the serialised event data plus store-assigned metadata. Returned by
+/// [`EventStore::load_events`]. Use [`EventStore::decode_event`] to deserialise
 /// the `data` field back into a domain event.
 ///
 /// # Type Parameters
 ///
 /// - `Id`: The aggregate identifier type
 /// - `Pos`: The position type used for ordering
-/// - `Data`: The serialized event payload type (e.g., `serde_json::Value`)
+/// - `Data`: The serialised event payload type (e.g., `serde_json::Value`)
 /// - `M`: The metadata type
 #[derive(Clone, Debug)]
 pub struct StoredEvent<Id, Pos, Data, M> {
@@ -48,7 +48,7 @@ pub struct StoredEvent<Id, Pos, Data, M> {
     pub kind: String,
     /// The global position assigned by the store.
     pub position: Pos,
-    /// The serialized event payload.
+    /// The serialised event payload.
     pub data: Data,
     /// Infrastructure metadata (timestamps, causation IDs, etc.).
     pub metadata: M,
@@ -144,7 +144,7 @@ pub enum CommitError<StoreError>
 where
     StoreError: std::error::Error,
 {
-    /// Failed to serialize an event.
+    /// Failed to serialise an event.
     #[error("failed to serialize event at index {index}")]
     Serialization {
         index: usize,
@@ -163,7 +163,7 @@ where
     Pos: std::fmt::Debug,
     StoreError: std::error::Error,
 {
-    /// Failed to serialize an event.
+    /// Failed to serialise an event.
     #[error("failed to serialize event at index {index}")]
     Serialization {
         index: usize,
@@ -194,15 +194,15 @@ pub type LoadEventsResult<Id, Pos, Data, M, E> = Result<StoredEvents<Id, Pos, Da
 /// Abstraction over the persistence layer for event streams.
 ///
 /// This trait supports both stream-based and type-partitioned storage
-/// implementations. Stores own event serialization/deserialization.
+/// implementations. Stores own event serialisation/deserialisation.
 ///
-/// Associated types allow stores to customize their behavior:
+/// Associated types allow stores to customise their behaviour:
 /// - `Id`: Aggregate identifier type
 /// - `Position`: Ordering strategy (`()` for stream-based, `u64` for global
 ///   ordering)
 /// - `Metadata`: Infrastructure metadata type (timestamps, causation tracking,
 ///   etc.)
-/// - `Data`: Serialized event payload type (e.g., `serde_json::Value` for JSON)
+/// - `Data`: Serialised event payload type (e.g., `serde_json::Value` for JSON)
 // ANCHOR: event_store_trait
 pub trait EventStore: Send + Sync {
     /// Aggregate identifier type.
@@ -223,7 +223,7 @@ pub trait EventStore: Send + Sync {
     /// Metadata type for infrastructure concerns.
     type Metadata: Send + Sync + 'static;
 
-    /// Serialized event payload type.
+    /// Serialised event payload type.
     ///
     /// This is the format used to store event data internally. Common choices:
     /// - `serde_json::Value` for JSON-based stores
@@ -232,12 +232,12 @@ pub trait EventStore: Send + Sync {
 
     /// Decode a stored event into a concrete event type.
     ///
-    /// Deserializes the `data` field of a [`StoredEvent`] back into a domain
+    /// Deserialises the `data` field of a [`StoredEvent`] back into a domain
     /// event.
     ///
     /// # Errors
     ///
-    /// Returns an error if deserialization fails.
+    /// Returns an error if deserialisation fails.
     fn decode_event<E>(
         &self,
         stored: &StoredEvent<Self::Id, Self::Position, Self::Data, Self::Metadata>,
@@ -260,12 +260,12 @@ pub trait EventStore: Send + Sync {
 
     /// Commit events to an aggregate stream without version checking.
     ///
-    /// Events are serialized and persisted atomically. No conflict detection
+    /// Events are serialised and persisted atomically. No conflict detection
     /// is performed (last-writer-wins).
     ///
     /// # Errors
     ///
-    /// Returns [`CommitError::Serialization`] if an event fails to serialize,
+    /// Returns [`CommitError::Serialization`] if an event fails to serialise,
     /// or [`CommitError::Store`] if persistence fails.
     fn commit_events<'a, E>(
         &'a self,
@@ -281,7 +281,7 @@ pub trait EventStore: Send + Sync {
     /// Commit events to an aggregate stream with optimistic concurrency
     /// control.
     ///
-    /// Events are serialized and persisted atomically. The commit fails if:
+    /// Events are serialised and persisted atomically. The commit fails if:
     /// - `expected_version` is `Some(v)` and the current version differs from
     ///   `v`
     /// - `expected_version` is `None` and the stream already has events (new
@@ -290,7 +290,7 @@ pub trait EventStore: Send + Sync {
     /// # Errors
     ///
     /// Returns [`OptimisticCommitError::Serialization`] if an event fails to
-    /// serialize, [`OptimisticCommitError::Conflict`] if the version check
+    /// serialise, [`OptimisticCommitError::Conflict`] if the version check
     /// fails, or [`OptimisticCommitError::Store`] if persistence fails.
     #[allow(clippy::type_complexity)]
     fn commit_events_optimistic<'a, E>(
@@ -317,7 +317,7 @@ pub trait EventStore: Send + Sync {
     /// - [`EventFilter::for_event`] loads every event of the given kind
     /// - [`EventFilter::for_aggregate`] narrows to a single aggregate instance
     ///
-    /// The store optimizes based on its storage model and returns events
+    /// The store optimises based on its storage model and returns events
     /// merged by position (if positions are available).
     ///
     /// # Errors

@@ -35,7 +35,7 @@ use crate::{
     aggregate::{Aggregate, Handle},
     concurrency::{ConcurrencyConflict, ConcurrencyStrategy, Optimistic, Unchecked},
     event::{EventKind, ProjectionEvent},
-    projection::{HandlerError, Projection, ProjectionError, Subscribable},
+    projection::{HandlerError, Projection, ProjectionError, ProjectionFilters},
     snapshot::{OfferSnapshotError, Snapshot, SnapshotOffer, SnapshotStore},
     store::{
         CommitError, EventFilter, EventStore, GloballyOrderedStore, OptimisticCommitError,
@@ -620,13 +620,13 @@ where
     /// Load a projection by replaying events (one-shot query, no snapshots).
     ///
     /// Filter configuration is defined centrally in the projection's
-    /// [`Subscribable`] implementation. The `instance_id` parameterizes
+    /// [`ProjectionFilters`] implementation. The `instance_id` parameterises
     /// which events to load.
     ///
     /// # Errors
     ///
     /// Returns [`ProjectionError`] when the store fails to load events or when
-    /// an event cannot be deserialized.
+    /// an event cannot be deserialised.
     #[tracing::instrument(
         skip(self, instance_id),
         fields(
@@ -638,7 +638,7 @@ where
         instance_id: &P::InstanceId,
     ) -> Result<P, ProjectionError<S::Error>>
     where
-        P: Subscribable<Id = S::Id>,
+        P: ProjectionFilters<Id = S::Id>,
         P::InstanceId: Send + Sync,
         S::Metadata: Clone + Into<P::Metadata>,
         M: Sync,
@@ -809,7 +809,7 @@ where
     /// # Errors
     ///
     /// Returns [`ProjectionError`] when the store fails to load events or when
-    /// an event cannot be deserialized.
+    /// an event cannot be deserialised.
     #[tracing::instrument(
         skip(self, instance_id),
         fields(
@@ -821,7 +821,7 @@ where
         instance_id: &P::InstanceId,
     ) -> Result<P, ProjectionError<S::Error>>
     where
-        P: Projection<Id = S::Id> + Serialize + DeserializeOwned + Sync,
+        P: Projection + ProjectionFilters<Id = S::Id> + Serialize + DeserializeOwned + Sync,
         P::InstanceId: Send + Sync,
         S::Metadata: Clone + Into<P::Metadata>,
         SS: SnapshotStore<P::InstanceId, Position = S::Position>,
@@ -946,7 +946,13 @@ where
     where
         S: SubscribableStore + Clone + 'static,
         S::Position: Ord,
-        P: Projection<Id = S::Id> + Serialize + DeserializeOwned + Send + Sync + 'static,
+        P: Projection
+            + ProjectionFilters<Id = S::Id>
+            + Serialize
+            + DeserializeOwned
+            + Send
+            + Sync
+            + 'static,
         P::InstanceId: Clone + Send + Sync + 'static,
         P::Metadata: Send,
         S::Metadata: Clone + Into<P::Metadata>,
@@ -970,7 +976,13 @@ where
     where
         S: SubscribableStore + Clone + 'static,
         S::Position: Ord,
-        P: Projection<Id = S::Id> + Serialize + DeserializeOwned + Send + Sync + 'static,
+        P: Projection
+            + ProjectionFilters<Id = S::Id>
+            + Serialize
+            + DeserializeOwned
+            + Send
+            + Sync
+            + 'static,
         P::InstanceId: Clone + Send + Sync + 'static,
         P::Metadata: Send,
         S::Metadata: Clone + Into<P::Metadata>,

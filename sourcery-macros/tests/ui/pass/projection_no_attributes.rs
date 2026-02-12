@@ -3,14 +3,14 @@ extern crate self as sourcery;
 #[path = "../common.rs"]
 mod support;
 
-pub use support::{codec, store, Aggregate, Apply, Filters, Projection, Subscribable};
+pub use support::{codec, store, Aggregate, Apply, Filters, Projection, ProjectionFilters};
 
 use sourcery_macros::Projection;
 
 #[derive(Default, Projection)]
 pub struct AccountLedger {}
 
-impl Subscribable for AccountLedger {
+impl ProjectionFilters for AccountLedger {
     type Id = String;
     type InstanceId = ();
     type Metadata = ();

@@ -2,4 +2,4 @@ error: Unsupported shape `expected `key = Type``
   --> tests/ui/fail/aggregate_id_string_literal.rs:23:13
    |
 23 | #[aggregate(id = "String", error = AggregateError, events(FundsDeposited))]
-   |             ^^
+   |             ^^^^^^^^^^^^^

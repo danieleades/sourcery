@@ -1,4 +1,4 @@
-//! Integration tests for aggregate behavior using the test utilities.
+//! Integration tests for aggregate behaviour using the test utilities.
 //! Run with `cargo test --features test-util`.
 
 #[cfg(feature = "test-util")]

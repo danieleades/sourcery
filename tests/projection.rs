@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use sourcery::{
     Aggregate, Apply, ApplyProjection, DomainEvent, EventKind, Filters, Handle, Projection,
-    Repository, Subscribable,
+    ProjectionFilters, Repository,
     projection::ProjectionError,
     store::{EventStore, inmemory},
     test::RepositoryTestExt,
@@ -26,8 +26,8 @@ impl DomainEvent for ValueAdded {
     const KIND: &'static str = "value-added";
 }
 
-/// Test helper that serializes to invalid JSON for testing deserialization
-/// error handling. Uses the same KIND as `ValueAdded` but serializes to a
+/// Test helper that serialises to invalid JSON for testing deserialisation
+/// error handling. Uses the same KIND as `ValueAdded` but serialises to a
 /// string instead of an object.
 struct InvalidValueAdded;
 
@@ -90,7 +90,7 @@ struct TotalsProjection {
     totals: HashMap<String, i32>,
 }
 
-impl Subscribable for TotalsProjection {
+impl ProjectionFilters for TotalsProjection {
     type Id = String;
     type InstanceId = ();
     type Metadata = ();
@@ -128,7 +128,7 @@ struct FilteredTotalsProjection {
     totals: HashMap<String, i32>,
 }
 
-impl Subscribable for FilteredTotalsProjection {
+impl ProjectionFilters for FilteredTotalsProjection {
     type Id = String;
     type InstanceId = String;
     type Metadata = ();
@@ -216,7 +216,7 @@ async fn load_surfaces_deserialization_error() {
 // - A projection is tightly coupled to one aggregate and wants all its events
 //
 // For most projections, prefer chaining `.event::<E>()` calls instead - this
-// subscribes to specific event types without needing the enum dispatch impl.
+// targets specific event types without needing the enum dispatch impl.
 // ============================================================================
 
 /// Second event type to test multi-event aggregate enums
@@ -286,7 +286,7 @@ struct EnumProjection {
     last_value: Option<i32>,
 }
 
-impl Subscribable for EnumProjection {
+impl ProjectionFilters for EnumProjection {
     type Id = String;
     type InstanceId = ();
     type Metadata = ();
@@ -331,7 +331,7 @@ struct EventsForProjection {
     last_value: Option<i32>,
 }
 
-impl Subscribable for EventsForProjection {
+impl ProjectionFilters for EventsForProjection {
     type Id = String;
     type InstanceId = String;
     type Metadata = ();
@@ -398,7 +398,7 @@ async fn events_loads_all_events_from_aggregate_enum() {
     .await
     .unwrap();
 
-    // Use events() via the EnumProjection's Subscribable impl
+    // Use events() via the EnumProjection's ProjectionFilters impl
     let projection: EnumProjection = repo.load_projection(&()).await.unwrap();
 
     assert_eq!(projection.additions, 13); // 10 + 3
@@ -436,7 +436,7 @@ async fn events_for_loads_events_for_specific_aggregate_instance() {
     .await
     .unwrap();
 
-    // Use events_for() via the EventsForProjection's Subscribable impl
+    // Use events_for() via the EventsForProjection's ProjectionFilters impl
     let projection: EventsForProjection = repo.load_projection(&"c1".to_string()).await.unwrap();
 
     assert_eq!(projection.additions, 10); // only c1's addition
@@ -456,7 +456,7 @@ struct SnapshotProjection {
     event_count: u32,
 }
 
-impl Subscribable for SnapshotProjection {
+impl ProjectionFilters for SnapshotProjection {
     type Id = String;
     type InstanceId = String;
     type Metadata = ();

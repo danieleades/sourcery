@@ -2,6 +2,21 @@
 
 While `load_projection` rebuilds a projection from scratch on each call, **subscriptions** maintain an in-memory projection that updates in real time as events are committed.
 
+## Basic Usage
+
+Use `Repository::subscribe` to create a `SubscriptionBuilder`, configure callbacks, then call `start()`:
+
+```rust,ignore
+let subscription = repository
+    .subscribe::<Dashboard>(())
+    .on_update(|dashboard| println!("{dashboard:?}"))
+    .start()
+    .await?;
+```
+
+The instance ID argument matches the projection's `InstanceId` type. For singleton projections (`InstanceId = ()`), pass `()`.
+`start()` returns only after catch-up completes.
+
 ## How Subscriptions Work
 
 A subscription:
@@ -26,21 +41,6 @@ Store -> Sub: "Live event" {style.stroke-dash: 3}
 Sub -> Sub: "apply_projection()"
 Sub -> App: "on_update(&projection)" {style.stroke-dash: 3}
 ```
-
-## Starting a Subscription
-
-Use `Repository::subscribe` to create a `SubscriptionBuilder`, configure callbacks, then call `start()`:
-
-```rust,ignore
-let subscription = repository
-    .subscribe::<Dashboard>(())
-    .on_update(|dashboard| println!("{dashboard:?}"))
-    .start()
-    .await?;
-```
-
-The instance ID argument matches the projection's `InstanceId` type. For singleton projections (`InstanceId = ()`), pass `()`.
-`start()` returns only after catch-up completes.
 
 ## Callbacks
 

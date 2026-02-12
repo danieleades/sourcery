@@ -1,8 +1,8 @@
-//! Advanced projection example using the `Subscribable` trait.
+//! Advanced projection example using the `ProjectionFilters` trait.
 //!
 //! This example demonstrates how to compose a projection that mixes
 //! global and scoped event subscriptions without relying on the
-//! aggregate event enums. The `Subscribable` impl registers:
+//! aggregate event enums. The `ProjectionFilters` impl registers:
 //!
 //! - All `ProductRestocked` events (global)
 //! - `InventoryAdjusted` events scoped to a specific product SKU
@@ -13,7 +13,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use sourcery::{
-    Aggregate, Apply, ApplyProjection, DomainEvent, Filters, Repository, Subscribable,
+    Aggregate, Apply, ApplyProjection, DomainEvent, Filters, ProjectionFilters, Repository,
     store::{EventStore, inmemory},
     test::RepositoryTestExt,
 };
@@ -112,7 +112,7 @@ struct ProductSummary {
     promotion_totals: HashMap<String, i64>,
 }
 
-impl Subscribable for ProductSummary {
+impl ProjectionFilters for ProductSummary {
     type Id = String;
     type InstanceId = ProductSummaryParams;
     type Metadata = ();

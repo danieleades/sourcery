@@ -1,23 +1,23 @@
 //! Domain event marker.
 //!
 //! `DomainEvent` is the lightweight trait every concrete event struct
-//! implements. It intentionally avoids persistence concerns; serialization is
+//! implements. It intentionally avoids persistence concerns; serialisation is
 //! handled by the event stores.
 
 use thiserror::Error;
 
-/// Error returned when deserializing a stored event fails.
+/// Error returned when deserialising a stored event fails.
 #[derive(Debug, Error)]
 pub enum EventDecodeError<StoreError> {
-    /// The event kind was not recognized by this event enum.
+    /// The event kind was not recognised by this event enum.
     #[error("unknown event kind `{kind}`, expected one of {expected:?}")]
     UnknownKind {
-        /// The unrecognized event kind string.
+        /// The unrecognised event kind string.
         kind: String,
         /// The list of event kinds this enum can handle.
         expected: &'static [&'static str],
     },
-    /// The store failed to deserialize the event data.
+    /// The store failed to deserialise the event data.
     #[error("store error: {0}")]
     Store(#[source] StoreError),
 }
@@ -59,26 +59,26 @@ impl<T: DomainEvent> EventKind for T {
     }
 }
 
-/// Trait for event sum types that can deserialize themselves from stored
+/// Trait for event sum types that can deserialise themselves from stored
 /// events.
 ///
-/// Implemented by event enums to deserialize stored events.
+/// Implemented by event enums to deserialise stored events.
 ///
 /// Deriving [`Aggregate`](crate::aggregate::Aggregate) includes a
 /// `ProjectionEvent` implementation for the generated sum type. Custom enums
 /// can opt in manually using the pattern illustrated below.
 pub trait ProjectionEvent: Sized {
-    /// The list of event kinds this sum type can deserialize.
+    /// The list of event kinds this sum type can deserialise.
     ///
     /// This data is generated automatically when using the derive macros.
     const EVENT_KINDS: &'static [&'static str];
 
-    /// Deserialize an event from stored representation.
+    /// Deserialise an event from stored representation.
     ///
     /// # Errors
     ///
     /// Returns [`EventDecodeError::UnknownKind`] if the event kind is not
-    /// recognized, or [`EventDecodeError::Store`] if deserialization fails.
+    /// recognised, or [`EventDecodeError::Store`] if deserialisation fails.
     fn from_stored<S: crate::store::EventStore>(
         stored: &crate::store::StoredEvent<S::Id, S::Position, S::Data, S::Metadata>,
         store: &S,

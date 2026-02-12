@@ -76,7 +76,7 @@ Use for: Read-only replicas, debugging.
 {{#include ../../../sourcery-core/src/snapshot.rs:snapshot_store_trait}}
 ```
 
-The repository calls `offer_snapshot` after successfully appending new events. Implementations may decline without invoking `create_snapshot`, avoiding unnecessary snapshot serialization.
+The repository calls `offer_snapshot` after successfully appending new events. Implementations may decline without invoking `create_snapshot`, avoiding unnecessary snapshot serialisation.
 
 ## The `Snapshot` Type
 
@@ -101,7 +101,7 @@ struct LoyaltySummary {
     total_earned: u64,
 }
 
-// (Subscribable impl defines filters and associated types)
+// (ProjectionFilters impl defines filters and associated types)
 
 let repo = Repository::new(store).with_snapshots(inmemory::Store::every(100));
 
@@ -131,10 +131,10 @@ For production, implement `SnapshotStore` with your database. See [Custom Stores
 
 ## Snapshot Invalidation
 
-Snapshots are tied to your aggregate's serialized form. When you change the struct:
+Snapshots are tied to your aggregate's serialised form. When you change the struct:
 
 1. **Add fields** — Use `#[serde(default)]` for backwards compatibility
-2. **Remove fields** — Old snapshots still deserialize (extra fields ignored)
+2. **Remove fields** — Old snapshots still deserialise (extra fields ignored)
 3. **Rename fields** — Use `#[serde(alias = "old_name")]`
 4. **Change types** — Old snapshots become invalid; delete them
 

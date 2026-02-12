@@ -1,65 +1,22 @@
 # Projections
 
-Projections are read models built by replaying events. They're optimized for queries rather than consistency. A single event stream can feed many projections, each structuring data differently.
+Projections are read models built by replaying events. They are query-oriented and eventually consistent.
 
-## The `Subscribable` Trait
+## Basic Usage
 
-```rust,ignore
-{{#include ../../../sourcery-core/src/projection.rs:subscribable_trait}}
-```
+Most projections should use this shape:
 
-`Subscribable` is the base trait for types that consume events. It defines:
-
-- **`Id`** — the aggregate identifier type
-- **`InstanceId`** — the projection instance identifier (use `()` for singletons)
-- **`Metadata`** — the metadata type passed to event handlers
-- **`init()`** — constructs a fresh instance from the instance identifier
-- **`filters()`** — builds the filter set and handler map centrally
-
-## The `Projection` Trait
+1. `#[derive(Projection)]`
+2. `#[projection(events(...))]`
+3. `impl ApplyProjection<E>` for each event
 
 ```rust,ignore
-{{#include ../../../sourcery-core/src/projection.rs:projection_trait}}
-```
-
-Extends `Subscribable` with a stable `KIND` identifier used for snapshot storage. Derivable via `#[derive(Projection)]`.
-
-## The `ApplyProjection<E>` Trait
-
-```rust,ignore
-{{#include ../../../sourcery-core/src/projection.rs:apply_projection_trait}}
-```
-
-Projections receive the aggregate ID and metadata alongside each event, enabling cross-aggregate views and audit trails.
-
-## Basic Example
-
-```rust,ignore
-use sourcery::{ApplyProjection, Filters, Subscribable, store::EventStore};
+use sourcery::ApplyProjection;
 
 #[derive(Debug, Default, sourcery::Projection)]
+#[projection(events(FundsDeposited, FundsWithdrawn))]
 pub struct AccountSummary {
     pub accounts: HashMap<String, i64>,
-}
-
-impl Subscribable for AccountSummary {
-    type Id = String;
-    type InstanceId = ();
-    type Metadata = ();
-
-    fn init((): &()) -> Self {
-        Self::default()
-    }
-
-    fn filters<S>((): &()) -> Filters<S, Self>
-    where
-        S: EventStore<Id = String>,
-        S::Metadata: Clone + Into<()>,
-    {
-        Filters::new()
-            .event::<FundsDeposited>()
-            .event::<FundsWithdrawn>()
-    }
 }
 
 impl ApplyProjection<FundsDeposited> for AccountSummary {
@@ -75,9 +32,9 @@ impl ApplyProjection<FundsWithdrawn> for AccountSummary {
 }
 ```
 
-## Loading Projections
+`#[projection(events(...))]` auto-generates `ProjectionFilters` for the common singleton case.
 
-Filter configuration is defined centrally in `Subscribable::filters()`, not at the call site. Pass the instance ID to load:
+## Loading Projections
 
 ```rust,ignore
 // Singleton projection (InstanceId = ())
@@ -91,16 +48,49 @@ let report = repository
     .await?;
 ```
 
-## The `Filters` Builder
+## When You Need Manual Filters
 
-`Filters` captures both which events to load and how to apply them:
+Implement `ProjectionFilters` yourself when you need:
+
+- Dynamic filter logic
+- `event_for` / `events_for` scoped filtering
+- Non-default projection initialisation
+- Custom `Id`, `InstanceId`, or `Metadata` with explicit control
+
+## Trait Reference
+
+### The `Projection` Trait
+
+```rust,ignore
+{{#include ../../../sourcery-core/src/projection.rs:projection_trait}}
+```
+
+`Projection` provides a stable `KIND` used for projection snapshots.
+
+### The `ApplyProjection<E>` Trait
+
+```rust,ignore
+{{#include ../../../sourcery-core/src/projection.rs:apply_projection_trait}}
+```
+
+`ApplyProjection<E>` is where event handling logic lives.
+
+### The `ProjectionFilters` Trait
+
+```rust,ignore
+{{#include ../../../sourcery-core/src/projection.rs:projection_filters_trait}}
+```
+
+`ProjectionFilters` controls initialisation and filter selection.
+
+## Advanced Filtering with `Filters`
 
 ```rust,ignore
 Filters::new()
-    .event::<FundsDeposited>()           // Global: all aggregates
-    .event_for::<Account, FundsWithdrawn>(&id)  // Scoped: specific aggregate instance
-    .events::<AccountEvent>()            // All variants of an event enum
-    .events_for::<Account>(&id)          // All variants for a specific aggregate
+    .event::<FundsDeposited>()                 // Global: all aggregates
+    .event_for::<Account, FundsWithdrawn>(&id) // Event from one aggregate instance
+    .events::<AccountEvent>()                  // All variants in an event enum
+    .events_for::<Account>(&id)                // All events for one aggregate instance
 ```
 
 | Method | Scope |
@@ -112,10 +102,8 @@ Filters::new()
 
 ## Multi-Aggregate Projections
 
-Projections can consume events from multiple aggregate types. Register each event type in `filters()`:
-
 ```rust,ignore
-impl Subscribable for InventoryReport {
+impl ProjectionFilters for InventoryReport {
     type Id = String;
     type InstanceId = ();
     type Metadata = ();
@@ -128,35 +116,16 @@ impl Subscribable for InventoryReport {
         S::Metadata: Clone + Into<()>,
     {
         Filters::new()
-            .event::<ProductCreated>()   // From Product aggregate
-            .event::<SaleRecorded>()     // From Sale aggregate
+            .event::<ProductCreated>()
+            .event::<SaleRecorded>()
     }
 }
 ```
 
-Implement `ApplyProjection<E>` for each event type the projection handles.
-
-## Filtering by Aggregate
-
-Use `events_for` to load all events for a specific aggregate instance:
+## Metadata in Projections
 
 ```rust,ignore
-fn filters<S>(account_id: &String) -> Filters<S, Self>
-where
-    S: EventStore<Id = String>,
-    S::Metadata: Clone + Into<()>,
-{
-    Filters::new()
-        .events_for::<Account>(account_id)
-}
-```
-
-## Using Metadata
-
-Projections can access event metadata for cross-cutting concerns. Set the `Metadata` associated type on `Subscribable`:
-
-```rust,ignore
-impl Subscribable for AuditLog {
+impl ProjectionFilters for AuditLog {
     type Id = String;
     type InstanceId = ();
     type Metadata = EventMetadata;
@@ -185,23 +154,41 @@ impl ApplyProjection<FundsDeposited> for AuditLog {
 
 ## Singleton vs Instance Projections
 
-- **Singleton** (`InstanceId = ()`): One global projection. Use `init((): &())` and `load_projection::<P>(&())`.
-- **Instance** (`InstanceId = String` or custom type): One projection per instance. Use `init(id: &String)` and `load_projection::<P>(&id)`.
+- **Singleton** (`InstanceId = ()`): one global projection.
+- **Instance** (`InstanceId = String` or custom type): one projection per instance ID.
 
-Instance projections can capture their identity at construction time and use it to scope their filters.
+### Example: Instance Projection with Scoped Filters
+
+A projection parameterised by two aggregate IDs, subscribing to all events from each:
+
+```rust,ignore
+impl ProjectionFilters for AccountComparison {
+    type Id = String;
+    type InstanceId = (String, String);
+    type Metadata = ();
+
+    fn init(ids: &Self::InstanceId) -> Self {
+        Self { left_id: ids.0.clone(), right_id: ids.1.clone(), ..Self::default() }
+    }
+
+    fn filters<S>(ids: &Self::InstanceId) -> Filters<S, Self>
+    where
+        S: EventStore<Id = String>,
+        S::Metadata: Clone + Into<()>,
+    {
+        let (left, right) = ids;
+        Filters::new()
+            .events_for::<Account>(left)
+            .events_for::<Account>(right)
+    }
+}
+```
+
+`apply_projection` receives the aggregate ID, not the instance ID — store the IDs in `init` so the handler can distinguish which aggregate each event belongs to.
 
 ## Snapshotting Projections
 
-On repositories with snapshot support, use `load_projection_with_snapshot`:
-
-```rust,ignore
-let projection = repo
-    .load_projection_with_snapshot::<LoyaltySummary>(&instance_id)
-    .await?;
-```
-
-Snapshotting requires a globally ordered store (`S: GloballyOrderedStore`),
-`S::Position: Ord`, and `P: Serialize + DeserializeOwned`.
+Projections support snapshots for faster loading. See [Snapshots — Projection Snapshots](../advanced/snapshots.md#projection-snapshots) for details.
 
 ## Projections vs Aggregates
 
@@ -216,4 +203,4 @@ Snapshotting requires a globally ordered store (`S: GloballyOrderedStore`),
 
 ## Next
 
-[Stores](stores.md) — Event persistence and serialization
+[Stores](stores.md) — Event persistence and serialisation

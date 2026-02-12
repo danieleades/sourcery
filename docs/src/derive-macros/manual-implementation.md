@@ -2,7 +2,7 @@
 
 While `#[derive(Aggregate)]` handles most cases, you might implement the traits manually for:
 
-- Custom serialization logic
+- Custom serialisation logic
 - Non-standard event routing
 - Learning how the system works
 
@@ -92,7 +92,7 @@ impl EventKind for AccountEvent {
     }
 }
 
-// Serialize — serializes only the inner event (no enum wrapper)
+// Serialize — serialises only the inner event (no enum wrapper)
 impl serde::Serialize for AccountEvent {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -105,7 +105,7 @@ impl serde::Serialize for AccountEvent {
     }
 }
 
-// ProjectionEvent for loading/deserialization
+// ProjectionEvent for loading/deserialisation
 impl ProjectionEvent for AccountEvent {
     const EVENT_KINDS: &'static [&'static str] = &[
         FundsDeposited::KIND,
@@ -155,7 +155,7 @@ impl Aggregate for Account {
 
 ## Trade-offs
 
-**You gain**: Custom enum structure, custom serialization (compress/encrypt), fallback handling for unknown events, conditional replay logic.
+**You gain**: Custom enum structure, custom serialisation (compress/encrypt), fallback handling for unknown events, conditional replay logic.
 
 **You lose**: More code to maintain, easy to introduce bugs in match arms, must keep `EVENT_KINDS` in sync with `from_stored`.
 
@@ -165,10 +165,10 @@ impl Aggregate for Account {
 |----------|----------------|
 | Standard CRUD aggregate | Use derive macro |
 | Learning the crate | Start with derive, then explore manual |
-| Custom event serialization | Manual |
+| Custom event serialisation | Manual |
 | Dynamic event types | Manual |
 | Unusual enum structure | Manual |
 
 ## Next
 
-[Snapshots](../advanced/snapshots.md) — Optimizing aggregate loading
+[Snapshots](../advanced/snapshots.md) — Optimising aggregate loading

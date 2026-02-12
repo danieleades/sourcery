@@ -9,8 +9,8 @@ use std::sync::{
 
 use serde::{Deserialize, Serialize};
 use sourcery::{
-    Aggregate, Apply, ApplyProjection, DomainEvent, Filters, Handle, Projection, Repository,
-    Subscribable,
+    Aggregate, Apply, ApplyProjection, DomainEvent, Filters, Handle, Projection, ProjectionFilters,
+    Repository,
     store::{EventStore, inmemory},
 };
 
@@ -68,7 +68,7 @@ struct ItemCount {
     count: u32,
 }
 
-impl Subscribable for ItemCount {
+impl ProjectionFilters for ItemCount {
     type Id = String;
     type InstanceId = ();
     type Metadata = ();

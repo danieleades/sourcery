@@ -1,63 +1,79 @@
 # The Projection Derive
 
-The `#[derive(Projection)]` macro implements the `Projection` trait for a
-struct, generating the `KIND` constant. You implement `Subscribable` and
-`ApplyProjection<E>` manually.
+`#[derive(Projection)]` generates a stable projection `KIND`.
 
-## What Gets Generated
+For common cases, `#[projection(events(...))]` also generates `ProjectionFilters`.
 
-The macro generates only:
+## Basic Usage
 
 ```rust,ignore
-impl Projection for MyProjection {
-    const KIND: &'static str = "my-projection"; // kebab-case by default
+use sourcery::ApplyProjection;
+
+#[derive(Debug, Default, sourcery::Projection)]
+#[projection(events(FundsDeposited, FundsWithdrawn))]
+pub struct AccountSummary {
+    totals: HashMap<String, i64>,
+}
+
+impl ApplyProjection<FundsDeposited> for AccountSummary {
+    fn apply_projection(&mut self, id: &Self::Id, event: &FundsDeposited, _: &Self::Metadata) {
+        *self.totals.entry(id.clone()).or_default() += event.amount;
+    }
+}
+
+impl ApplyProjection<FundsWithdrawn> for AccountSummary {
+    fn apply_projection(&mut self, id: &Self::Id, event: &FundsWithdrawn, _: &Self::Metadata) {
+        *self.totals.entry(id.clone()).or_default() -= event.amount;
+    }
 }
 ```
+
+That is the recommended default path.
 
 ## Attributes
 
-All attributes are optional:
-
 | Attribute | Default | Description |
 |-----------|---------|-------------|
-| `kind = "name"` | kebab-case struct name | Projection type identifier for snapshots |
+| `kind = "name"` | kebab-case struct name | Projection identifier for snapshots |
+| `events(E1, E2, ...)` | none | Auto-generate `ProjectionFilters::filters()` |
+| `id = Type` | `String` | Auto-generated `ProjectionFilters::Id` |
+| `instance_id = Type` | `()` | Auto-generated `ProjectionFilters::InstanceId` |
+| `metadata = Type` | `()` | Auto-generated `ProjectionFilters::Metadata` |
 
-## Minimal Example
+## What Is Generated
+
+Always:
 
 ```rust,ignore
-#[derive(Default, sourcery::Projection)]
-pub struct AccountLedger {
-    total: i64,
+impl Projection for MyProjection {
+    const KIND: &'static str = "my-projection";
 }
 ```
 
-This generates `impl Projection for AccountLedger` with `KIND = "account-ledger"`.
+When `events(...)` (or filter type overrides) are present, also generates:
 
-## Custom Kind
+- `impl ProjectionFilters for MyProjection`
+- `init(...) -> Self::default()`
+- `filters(...) -> Filters::new().event::<...>()...`
 
-```rust,ignore
-#[derive(Default, sourcery::Projection)]
-#[projection(kind = "audit-log")]
-pub struct AuditLog {
-    entries: Vec<AuditEntry>,
-}
-```
+## When to Go Manual
 
-## Complete Projection Setup
+Manually implement `ProjectionFilters` when you need:
 
-The derive only generates the `Projection` impl. You must also implement
-`Subscribable` (for filter configuration) and `ApplyProjection<E>` (for event
-handlers):
+- Dynamic filtering
+- `event_for` / `events_for`
+- Non-default initialisation
+- Full control over filter construction
 
 ```rust,ignore
-use sourcery::{ApplyProjection, Filters, Subscribable, store::EventStore};
+use sourcery::{ApplyProjection, Filters, ProjectionFilters, store::EventStore};
 
 #[derive(Debug, Default, sourcery::Projection)]
 pub struct AccountSummary {
     totals: HashMap<String, i64>,
 }
 
-impl Subscribable for AccountSummary {
+impl ProjectionFilters for AccountSummary {
     type Id = String;
     type InstanceId = ();
     type Metadata = ();
@@ -76,18 +92,9 @@ impl Subscribable for AccountSummary {
             .event::<FundsWithdrawn>()
     }
 }
-
-impl ApplyProjection<FundsDeposited> for AccountSummary {
-    fn apply_projection(&mut self, id: &Self::Id, event: &FundsDeposited, _: &Self::Metadata) {
-        *self.totals.entry(id.clone()).or_default() += event.amount;
-    }
-}
 ```
 
 ## Loading
-
-Since filters are defined centrally in `Subscribable::filters()`, loading is a
-single call:
 
 ```rust,ignore
 let projection = repository

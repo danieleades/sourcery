@@ -37,7 +37,7 @@ use tokio_stream::StreamExt as _;
 
 use crate::{
     event::EventDecodeError,
-    projection::{HandlerError, Projection, Subscribable},
+    projection::{HandlerError, Projection, ProjectionFilters},
     snapshot::{Snapshot, SnapshotStore},
     store::{EventFilter, EventStore, GloballyOrderedStore, StoredEvent},
 };
@@ -136,6 +136,7 @@ where
     /// # Errors
     ///
     /// Returns the subscription's error if it failed before being stopped.
+    #[allow(clippy::missing_panics_doc)]
     pub async fn stop(mut self) -> Result<(), SubscriptionError<StoreError>> {
         if let Some(tx) = self.stop_tx.take() {
             let _ = tx.send(());
@@ -189,7 +190,7 @@ type UpdateCallback<P> = Box<dyn Fn(&P) + Send + Sync + 'static>;
 pub struct SubscriptionBuilder<S, P, SS>
 where
     S: EventStore,
-    P: Subscribable,
+    P: ProjectionFilters,
 {
     store: S,
     snapshots: SS,
@@ -203,7 +204,13 @@ where
     S::Position: Ord + Send + Sync,
     S::Data: Send,
     S::Metadata: Clone + Send + Sync + Into<P::Metadata>,
-    P: Projection<Id = S::Id> + Serialize + DeserializeOwned + Send + Sync + 'static,
+    P: Projection
+        + ProjectionFilters<Id = S::Id>
+        + Serialize
+        + DeserializeOwned
+        + Send
+        + Sync
+        + 'static,
     P::InstanceId: Clone + Send + Sync + 'static,
     P::Metadata: Send,
     SS: SnapshotStore<P::InstanceId, Position = S::Position> + Send + Sync + 'static,
@@ -431,7 +438,7 @@ async fn load_snapshot<P, SS>(
     instance_id: &P::InstanceId,
 ) -> (P, Option<SS::Position>)
 where
-    P: Projection + DeserializeOwned,
+    P: Projection + ProjectionFilters + DeserializeOwned,
     P::InstanceId: Sync,
     SS: SnapshotStore<P::InstanceId>,
 {
@@ -458,7 +465,7 @@ fn apply_handler<P, S>(
     store: &S,
 ) -> Result<(), SubscriptionError<S::Error>>
 where
-    P: Subscribable<Id = S::Id>,
+    P: ProjectionFilters<Id = S::Id>,
     S: EventStore,
 {
     (handler)(
@@ -484,7 +491,7 @@ async fn offer_projection_snapshot<P, SS>(
     projection: &P,
 ) -> bool
 where
-    P: Projection + Serialize + Sync,
+    P: Projection + ProjectionFilters + Serialize + Sync,
     P::InstanceId: Sync,
     SS: SnapshotStore<P::InstanceId>,
     SS::Position: Clone,

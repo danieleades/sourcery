@@ -23,7 +23,7 @@ Works for:
 
 ## Strategy 2: Explicit Versioning
 
-Keep old event types, migrate at deserialization:
+Keep old event types, migrate at deserialisation:
 
 ```rust,ignore
 // Original event (still in storage)
@@ -92,7 +92,7 @@ impl From<UserRegisteredV2> for UserRegistered {
 }
 ```
 
-When deserializing, `serde-evolve` tries each ancestor in order and applies the `From` chain.
+When deserialising, `serde-evolve` tries each ancestor in order and applies the `From` chain.
 
 ## Which Strategy to Use?
 
@@ -108,7 +108,7 @@ When deserializing, `serde-evolve` tries each ancestor in order and applies the 
 The `KIND` constant must never change for stored events:
 
 ```rust,ignore
-// BAD: Changing KIND breaks deserialization
+// BAD: Changing KIND breaks deserialisation
 impl DomainEvent for UserRegistered {
     const KIND: &'static str = "user.created";  // Was "user.registered"
 }
@@ -117,12 +117,12 @@ impl DomainEvent for UserRegistered {
 impl DomainEvent for UserCreated {
     const KIND: &'static str = "user.created";
 }
-// Old UserRegistered events still deserialize, then convert
+// Old UserRegistered events still deserialise, then convert
 ```
 
 ## Testing Migrations
 
-Include serialized old events in your test suite:
+Include serialised old events in your test suite:
 
 ```rust,ignore
 #[test]

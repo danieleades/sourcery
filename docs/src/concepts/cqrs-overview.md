@@ -26,14 +26,14 @@ Write.Store -> Read.Store: {style.stroke-dash: 3}
 
 **Write side**: Commands validate against the aggregate and produce events. The aggregate enforces business rules.
 
-**Read side**: Projections consume events and build optimized views for queries. Each projection can structure data however the UI needs.
+**Read side**: Projections consume events and build optimised views for queries. Each projection can structure data however the UI needs.
 
 ## Why Separate?
 
 | Concern | Write Model | Read Model |
 |---------|-------------|------------|
-| **Optimized for** | Consistency, validation | Query performance |
-| **Structure** | Reflects domain behavior | Reflects UI needs |
+| **Optimised for** | Consistency, validation | Query performance |
+| **Structure** | Reflects domain behaviour | Reflects UI needs |
 | **Updates** | Transactional | Eventually consistent |
 | **Scaling** | Consistent writes | Replicated reads |
 

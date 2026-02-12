@@ -1,6 +1,6 @@
 # Stores
 
-The crate separates storage concerns into two traits: `EventStore` for event persistence and `SnapshotStore` for aggregate snapshots. Serialization is handled internally by stores using `serde`.
+The crate separates storage concerns into two traits: `EventStore` for event persistence and `SnapshotStore` for aggregate snapshots. Serialisation is handled internally by stores using `serde`.
 
 ## The `EventStore` Trait
 
@@ -22,7 +22,7 @@ let store: inmemory::Store<String, ()> = inmemory::Store::new();
 let store: inmemory::Store<String, MyMetadata> = inmemory::Store::new();
 ```
 
-Uses JSON serialization via `serde_json` and deduplicates overlapping filters when loading.
+Uses JSON serialisation via `serde_json` and deduplicates overlapping filters when loading.
 
 ## Committing Events
 
@@ -67,7 +67,7 @@ EventFilter::for_event("account.deposited").after(100)
 
 ### `StoredEvent<Id, Pos, Data, M>`
 
-An event loaded from the store. Contains the serialized data plus store-assigned metadata. Use `EventStore::decode_event()` to deserialize back to a domain event.
+An event loaded from the store. Contains the serialised data plus store-assigned metadata. Use `EventStore::decode_event()` to deserialise back to a domain event.
 
 ```rust,ignore
 pub struct StoredEvent<Id, Pos, Data, M> {
@@ -80,7 +80,7 @@ pub struct StoredEvent<Id, Pos, Data, M> {
 }
 ```
 
-The `Data` type is generic over the serialization format (e.g., `serde_json::Value` for JSON stores). Store implementations specify their concrete type through the `EventStore::Data` associated type.
+The `Data` type is generic over the serialisation format (e.g., `serde_json::Value` for JSON stores). Store implementations specify their concrete type through the `EventStore::Data` associated type.
 
 ## The `SnapshotStore` Trait
 

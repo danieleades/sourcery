@@ -1,6 +1,6 @@
 //! Snapshotting Example
 //!
-//! Demonstrates how to use snapshots to optimize aggregate loading for
+//! Demonstrates how to use snapshots to optimise aggregate loading for
 //! long-lived aggregates with many events.
 //!
 //! This example shows:
@@ -17,7 +17,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use sourcery::{
-    Aggregate, Apply, ApplyProjection, DomainEvent, Filters, Handle, Repository, Subscribable,
+    Aggregate, Apply, ApplyProjection, DomainEvent, Filters, Handle, ProjectionFilters, Repository,
     snapshot::inmemory::Store as InMemorySnapshotStore,
     store::{EventStore, inmemory},
 };
@@ -159,7 +159,7 @@ pub struct LoyaltySummary {
     customer_points: HashMap<String, u64>,
 }
 
-impl Subscribable for LoyaltySummary {
+impl ProjectionFilters for LoyaltySummary {
     type Id = String;
     type InstanceId = String;
     type Metadata = ();

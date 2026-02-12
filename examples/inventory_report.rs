@@ -2,7 +2,7 @@
 //!
 //! Demonstrates the event envelope pattern with pure domain events and
 //! composite aggregate IDs, using the `#[derive(Aggregate)]` macro and the
-//! `Subscribable` trait.
+//! `ProjectionFilters` trait.
 //! - **Product aggregate**: Manages inventory with simple string IDs (SKU)
 //! - **Sale aggregate**: Records sales with composite IDs (`SaleId {
 //!   product_sku, sale_number }`)
@@ -11,12 +11,12 @@
 //!
 //! Key architectural points:
 //! - **Pure events**: Domain events contain no persistence metadata
-//! - **Composite IDs**: `SaleId` is a type-safe domain type that serializes to
+//! - **Composite IDs**: `SaleId` is a type-safe domain type that serialises to
 //!   string for storage
 //! - **Shared ID type**: All aggregates in a store must share the same ID type
 //!   (`String`), but domain code can use stronger types like `SaleId` that
 //!   convert to/from the storage format
-//! - **`ApplyProjection` + `Subscribable`**: Projections access
+//! - **`ApplyProjection` + `ProjectionFilters`**: Projections access
 //!   `aggregate_kind`, `aggregate_id`, and metadata
 //! - **External IDs**: Aggregates treat IDs as infrastructure metadata supplied
 //!   by the repository
@@ -25,7 +25,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use sourcery::{
-    Aggregate, Apply, ApplyProjection, DomainEvent, Filters, Handle, Repository, Subscribable,
+    Aggregate, Apply, ApplyProjection, DomainEvent, Filters, Handle, ProjectionFilters, Repository,
     store::{EventStore, inmemory},
 };
 
@@ -132,7 +132,7 @@ impl Handle<AdjustInventory> for Product {
 /// the ID allows projections to correlate sale events with product inventory
 /// without polluting the event data with cross-aggregate references.
 ///
-/// The ID is serialized as `"{product_sku}::{sale_number}"` for storage.
+/// The ID is serialised as `"{product_sku}::{sale_number}"` for storage.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(into = "String", try_from = "String")]
 pub struct SaleId {
@@ -270,7 +270,7 @@ pub struct ProductStats {
     pub units_sold: i64,
 }
 
-impl Subscribable for InventoryReport {
+impl ProjectionFilters for InventoryReport {
     type Id = String;
     type InstanceId = ();
     type Metadata = ();

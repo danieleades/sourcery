@@ -8,7 +8,7 @@ pub use sourcery_core::{
     event,
     event::{DomainEvent, EventDecodeError, EventKind, ProjectionEvent},
     projection,
-    projection::{ApplyProjection, Filters, Projection, Subscribable},
+    projection::{ApplyProjection, Filters, Projection, ProjectionFilters},
     repository,
     repository::{
         OptimisticRepository, OptimisticSnapshotRepository, Repository, UncheckedRepository,

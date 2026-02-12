@@ -4,7 +4,7 @@ When multiple processes or threads write to the same aggregate simultaneously, y
 losing updates. Optimistic concurrency control detects these conflicts by checking that
 the stream version hasn't changed between loading the aggregate and committing new events.
 
-## Default Behavior
+## Default Behaviour
 
 By default, repositories use **optimistic concurrency**—version checking is performed on every write. This is the safe default for production systems.
 
