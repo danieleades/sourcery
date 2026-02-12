@@ -2,4 +2,4 @@ error: Duplicate field `id`
   --> tests/ui/fail/aggregate_duplicate_attribute.rs:23:26
    |
 23 | #[aggregate(id = String, id = u64, error = AggregateError, events(FundsDeposited))]
-   |                          ^^^^^^^^
+   |                          ^^
