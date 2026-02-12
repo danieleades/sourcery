@@ -277,25 +277,19 @@ where
             }
         }
 
-        // Check if catch-up is already complete
-        if (catchup_target_position.is_none() || last_position >= catchup_target_position)
-            && let Some(callback) = on_catchup_complete.take()
-        {
-            callback();
-        }
-
-        // Offer snapshot after catch-up
+        // Offer snapshot after catch-up (preserve counter if declined)
         if events_since_snapshot > 0
             && let Some(ref pos) = last_position
-        {
-            let _ = offer_projection_snapshot(
+            && offer_projection_snapshot(
                 &snapshots,
                 &instance_id,
                 events_since_snapshot,
                 pos,
                 &projection,
             )
-            .await;
+            .await
+        {
+            events_since_snapshot = 0;
         }
 
         // Spawn live subscription task
@@ -307,7 +301,15 @@ where
             let (live_filters, handlers) = filters.into_event_filters(last_position.as_ref());
 
             let mut stream = store.subscribe(&live_filters, last_position.clone());
-            let mut events_since_snapshot: u64 = 0;
+
+            // Fire catch-up callback now that the live stream is attached.
+            // Any events committed during the gap between load_events and
+            // subscribe will be delivered by the stream and deduplicated.
+            if (catchup_target_position.is_none() || last_position >= catchup_target_position)
+                && let Some(callback) = on_catchup_complete.take()
+            {
+                callback();
+            }
 
             loop {
                 tokio::select! {
@@ -339,8 +341,14 @@ where
                         last_position = Some(stored.position());
                         events_since_snapshot += 1;
 
-                        // Fire catch-up complete on first live event
-                        if let Some(callback) = on_catchup_complete.take() {
+                        // Fire catch-up complete once we've processed past the
+                        // target position (handles gap events between load_events
+                        // and subscribe)
+                        if on_catchup_complete.is_some()
+                            && (catchup_target_position.is_none()
+                                || last_position >= catchup_target_position)
+                            && let Some(callback) = on_catchup_complete.take()
+                        {
                             callback();
                         }
 
@@ -351,15 +359,16 @@ where
                         // Periodically offer snapshots
                         if events_since_snapshot.is_multiple_of(100)
                             && let Some(ref pos) = last_position
-                        {
-                            let _ = offer_projection_snapshot(
+                            && offer_projection_snapshot(
                                 &snapshots,
                                 &instance_id,
                                 events_since_snapshot,
                                 pos,
                                 &projection,
                             )
-                            .await;
+                            .await
+                        {
+                            events_since_snapshot = 0;
                         }
                     }
                 }
@@ -468,7 +477,8 @@ where
         .await;
 
     match result {
-        Ok(_) => true,
+        Ok(crate::snapshot::SnapshotOffer::Stored) => true,
+        Ok(crate::snapshot::SnapshotOffer::Declined) => false,
         Err(e) => {
             tracing::warn!(error = %e, "failed to store subscription snapshot");
             false
