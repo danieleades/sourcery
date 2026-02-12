@@ -27,7 +27,7 @@
 //!
 //! [`Repository::load_projection`]: crate::repository::Repository::load_projection
 
-use std::pin::Pin;
+use std::{collections::HashMap, pin::Pin};
 
 use futures_core::Stream;
 use serde::{Serialize, de::DeserializeOwned};
@@ -138,14 +138,17 @@ where
     /// Returns the subscription's error if it failed before being stopped.
     #[allow(clippy::missing_panics_doc)]
     pub async fn stop(mut self) -> Result<(), SubscriptionError<StoreError>> {
+        // By taking the tx, we ensure Drop won't try to send it again.
         if let Some(tx) = self.stop_tx.take() {
             let _ = tx.send(());
         }
-        self.task
-            .take()
-            .expect("subscription task missing")
-            .await
-            .map_err(|_| SubscriptionError::TaskPanicked)?
+
+        // Taking the task ensures that is_running() returns false from here on.
+        if let Some(task) = self.task.take() {
+            return task.await.map_err(|_| SubscriptionError::TaskPanicked)?;
+        }
+
+        Ok(())
     }
 
     /// Check if the subscription task is still running.
@@ -160,18 +163,13 @@ where
     StoreError: std::error::Error + 'static,
 {
     fn drop(&mut self) {
-        if self
-            .task
-            .as_ref()
-            .is_some_and(tokio::task::JoinHandle::is_finished)
-        {
-            return;
-        }
-        tracing::warn!(
-            "subscription handle dropped without stop(); signaling background task to stop"
-        );
-        if let Some(tx) = self.stop_tx.take() {
-            let _ = tx.send(());
+        if self.is_running() {
+            tracing::warn!(
+                "subscription handle dropped without stop(); signaling background task to stop"
+            );
+            if let Some(tx) = self.stop_tx.take() {
+                let _ = tx.send(());
+            }
         }
     }
 }
@@ -203,9 +201,9 @@ where
     S: SubscribableStore + Clone + Send + Sync + 'static,
     S::Position: Ord + Send + Sync,
     S::Data: Send,
-    S::Metadata: Clone + Send + Sync + Into<P::Metadata>,
+    S::Metadata: Send + Sync,
     P: Projection
-        + ProjectionFilters<Id = S::Id>
+        + ProjectionFilters<Id = S::Id, Metadata = S::Metadata>
         + Serialize
         + DeserializeOwned
         + Send
@@ -280,16 +278,15 @@ where
         let mut events_since_snapshot: u64 = 0;
 
         for stored in &current_events {
-            let kind = stored.kind();
-            if let Some(handler) = handlers.get(kind) {
-                apply_handler(handler, &mut projection, stored, &store)?;
-            }
-            last_position = Some(stored.position());
-            events_since_snapshot += 1;
-
-            if let Some(ref callback) = on_update {
-                callback(&projection);
-            }
+            process_subscription_event(
+                &mut projection,
+                stored,
+                &handlers,
+                &store,
+                on_update.as_ref(),
+                &mut last_position,
+                &mut events_since_snapshot,
+            )?;
         }
 
         // Offer snapshot after catch-up (preserve counter if declined)
@@ -366,17 +363,15 @@ where
                             continue;
                         }
 
-                        let kind = stored.kind();
-                        if let Some(handler) = handlers.get(kind) {
-                            apply_handler(handler, &mut projection, &stored, &store)?;
-                        }
-
-                        last_position = Some(stored.position());
-                        events_since_snapshot += 1;
-
-                        if let Some(ref callback) = on_update {
-                            callback(&projection);
-                        }
+                        process_subscription_event(
+                            &mut projection,
+                            &stored,
+                            &handlers,
+                            &store,
+                            on_update.as_ref(),
+                            &mut last_position,
+                            &mut events_since_snapshot,
+                        )?;
 
                         // Signal catch-up completion once we've processed
                         // past the effective target (includes gap events).
@@ -483,6 +478,34 @@ where
     })
 }
 
+fn process_subscription_event<P, S>(
+    projection: &mut P,
+    stored: &StoredEvent<S::Id, S::Position, S::Data, S::Metadata>,
+    handlers: &HashMap<&'static str, crate::projection::EventHandler<P, S>>,
+    store: &S,
+    on_update: Option<&UpdateCallback<P>>,
+    last_position: &mut Option<S::Position>,
+    events_since_snapshot: &mut u64,
+) -> Result<(), SubscriptionError<S::Error>>
+where
+    P: ProjectionFilters<Id = S::Id>,
+    S: EventStore,
+    S::Position: Clone,
+{
+    if let Some(handler) = handlers.get(stored.kind()) {
+        apply_handler(handler, projection, stored, store)?;
+    }
+
+    *last_position = Some(stored.position());
+    *events_since_snapshot += 1;
+
+    if let Some(callback) = on_update {
+        callback(projection);
+    }
+
+    Ok(())
+}
+
 async fn offer_projection_snapshot<P, SS>(
     snapshots: &SS,
     instance_id: &P::InstanceId,
@@ -538,5 +561,14 @@ mod tests {
     fn subscription_error_task_panicked_displays() {
         let err: SubscriptionError<io::Error> = SubscriptionError::TaskPanicked;
         assert!(err.to_string().contains("panicked"));
+    }
+
+    #[test]
+    fn subscription_not_alive_after_stop_consumes_task_handle() {
+        let handle: SubscriptionHandle<io::Error> = SubscriptionHandle {
+            stop_tx: None,
+            task: None,
+        };
+        assert!(!handle.is_running());
     }
 }

@@ -2,9 +2,9 @@
 
 Projections are read models built by replaying events. They are query-oriented and eventually consistent.
 
-## Basic Usage
+## Recommended Default Path
 
-Most projections should use this shape:
+For most projections, keep to this shape:
 
 1. `#[derive(Projection)]`
 2. `#[projection(events(...))]`
@@ -32,7 +32,7 @@ impl ApplyProjection<FundsWithdrawn> for AccountSummary {
 }
 ```
 
-`#[projection(events(...))]` auto-generates `ProjectionFilters` for the common singleton case.
+`#[projection(events(...))]` auto-generates `ProjectionFilters` for the common case.
 
 ## Loading Projections
 
@@ -48,101 +48,78 @@ let report = repository
     .await?;
 ```
 
-## When You Need Manual Filters
+## When to Implement `ProjectionFilters` Manually
 
-Implement `ProjectionFilters` yourself when you need:
+Use manual filters when you need:
 
-- Dynamic filter logic
-- `event_for` / `events_for` scoped filtering
-- Non-default projection initialisation
-- Custom `Id`, `InstanceId`, or `Metadata` with explicit control
+- Dynamic filtering
+- Scoped filtering (`event_for` / `events_for`)
+- Non-default initialisation
+- Full control over `Id`, `InstanceId`, or `Metadata`
 
-## Trait Reference
-
-### The `Projection` Trait
+### Example: Scoped Instance Filter
 
 ```rust,ignore
-{{#include ../../../sourcery-core/src/projection.rs:projection_trait}}
+impl ProjectionFilters for AccountComparison {
+    type Id = String;
+    type InstanceId = (String, String);
+    type Metadata = ();
+
+    fn init(ids: &Self::InstanceId) -> Self {
+        Self {
+            left_id: ids.0.clone(),
+            right_id: ids.1.clone(),
+            ..Self::default()
+        }
+    }
+
+    fn filters<S>(ids: &Self::InstanceId) -> Filters<S, Self>
+    where
+        S: EventStore<Id = Self::Id, Metadata = Self::Metadata>,
+    {
+        let (left, right) = ids;
+        Filters::new()
+            .events_for::<Account>(left)
+            .events_for::<Account>(right)
+    }
+}
 ```
 
-`Projection` provides a stable `KIND` used for projection snapshots.
-
-### The `ApplyProjection<E>` Trait
-
-```rust,ignore
-{{#include ../../../sourcery-core/src/projection.rs:apply_projection_trait}}
-```
-
-`ApplyProjection<E>` is where event handling logic lives.
-
-### The `ProjectionFilters` Trait
-
-```rust,ignore
-{{#include ../../../sourcery-core/src/projection.rs:projection_filters_trait}}
-```
-
-`ProjectionFilters` controls initialisation and filter selection.
-
-## Advanced Filtering with `Filters`
+## `Filters` Cheat Sheet
 
 ```rust,ignore
 Filters::new()
     .event::<FundsDeposited>()                 // Global: all aggregates
-    .event_for::<Account, FundsWithdrawn>(&id) // Event from one aggregate instance
-    .events::<AccountEvent>()                  // All variants in an event enum
-    .events_for::<Account>(&id)                // All events for one aggregate instance
+    .event_for::<Account, FundsWithdrawn>(&id) // One event type, one aggregate instance
+    .events::<AccountEvent>()                  // All kinds in an event enum
+    .events_for::<Account>(&id)                // All event kinds for one aggregate instance
 ```
 
 | Method | Scope |
 |--------|-------|
 | `.event::<E>()` | All events of type `E` across all aggregates |
-| `.event_for::<A, E>(&id)` | Events of type `E` from a specific aggregate instance |
+| `.event_for::<A, E>(&id)` | Events of type `E` from one aggregate instance |
 | `.events::<Enum>()` | All event kinds in a `ProjectionEvent` enum |
-| `.events_for::<A>(&id)` | All event kinds for a specific aggregate instance |
-
-## Multi-Aggregate Projections
-
-```rust,ignore
-impl ProjectionFilters for InventoryReport {
-    type Id = String;
-    type InstanceId = ();
-    type Metadata = ();
-
-    fn init((): &()) -> Self { Self::default() }
-
-    fn filters<S>((): &()) -> Filters<S, Self>
-    where
-        S: EventStore<Id = String>,
-        S::Metadata: Clone + Into<()>,
-    {
-        Filters::new()
-            .event::<ProductCreated>()
-            .event::<SaleRecorded>()
-    }
-}
-```
+| `.events_for::<A>(&id)` | All event kinds for one aggregate instance |
 
 ## Metadata in Projections
 
+Use `metadata = ...` in the derive attribute for the common case:
+
 ```rust,ignore
-impl ProjectionFilters for AuditLog {
-    type Id = String;
-    type InstanceId = ();
-    type Metadata = EventMetadata;
-
-    fn init((): &()) -> Self { Self::default() }
-
-    fn filters<S>((): &()) -> Filters<S, Self>
-    where
-        S: EventStore<Id = String>,
-        S::Metadata: Clone + Into<EventMetadata>,
-    {
-        Filters::new().event::<FundsDeposited>()
-    }
+#[derive(Debug, Default, sourcery::Projection)]
+#[projection(metadata = EventMetadata, events(FundsDeposited))]
+struct AuditLog {
+    entries: Vec<AuditEntry>,
 }
 
 impl ApplyProjection<FundsDeposited> for AuditLog {
-    fn apply_projection(&mut self, id: &Self::Id, event: &FundsDeposited, meta: &Self::Metadata) {
+    fn apply_projection(
+        &mut self,
+        id: &Self::Id,
+        event: &FundsDeposited,
+        meta: &Self::Metadata,
+    ) {
         self.entries.push(AuditEntry {
             timestamp: meta.timestamp,
             user: meta.user_id.clone(),
@@ -157,38 +134,27 @@ impl ApplyProjection<FundsDeposited> for AuditLog {
 - **Singleton** (`InstanceId = ()`): one global projection.
 - **Instance** (`InstanceId = String` or custom type): one projection per instance ID.
 
-### Example: Instance Projection with Scoped Filters
+`apply_projection` receives the aggregate ID, not the instance ID. If handlers need instance context, store it during `init`.
 
-A projection parameterised by two aggregate IDs, subscribing to all events from each:
+## Trait Reference
+
+For full signatures, see the API docs:
+
+- `Projection`
+- `ApplyProjection<E>`
+- `ProjectionFilters`
+
+You can also inspect the trait definitions directly:
 
 ```rust,ignore
-impl ProjectionFilters for AccountComparison {
-    type Id = String;
-    type InstanceId = (String, String);
-    type Metadata = ();
-
-    fn init(ids: &Self::InstanceId) -> Self {
-        Self { left_id: ids.0.clone(), right_id: ids.1.clone(), ..Self::default() }
-    }
-
-    fn filters<S>(ids: &Self::InstanceId) -> Filters<S, Self>
-    where
-        S: EventStore<Id = String>,
-        S::Metadata: Clone + Into<()>,
-    {
-        let (left, right) = ids;
-        Filters::new()
-            .events_for::<Account>(left)
-            .events_for::<Account>(right)
-    }
-}
+{{#include ../../../sourcery-core/src/projection.rs:projection_trait}}
+{{#include ../../../sourcery-core/src/projection.rs:apply_projection_trait}}
+{{#include ../../../sourcery-core/src/projection.rs:projection_filters_trait}}
 ```
-
-`apply_projection` receives the aggregate ID, not the instance ID — store the IDs in `init` so the handler can distinguish which aggregate each event belongs to.
 
 ## Snapshotting Projections
 
-Projections support snapshots for faster loading. See [Snapshots — Projection Snapshots](../advanced/snapshots.md#projection-snapshots) for details.
+Projections support snapshots for faster loading. See [Snapshots — Projection Snapshots](../advanced/snapshots.md#projection-snapshots).
 
 ## Projections vs Aggregates
 

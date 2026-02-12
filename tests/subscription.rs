@@ -9,9 +9,7 @@ use std::sync::{
 
 use serde::{Deserialize, Serialize};
 use sourcery::{
-    Aggregate, Apply, ApplyProjection, DomainEvent, Filters, Handle, Projection, ProjectionFilters,
-    Repository,
-    store::{EventStore, inmemory},
+    Aggregate, Apply, ApplyProjection, DomainEvent, Handle, Projection, Repository, store::inmemory,
 };
 
 // ============================================================================
@@ -64,26 +62,9 @@ impl Handle<AddItem> for Inventory {
 // ============================================================================
 
 #[derive(Debug, Default, Serialize, Deserialize, Projection)]
+#[projection(events(ItemAdded))]
 struct ItemCount {
     count: u32,
-}
-
-impl ProjectionFilters for ItemCount {
-    type Id = String;
-    type InstanceId = ();
-    type Metadata = ();
-
-    fn init((): &()) -> Self {
-        Self::default()
-    }
-
-    fn filters<S>((): &()) -> Filters<S, Self>
-    where
-        S: EventStore<Id = String>,
-        S::Metadata: Clone + Into<()>,
-    {
-        Filters::new().event::<ItemAdded>()
-    }
 }
 
 impl ApplyProjection<ItemAdded> for ItemCount {

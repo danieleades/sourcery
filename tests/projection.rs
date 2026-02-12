@@ -86,26 +86,9 @@ impl Handle<AddValue> for Counter {
 // ============================================================================
 
 #[derive(Debug, Default, Projection)]
+#[projection(events(ValueAdded))]
 struct TotalsProjection {
     totals: HashMap<String, i32>,
-}
-
-impl ProjectionFilters for TotalsProjection {
-    type Id = String;
-    type InstanceId = ();
-    type Metadata = ();
-
-    fn init((): &()) -> Self {
-        Self::default()
-    }
-
-    fn filters<S>((): &()) -> Filters<S, Self>
-    where
-        S: EventStore<Id = String>,
-        S::Metadata: Clone + Into<()>,
-    {
-        Filters::new().event::<ValueAdded>()
-    }
 }
 
 impl ApplyProjection<ValueAdded> for TotalsProjection {
@@ -139,8 +122,7 @@ impl ProjectionFilters for FilteredTotalsProjection {
 
     fn filters<S>(aggregate_id: &String) -> Filters<S, Self>
     where
-        S: EventStore<Id = String>,
-        S::Metadata: Clone + Into<()>,
+        S: EventStore<Id = String, Metadata = ()>,
     {
         Filters::new().event_for::<Counter, ValueAdded>(aggregate_id)
     }
@@ -297,8 +279,7 @@ impl ProjectionFilters for EnumProjection {
 
     fn filters<S>((): &()) -> Filters<S, Self>
     where
-        S: EventStore<Id = String>,
-        S::Metadata: Clone + Into<()>,
+        S: EventStore<Id = String, Metadata = ()>,
     {
         Filters::new().events::<MultiEventCounterEvent>()
     }
@@ -342,8 +323,7 @@ impl ProjectionFilters for EventsForProjection {
 
     fn filters<S>(aggregate_id: &String) -> Filters<S, Self>
     where
-        S: EventStore<Id = String>,
-        S::Metadata: Clone + Into<()>,
+        S: EventStore<Id = String, Metadata = ()>,
     {
         Filters::new().events_for::<MultiEventCounter>(aggregate_id)
     }
@@ -451,27 +431,10 @@ async fn events_for_loads_events_for_specific_aggregate_instance() {
 /// Projection with Serialize/Deserialize for snapshot support.
 /// Uses String as both aggregate ID and instance ID for simplicity.
 #[derive(Debug, Default, Serialize, Deserialize, Projection)]
+#[projection(instance_id = String, events(ValueAdded))]
 struct SnapshotProjection {
     total: i32,
     event_count: u32,
-}
-
-impl ProjectionFilters for SnapshotProjection {
-    type Id = String;
-    type InstanceId = String;
-    type Metadata = ();
-
-    fn init(_id: &String) -> Self {
-        Self::default()
-    }
-
-    fn filters<S>(_id: &String) -> Filters<S, Self>
-    where
-        S: EventStore<Id = String>,
-        S::Metadata: Clone + Into<()>,
-    {
-        Filters::new().event::<ValueAdded>()
-    }
 }
 
 impl ApplyProjection<ValueAdded> for SnapshotProjection {

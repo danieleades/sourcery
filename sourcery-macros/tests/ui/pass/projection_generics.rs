@@ -25,8 +25,7 @@ impl<'a, T: 'static> ProjectionFilters for AccountLedger<'a, T> {
 
     fn filters<S>(_instance_id: &Self::InstanceId) -> Filters<S, Self>
     where
-        S: store::EventStore<Id = String>,
-        S::Metadata: Clone + Into<Self::Metadata>,
+        S: store::EventStore<Id = String, Metadata = Self::Metadata>,
     {
         Filters::new()
     }

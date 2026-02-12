@@ -133,7 +133,7 @@ impl ProjectionFilters for Dashboard {
     type Metadata = ();
     fn init((): &()) -> Self { Self::default() }
     fn filters<S>((): &()) -> Filters<S, Self>
-    where S: EventStore<Id = String>, S::Metadata: Clone + Into<()> {
+    where S: EventStore<Id = String, Metadata = ()> {
         Filters::new()
             .event::<OrderPlaced>()
             .event::<PaymentReceived>()

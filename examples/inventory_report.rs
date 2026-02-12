@@ -25,8 +25,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use sourcery::{
-    Aggregate, Apply, ApplyProjection, DomainEvent, Filters, Handle, ProjectionFilters, Repository,
-    store::{EventStore, inmemory},
+    Aggregate, Apply, ApplyProjection, DomainEvent, Handle, Repository, store::inmemory,
 };
 
 // =============================================================================
@@ -252,6 +251,7 @@ impl Handle<RefundSale> for Sale {
 // =============================================================================
 
 #[derive(Debug, Default, sourcery::Projection)]
+#[projection(events(ProductRestocked, InventoryAdjusted, SaleCompleted, SaleRefunded))]
 pub struct InventoryReport {
     pub total_products_restocked: i64,
     pub total_items_in_stock: i64,
@@ -268,28 +268,6 @@ pub struct ProductStats {
     pub unit_price_cents: i64,
     pub times_restocked: i64,
     pub units_sold: i64,
-}
-
-impl ProjectionFilters for InventoryReport {
-    type Id = String;
-    type InstanceId = ();
-    type Metadata = ();
-
-    fn init((): &()) -> Self {
-        Self::default()
-    }
-
-    fn filters<S>((): &()) -> Filters<S, Self>
-    where
-        S: EventStore<Id = String>,
-        S::Metadata: Clone + Into<()>,
-    {
-        Filters::new()
-            .event::<ProductRestocked>()
-            .event::<InventoryAdjusted>()
-            .event::<SaleCompleted>()
-            .event::<SaleRefunded>()
-    }
 }
 
 // ApplyProjection implementations - for events that need stream context

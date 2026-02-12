@@ -123,8 +123,7 @@ impl ProjectionFilters for ProductSummary {
 
     fn filters<S>(params: &ProductSummaryParams) -> Filters<S, Self>
     where
-        S: EventStore<Id = String>,
-        S::Metadata: Clone + Into<()>,
+        S: EventStore<Id = String, Metadata = ()>,
     {
         Filters::new()
             .event::<ProductRestocked>() // global restocks

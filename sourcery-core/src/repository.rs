@@ -25,7 +25,7 @@
 //! See the [quickstart example](https://github.com/danieleades/sourcery/blob/main/examples/quickstart.rs)
 //! for a complete working example.
 
-use std::{convert::Infallible, marker::PhantomData};
+use std::{collections::HashMap, convert::Infallible, marker::PhantomData};
 
 use nonempty::NonEmpty;
 use serde::{Serialize, de::DeserializeOwned};
@@ -223,6 +223,40 @@ where
     }
 
     Ok(last_event_position)
+}
+
+fn replay_projection_events<P, S>(
+    projection: &mut P,
+    events: &StoredEvents<S::Id, S::Position, S::Data, S::Metadata>,
+    handlers: &HashMap<&'static str, crate::projection::EventHandler<P, S>>,
+    store: &S,
+) -> Result<Option<S::Position>, ProjectionError<S::Error>>
+where
+    S: EventStore,
+    S::Position: Clone,
+    P: ProjectionFilters<Id = S::Id>,
+{
+    let mut last_position = None;
+
+    for stored in events {
+        let aggregate_id = stored.aggregate_id();
+        let kind = stored.kind();
+        let metadata = stored.metadata();
+
+        if let Some(handler) = handlers.get(kind) {
+            (handler)(projection, aggregate_id, stored, metadata, store).map_err(|error| {
+                match error {
+                    HandlerError::Store(error) => {
+                        ProjectionError::EventDecode(crate::event::EventDecodeError::Store(error))
+                    }
+                    HandlerError::EventDecode(error) => ProjectionError::EventDecode(error),
+                }
+            })?;
+        }
+        last_position = Some(stored.position());
+    }
+
+    Ok(last_position)
 }
 
 /// Snapshot-enabled repository mode wrapper.
@@ -638,9 +672,8 @@ where
         instance_id: &P::InstanceId,
     ) -> Result<P, ProjectionError<S::Error>>
     where
-        P: ProjectionFilters<Id = S::Id>,
+        P: ProjectionFilters<Id = S::Id, Metadata = S::Metadata>,
         P::InstanceId: Send + Sync,
-        S::Metadata: Clone + Into<P::Metadata>,
         M: Sync,
     {
         tracing::debug!("loading projection");
@@ -661,22 +694,7 @@ where
             "replaying events into projection"
         );
 
-        for stored in &events {
-            let aggregate_id = stored.aggregate_id();
-            let kind = stored.kind();
-            let metadata = stored.metadata();
-
-            if let Some(handler) = handlers.get(kind) {
-                (handler)(&mut projection, aggregate_id, stored, metadata, &self.store).map_err(
-                    |error| match error {
-                        HandlerError::Store(error) => ProjectionError::EventDecode(
-                            crate::event::EventDecodeError::Store(error),
-                        ),
-                        HandlerError::EventDecode(error) => ProjectionError::EventDecode(error),
-                    },
-                )?;
-            }
-        }
+        let _ = replay_projection_events(&mut projection, &events, &handlers, &self.store)?;
 
         tracing::info!(events_applied = event_count, "projection loaded");
         Ok(projection)
@@ -821,9 +839,12 @@ where
         instance_id: &P::InstanceId,
     ) -> Result<P, ProjectionError<S::Error>>
     where
-        P: Projection + ProjectionFilters<Id = S::Id> + Serialize + DeserializeOwned + Sync,
+        P: Projection
+            + ProjectionFilters<Id = S::Id, Metadata = S::Metadata>
+            + Serialize
+            + DeserializeOwned
+            + Sync,
         P::InstanceId: Send + Sync,
-        S::Metadata: Clone + Into<P::Metadata>,
         SS: SnapshotStore<P::InstanceId, Position = S::Position>,
     {
         tracing::debug!("loading projection with snapshot");
@@ -855,26 +876,8 @@ where
             .map_err(ProjectionError::Store)?;
 
         let event_count = events.len();
-        let mut last_position = None;
-
-        for stored in &events {
-            let aggregate_id = stored.aggregate_id();
-            let kind = stored.kind();
-            let metadata = stored.metadata();
-            let position = stored.position();
-
-            if let Some(handler) = handlers.get(kind) {
-                (handler)(&mut projection, aggregate_id, stored, metadata, &self.store).map_err(
-                    |error| match error {
-                        HandlerError::Store(error) => ProjectionError::EventDecode(
-                            crate::event::EventDecodeError::Store(error),
-                        ),
-                        HandlerError::EventDecode(error) => ProjectionError::EventDecode(error),
-                    },
-                )?;
-            }
-            last_position = Some(position);
-        }
+        let last_position =
+            replay_projection_events(&mut projection, &events, &handlers, &self.store)?;
 
         if event_count > 0
             && let Some(position) = last_position
@@ -947,7 +950,7 @@ where
         S: SubscribableStore + Clone + 'static,
         S::Position: Ord,
         P: Projection
-            + ProjectionFilters<Id = S::Id>
+            + ProjectionFilters<Id = S::Id, Metadata = S::Metadata>
             + Serialize
             + DeserializeOwned
             + Send
@@ -955,7 +958,6 @@ where
             + 'static,
         P::InstanceId: Clone + Send + Sync + 'static,
         P::Metadata: Send,
-        S::Metadata: Clone + Into<P::Metadata>,
     {
         SubscriptionBuilder::new(
             self.store.clone(),
@@ -977,7 +979,7 @@ where
         S: SubscribableStore + Clone + 'static,
         S::Position: Ord,
         P: Projection
-            + ProjectionFilters<Id = S::Id>
+            + ProjectionFilters<Id = S::Id, Metadata = S::Metadata>
             + Serialize
             + DeserializeOwned
             + Send
@@ -985,7 +987,6 @@ where
             + 'static,
         P::InstanceId: Clone + Send + Sync + 'static,
         P::Metadata: Send,
-        S::Metadata: Clone + Into<P::Metadata>,
         SS: SnapshotStore<P::InstanceId, Position = S::Position> + Send + Sync + 'static,
     {
         SubscriptionBuilder::new(self.store.clone(), snapshots, instance_id)

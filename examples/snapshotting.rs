@@ -17,9 +17,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use sourcery::{
-    Aggregate, Apply, ApplyProjection, DomainEvent, Filters, Handle, ProjectionFilters, Repository,
-    snapshot::inmemory::Store as InMemorySnapshotStore,
-    store::{EventStore, inmemory},
+    Aggregate, Apply, ApplyProjection, DomainEvent, Handle, Repository,
+    snapshot::inmemory::Store as InMemorySnapshotStore, store::inmemory,
 };
 
 // =============================================================================
@@ -152,31 +151,15 @@ impl Handle<RedeemPoints> for LoyaltyAccount {
 // =============================================================================
 
 #[derive(Debug, Default, Serialize, Deserialize, sourcery::Projection)]
-#[projection(kind = "loyalty.summary")]
+#[projection(
+    kind = "loyalty.summary",
+    instance_id = String,
+    events(PointsEarned, PointsRedeemed)
+)]
 pub struct LoyaltySummary {
     total_earned: u64,
     total_redeemed: u64,
     customer_points: HashMap<String, u64>,
-}
-
-impl ProjectionFilters for LoyaltySummary {
-    type Id = String;
-    type InstanceId = String;
-    type Metadata = ();
-
-    fn init(_instance_id: &String) -> Self {
-        Self::default()
-    }
-
-    fn filters<S>(_instance_id: &String) -> Filters<S, Self>
-    where
-        S: EventStore<Id = String>,
-        S::Metadata: Clone + Into<()>,
-    {
-        Filters::new()
-            .event::<PointsEarned>()
-            .event::<PointsRedeemed>()
-    }
 }
 
 impl ApplyProjection<PointsEarned> for LoyaltySummary {

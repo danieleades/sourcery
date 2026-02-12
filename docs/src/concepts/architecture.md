@@ -91,8 +91,7 @@ Projections define their event filters centrally in the `ProjectionFilters` trai
 
 | Type | Role |
 |------|------|
-| `Repository<S>` | Orchestrates aggregates and projections (no snapshots) |
-| `Repository<S, C, Snapshots<SS>>` | Snapshot-enabled repository orchestration |
+| `Repository` | Orchestrates command execution, aggregate loading, and projection loading |
 | `EventStore` | Trait for event persistence |
 | `SnapshotStore` | Trait for aggregate/projection snapshots |
 | `Aggregate` | Trait for command-side entities |
@@ -101,6 +100,8 @@ Projections define their event filters centrally in the `ProjectionFilters` trai
 | `ApplyProjection<E>` | Per-event handler for projections |
 | `Filters` | Builder for event filter specs + handler closures |
 | `DomainEvent` | Marker trait for event structs |
+
+For exact generic signatures, see the API docs on docs.rs. This page is intentionally focused on responsibilities and flow.
 
 ## Next
 

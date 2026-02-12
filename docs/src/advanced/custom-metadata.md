@@ -53,30 +53,15 @@ Each event produced by the command receives this metadata.
 
 ## Accessing Metadata in Projections
 
-Set the `Metadata` associated type on `ProjectionFilters` and receive it in `ApplyProjection`:
+Set metadata in the derive attribute and receive it in `ApplyProjection`:
 
 ```rust,ignore
-use sourcery::{ApplyProjection, Filters, ProjectionFilters, store::EventStore};
+use sourcery::ApplyProjection;
 
 #[derive(Debug, Default, sourcery::Projection)]
+#[projection(metadata = EventMetadata, events(FundsDeposited))]
 pub struct AuditLog {
     pub entries: Vec<AuditEntry>,
-}
-
-impl ProjectionFilters for AuditLog {
-    type Id = String;
-    type InstanceId = ();
-    type Metadata = EventMetadata;
-
-    fn init((): &()) -> Self { Self::default() }
-
-    fn filters<S>((): &()) -> Filters<S, Self>
-    where
-        S: EventStore<Id = String>,
-        S::Metadata: Clone + Into<EventMetadata>,
-    {
-        Filters::new().event::<FundsDeposited>()
-    }
 }
 
 impl ApplyProjection<FundsDeposited> for AuditLog {
@@ -96,7 +81,7 @@ impl ApplyProjection<FundsDeposited> for AuditLog {
 }
 ```
 
-The store's metadata type must implement `Into<P::Metadata>`. When they're the same type, this is automatic.
+Projection handlers use the same metadata type as the store for that repository.
 
 ## Correlation and Causation
 
@@ -160,7 +145,7 @@ impl ApplyProjection<OrderPlaced> for TenantDashboard {
 }
 ```
 
-The `ProjectionFilters` impl follows the same pattern shown in [Accessing Metadata in Projections](#accessing-metadata-in-projections) above, with `type InstanceId = String` so each tenant gets its own projection instance.
+The projection follows the same pattern shown in [Accessing Metadata in Projections](#accessing-metadata-in-projections), with `instance_id = String` if each tenant needs its own projection instance.
 
 ## Next
 

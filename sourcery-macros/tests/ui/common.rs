@@ -131,8 +131,7 @@ pub trait ProjectionFilters: Sized {
 
     fn filters<S>(instance_id: &Self::InstanceId) -> Filters<S, Self>
     where
-        S: store::EventStore<Id = Self::Id>,
-        S::Metadata: Clone + Into<Self::Metadata>;
+        S: store::EventStore<Id = Self::Id, Metadata = Self::Metadata>;
 }
 
 pub trait Projection {
@@ -161,7 +160,7 @@ where
     where
         E: event::DomainEvent + serde::de::DeserializeOwned,
         P: ApplyProjection<E>,
-        S::Metadata: Clone + Into<P::Metadata>,
+        S: store::EventStore<Metadata = P::Metadata>,
     {
         self
     }

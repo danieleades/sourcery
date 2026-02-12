@@ -19,7 +19,7 @@ use crate::{
 /// The `filters()` method returns both the event filters AND the handlers
 /// needed to process those events. It is generic over the store type `S`,
 /// allowing the same projection to work with any store that shares the
-/// same `Id` type.
+/// same `Id` and `Metadata` types.
 ///
 /// `filters()` must be **pure and deterministic**: given the same
 /// `instance_id`, it must always return the same filter set.
@@ -48,8 +48,7 @@ pub trait ProjectionFilters: Sized {
     /// Build the filter set and handler map for this subscriber.
     fn filters<S>(instance_id: &Self::InstanceId) -> Filters<S, Self>
     where
-        S: EventStore<Id = Self::Id>,
-        S::Metadata: Clone + Into<Self::Metadata>;
+        S: EventStore<Id = Self::Id, Metadata = Self::Metadata>;
 }
 // ANCHOR_END: projection_filters_trait
 
@@ -155,7 +154,7 @@ where
 impl<S, P> Default for Filters<S, P>
 where
     S: EventStore,
-    P: ProjectionFilters<Id = S::Id>,
+    P: ProjectionFilters<Id = S::Id, Metadata = S::Metadata>,
 {
     fn default() -> Self {
         Self::new()
@@ -165,7 +164,7 @@ where
 impl<S, P> Filters<S, P>
 where
     S: EventStore,
-    P: ProjectionFilters<Id = S::Id>,
+    P: ProjectionFilters<Id = S::Id, Metadata = S::Metadata>,
 {
     /// Create an empty filter set.
     #[must_use]
@@ -182,15 +181,13 @@ where
     where
         E: DomainEvent + serde::de::DeserializeOwned,
         P: ApplyProjection<E>,
-        S::Metadata: Clone + Into<P::Metadata>,
     {
         self.specs.push(EventFilter::for_event(E::KIND));
         self.handlers.insert(
             E::KIND,
             Box::new(|proj, agg_id, stored, metadata, store| {
                 let event: E = store.decode_event(stored)?;
-                let metadata_converted: P::Metadata = metadata.clone().into();
-                ApplyProjection::apply_projection(proj, agg_id, &event, &metadata_converted);
+                ApplyProjection::apply_projection(proj, agg_id, &event, metadata);
                 Ok(())
             }),
         );
@@ -204,7 +201,6 @@ where
     where
         E: ProjectionEvent,
         P: ApplyProjection<E>,
-        S::Metadata: Clone + Into<P::Metadata>,
     {
         for &kind in E::EVENT_KINDS {
             self.specs.push(EventFilter::for_event(kind));
@@ -212,8 +208,7 @@ where
                 kind,
                 Box::new(move |proj, agg_id, stored, metadata, store| {
                     let event = E::from_stored(stored, store).map_err(HandlerError::EventDecode)?;
-                    let metadata_converted: P::Metadata = metadata.clone().into();
-                    ApplyProjection::apply_projection(proj, agg_id, &event, &metadata_converted);
+                    ApplyProjection::apply_projection(proj, agg_id, &event, metadata);
                     Ok(())
                 }),
             );
@@ -228,7 +223,6 @@ where
         A: Aggregate<Id = S::Id>,
         E: DomainEvent + serde::de::DeserializeOwned,
         P: ApplyProjection<E>,
-        S::Metadata: Clone + Into<P::Metadata>,
     {
         self.specs.push(EventFilter::for_aggregate(
             E::KIND,
@@ -239,8 +233,7 @@ where
             E::KIND,
             Box::new(|proj, agg_id, stored, metadata, store| {
                 let event: E = store.decode_event(stored)?;
-                let metadata_converted: P::Metadata = metadata.clone().into();
-                ApplyProjection::apply_projection(proj, agg_id, &event, &metadata_converted);
+                ApplyProjection::apply_projection(proj, agg_id, &event, metadata);
                 Ok(())
             }),
         );
@@ -254,7 +247,6 @@ where
         A: Aggregate<Id = S::Id>,
         A::Event: ProjectionEvent,
         P: ApplyProjection<A::Event>,
-        S::Metadata: Clone + Into<P::Metadata>,
     {
         for &kind in <A::Event as ProjectionEvent>::EVENT_KINDS {
             self.specs.push(EventFilter::for_aggregate(
@@ -267,8 +259,7 @@ where
                 Box::new(move |proj, agg_id, stored, metadata, store| {
                     let event = <A::Event as ProjectionEvent>::from_stored(stored, store)
                         .map_err(HandlerError::EventDecode)?;
-                    let metadata_converted: P::Metadata = metadata.clone().into();
-                    ApplyProjection::apply_projection(proj, agg_id, &event, &metadata_converted);
+                    ApplyProjection::apply_projection(proj, agg_id, &event, metadata);
                     Ok(())
                 }),
             );

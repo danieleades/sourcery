@@ -31,9 +31,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use sourcery::{
-    Aggregate, Apply, ApplyProjection, DomainEvent, Filters, Handle, Projection, ProjectionFilters,
-    Repository,
-    store::{EventStore, inmemory},
+    Aggregate, Apply, ApplyProjection, DomainEvent, Handle, Projection, Repository, store::inmemory,
 };
 
 // =============================================================================
@@ -335,32 +333,19 @@ pub struct CustomerSnapshot {
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, Projection)]
-#[projection(kind = "customer-billing")]
+#[projection(
+    kind = "customer-billing",
+    metadata = EventMetadata,
+    events(
+        SubscriptionStarted,
+        SubscriptionCancelled,
+        InvoiceIssued,
+        PaymentRecorded,
+        InvoiceSettled
+    )
+)]
 pub struct CustomerBillingProjection {
     customers: HashMap<String, CustomerSnapshot>,
-}
-
-impl ProjectionFilters for CustomerBillingProjection {
-    type Id = String;
-    type InstanceId = ();
-    type Metadata = EventMetadata;
-
-    fn init((): &()) -> Self {
-        Self::default()
-    }
-
-    fn filters<S>((): &()) -> Filters<S, Self>
-    where
-        S: EventStore<Id = String>,
-        S::Metadata: Clone + Into<EventMetadata>,
-    {
-        Filters::new()
-            .event::<SubscriptionStarted>()
-            .event::<SubscriptionCancelled>()
-            .event::<InvoiceIssued>()
-            .event::<PaymentRecorded>()
-            .event::<InvoiceSettled>()
-    }
 }
 
 impl CustomerBillingProjection {

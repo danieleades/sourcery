@@ -67,7 +67,7 @@ The most common pattern for handling conflicts is to **retry** the operation.
 The repository provides a helper for this: `execute_with_retry`.
 
 ```rust,ignore
-use sourcery::RetryResult;
+use sourcery::repository::RetryResult;
 
 let attempts: RetryResult<MyAggregate, MyStore> =
     repo.execute_with_retry::<MyAggregate, MyCommand>(&id, &command, &metadata, 3).await?;

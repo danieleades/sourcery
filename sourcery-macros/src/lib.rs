@@ -392,8 +392,7 @@ fn generate_projection_impl(args: ProjectionArgs, input: &DeriveInput) -> TokenS
 
             fn filters<S>(_instance_id: &Self::InstanceId) -> ::sourcery::Filters<S, Self>
             where
-                S: ::sourcery::store::EventStore<Id = Self::Id>,
-                S::Metadata: Clone + Into<Self::Metadata>,
+                S: ::sourcery::store::EventStore<Id = Self::Id, Metadata = Self::Metadata>,
             {
                 #filters_body
             }
