@@ -1,31 +1,40 @@
-//! Subscription Billing Example – Command/Query split with cross-aggregate
-//! projection
+//! Subscription Billing Example – live projection via push-based subscriptions
 //!
-//! This example demonstrates a realistic CQRS flow using the primitives
-//! provided by the `sourcery` crate:
+//! This example demonstrates a realistic CQRS flow with real-time projection
+//! updates using the subscription API:
+//!
 //! - **Subscription aggregate** drives the customer lifecycle
 //!   (activation/cancellation).
 //! - **Invoice aggregate** handles billing and payments for a specific customer
 //!   invoice.
-//! - **`CustomerBillingProjection`** consumes events from *both* aggregates to
-//!   maintain an operational dashboard: plan status, outstanding balance, audit
-//!   metadata.
+//! - **`CustomerBillingProjection`** consumes events from *both* aggregates via
+//!   a push-based subscription, maintaining a live in-memory dashboard that
+//!   updates after every committed event.
 //!
-//! The example emphasises CQRS good practice:
-//! - Aggregates emit domain-focused events with no persistence artefacts.
-//! - Commands include tracing metadata (`causation_id`, `correlation_id`,
-//!   `user_id`), making downstream projections observable.
-//! - The query-side projection is idempotent and could be materialised
-//!   asynchronously. (For the demo we rebuild it in-process; in production it
-//!   would run in its own worker.)
-//! - The command side consults the read model before allowing a risky operation
-//!   (cancelling a subscription while money is outstanding).
+//! Key patterns demonstrated:
+//!
+//! - **`subscribe()` / `on_update()`** – the projection updates in real time as
+//!   commands are executed, with zero per-query replay cost.
+//! - **`on_catchup_complete()`** – the example waits until historical events
+//!   are replayed before serving traffic, guaranteeing the projection is
+//!   current.
+//! - **Guard conditions from live state** – the command side reads the
+//!   subscription-maintained projection (via `Arc<Mutex<_>>`) to decide whether
+//!   cancellation is safe.
+//! - **Graceful shutdown** – `subscription.stop()` cleanly terminates the
+//!   background task.
 
-use std::{collections::HashMap, fmt};
+use std::{
+    collections::HashMap,
+    fmt,
+    sync::{Arc, Mutex},
+};
 
 use serde::{Deserialize, Serialize};
 use sourcery::{
-    Aggregate, Apply, ApplyProjection, DomainEvent, Handle, Repository, store::inmemory,
+    Aggregate, Apply, ApplyProjection, DomainEvent, Filters, Handle, Projection, Repository,
+    Subscribable,
+    store::{EventStore, inmemory},
 };
 
 // =============================================================================
@@ -316,7 +325,7 @@ impl Handle<RecordPayment> for Invoice {
 // Projection: Customer Billing Dashboard
 // =============================================================================
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct CustomerSnapshot {
     pub active_plan: Option<String>,
     pub is_active: bool,
@@ -326,10 +335,33 @@ pub struct CustomerSnapshot {
     pub last_updated_by: String,
 }
 
-#[derive(Debug, Default, sourcery::Projection)]
-#[projection(id = String, metadata = EventMetadata, kind = "customer-billing")]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, Projection)]
+#[projection(kind = "customer-billing")]
 pub struct CustomerBillingProjection {
     customers: HashMap<String, CustomerSnapshot>,
+}
+
+impl Subscribable for CustomerBillingProjection {
+    type Id = String;
+    type InstanceId = ();
+    type Metadata = EventMetadata;
+
+    fn init((): &()) -> Self {
+        Self::default()
+    }
+
+    fn filters<S>((): &()) -> Filters<S, Self>
+    where
+        S: EventStore<Id = String>,
+        S::Metadata: Clone + Into<EventMetadata>,
+    {
+        Filters::new()
+            .event::<SubscriptionStarted>()
+            .event::<SubscriptionCancelled>()
+            .event::<InvoiceIssued>()
+            .event::<PaymentRecorded>()
+            .event::<InvoiceSettled>()
+    }
 }
 
 impl CustomerBillingProjection {
@@ -340,11 +372,6 @@ impl CustomerBillingProjection {
     #[must_use]
     pub fn customer(&self, id: &str) -> Option<&CustomerSnapshot> {
         self.customers.get(id)
-    }
-
-    /// Iterate customers for reporting.
-    pub fn customers(&self) -> impl Iterator<Item = (&String, &CustomerSnapshot)> {
-        self.customers.iter()
     }
 }
 
@@ -373,7 +400,6 @@ impl ApplyProjection<SubscriptionCancelled> for CustomerBillingProjection {
         _event: &SubscriptionCancelled,
         metadata: &Self::Metadata,
     ) {
-        // aggregate_id already has the "subscription::" prefix stripped
         let customer_id = aggregate_id;
         let snapshot = self.touch_customer(customer_id.to_owned());
         snapshot.is_active = false;
@@ -444,10 +470,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store: inmemory::Store<String, EventMetadata> = inmemory::Store::new();
     let repository = Repository::new(store);
 
+    // -------------------------------------------------------------------------
+    // Start a live subscription BEFORE issuing commands.
+    //
+    // The subscription replays any historical events first (catch-up phase),
+    // then transitions to processing live events as they are committed.
+    // `on_catchup_complete` fires once the historical replay is done.
+    // `on_update` fires after every event is applied.
+    // -------------------------------------------------------------------------
+
+    // Shared state: the subscription writes, the command side reads.
+    let live_projection = Arc::new(Mutex::new(CustomerBillingProjection::default()));
+    let projection_for_callback = live_projection.clone();
+
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+
+    let subscription = repository
+        .subscribe::<CustomerBillingProjection>(())
+        .on_catchup_complete(move || {
+            let _ = ready_tx.send(());
+        })
+        .on_update(move |projection| {
+            // Capture the latest state so the command side can read it.
+            *projection_for_callback.lock().expect("lock poisoned") = projection.clone();
+
+            // In production this would push to WebSocket clients, update a
+            // cache, or send to a channel. Here we just print a summary.
+            print_dashboard(projection, "  [live]");
+        })
+        .start()
+        .await?;
+
+    // Wait until the catch-up phase is complete before executing commands.
+    // In a real service this is where you'd start accepting HTTP traffic.
+    ready_rx.await?;
+    println!("Subscription caught up – ready to process commands.\n");
+
+    // -------------------------------------------------------------------------
+    // Execute commands. Each commit automatically updates the subscription.
+    // -------------------------------------------------------------------------
+
     let customer_id = String::from("ACME-001");
     let subscription_corr = format!("subscription/{}", customer_id.as_str());
 
-    // Activate the subscription
+    // 1. Activate the subscription
     repository
         .execute_command::<Subscription, StartSubscription>(
             &customer_id,
@@ -462,7 +528,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?;
 
-    // Issue an invoice tied to the subscription lifecycle
+    // 2. Issue an invoice
     let invoice_id = InvoiceId::new(customer_id.clone(), "2024-INV-1001");
     let invoice_stream_id = invoice_id.to_string();
     let invoice_corr = format!("invoice/{}", invoice_id.invoice_number);
@@ -482,7 +548,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?;
 
-    // Record a partial payment
+    // 3. Record a partial payment
     repository
         .execute_command::<Invoice, RecordPayment>(
             &invoice_stream_id,
@@ -496,7 +562,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?;
 
-    // Record remaining balance
+    // 4. Record remaining balance (triggers InvoiceSettled)
     repository
         .execute_command::<Invoice, RecordPayment>(
             &invoice_stream_id,
@@ -510,22 +576,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?;
 
-    // Build the read model (would typically happen asynchronously)
-    let billing_projection = repository
-        .build_projection::<CustomerBillingProjection>()
-        .event::<SubscriptionStarted>()
-        .event::<SubscriptionCancelled>()
-        .event::<InvoiceIssued>()
-        .event::<PaymentRecorded>()
-        .event::<InvoiceSettled>()
-        .load()
-        .await?;
+    // Brief pause to let the subscription task process all pending events.
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
-    // Guard cancelling the subscription with the up-to-date read model
-    if billing_projection
-        .customer(&customer_id)
-        .is_some_and(|snapshot| snapshot.outstanding_balance_cents == 0)
-    {
+    // -------------------------------------------------------------------------
+    // Guard: read the live projection before allowing cancellation.
+    //
+    // Because the projection is maintained by the subscription, this is a
+    // simple lock read — no event replay needed.
+    // -------------------------------------------------------------------------
+
+    let can_cancel = {
+        let projection = live_projection.lock().expect("lock poisoned");
+        projection
+            .customer(&customer_id)
+            .is_some_and(|snapshot| snapshot.outstanding_balance_cents == 0)
+    };
+
+    if can_cancel {
+        println!("\nBalance is zero – proceeding with cancellation.");
         repository
             .execute_command::<Subscription, CancelSubscription>(
                 &customer_id,
@@ -540,44 +609,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .await?;
     } else {
-        println!("Subscription not cancelled – outstanding balance detected.");
+        println!("\nSubscription not cancelled – outstanding balance detected.");
     }
 
-    let final_projection = repository
-        .build_projection::<CustomerBillingProjection>()
-        .event::<SubscriptionStarted>()
-        .event::<SubscriptionCancelled>()
-        .event::<InvoiceIssued>()
-        .event::<PaymentRecorded>()
-        .event::<InvoiceSettled>()
-        .load()
-        .await?;
+    // Allow the final event to propagate.
+    // Brief pause to let the subscription task process the event.
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
-    println!("=== Customer Billing Dashboard ===");
-    for (customer, snapshot) in final_projection.customers() {
-        println!("Customer: {customer}");
+    // -------------------------------------------------------------------------
+    // Print the final state from the live projection, then shut down.
+    // -------------------------------------------------------------------------
+
+    println!("\n=== Final Dashboard State ===");
+    {
+        let projection = live_projection.lock().expect("lock poisoned");
+        print_dashboard(&projection, "");
+    }
+
+    // Graceful shutdown: stop the subscription and wait for its task to finish.
+    subscription.stop().await?;
+    println!("Subscription stopped.");
+
+    Ok(())
+}
+
+fn print_dashboard(projection: &CustomerBillingProjection, prefix: &str) {
+    for (customer, snapshot) in &projection.customers {
+        println!("{prefix}Customer: {customer}");
         println!(
-            "  Active Plan: {}",
+            "{prefix}  Active Plan: {}",
             snapshot.active_plan.as_deref().unwrap_or("none")
         );
         println!(
-            "  Status: {}",
+            "{prefix}  Status: {}",
             if snapshot.is_active {
                 "active"
             } else {
                 "inactive"
             }
         );
-        println!(
-            "  Outstanding Balance: ${:.2}",
-            snapshot.outstanding_balance_cents as f64 / 100.0
-        );
-        if let Some(due) = &snapshot.last_invoice_due {
-            println!("  Last Invoice Due: {due}");
+        #[allow(clippy::cast_precision_loss)]
+        {
+            println!(
+                "{prefix}  Outstanding Balance: ${:.2}",
+                snapshot.outstanding_balance_cents as f64 / 100.0
+            );
         }
-        println!("  Last Correlation ID: {}", snapshot.last_correlation_id);
-        println!();
+        if let Some(due) = &snapshot.last_invoice_due {
+            println!("{prefix}  Last Invoice Due: {due}");
+        }
+        println!(
+            "{prefix}  Last Correlation ID: {}",
+            snapshot.last_correlation_id
+        );
     }
-
-    Ok(())
 }

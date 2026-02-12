@@ -19,7 +19,7 @@
 - [Domain Events](core-traits/domain-event.md)
 - [Commands](core-traits/commands.md)
 - [Projections](core-traits/projections.md)
-- [Stores & Codecs](core-traits/stores.md)
+- [Stores](core-traits/stores.md)
 
 # Derive Macros
 
@@ -33,6 +33,7 @@
 - [Snapshots](advanced/snapshots.md)
 - [Event Versioning](advanced/event-versioning.md)
 - [Custom Metadata](advanced/custom-metadata.md)
+- [Subscriptions](advanced/subscriptions.md)
 - [Custom Stores](advanced/custom-stores.md)
 
 # Testing

@@ -1,5 +1,5 @@
 error: Unexpected type `path`
-  --> tests/ui/fail/projection_kind_non_string.rs:11:34
+  --> tests/ui/fail/projection_kind_non_string.rs:11:21
    |
-11 | #[projection(id = String, kind = AccountLedger)]
-   |                                  ^^^^^^^^^^^^^
+11 | #[projection(kind = AccountLedger)]
+   |                     ^^^^^^^^^^^^^

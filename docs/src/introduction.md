@@ -18,9 +18,10 @@ It adds complexity, so consider simpler approaches for CRUD-heavy applications w
 | Included | Not Included |
 |----------|--------------|
 | Core traits for aggregates, events, projections | Command bus / message broker |
-| Derive macro to reduce boilerplate | Outbox pattern |
+| Derive macros to reduce boilerplate | Outbox pattern |
 | Repository for command execution | Snapshot scheduler |
-| In-memory store for testing | Event streaming infrastructure |
+| Push-based subscriptions for live projections | |
+| In-memory store for testing | |
 | PostgreSQL store (optional) | |
 | Test framework (given-when-then) | |
 

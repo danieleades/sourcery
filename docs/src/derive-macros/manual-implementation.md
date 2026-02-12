@@ -46,9 +46,9 @@ impl Apply<FundsWithdrawn> for Account {
 ### Without Derive Macro
 
 ```rust,ignore
-use sourcery::{Aggregate, DomainEvent};
-use sourcery::codec::{Codec, EventDecodeError, ProjectionEvent, SerializableEvent};
-use sourcery::store::PersistableEvent;
+use sourcery::{Aggregate, DomainEvent, EventKind, ProjectionEvent};
+use sourcery::event::EventDecodeError;
+use sourcery::store::{EventStore, StoredEvent};
 use serde::{Deserialize, Serialize};
 
 // Events (same as before)
@@ -67,7 +67,7 @@ impl DomainEvent for FundsWithdrawn {
 }
 
 // Manual event enum
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 pub enum AccountEvent {
     Deposited(FundsDeposited),
     Withdrawn(FundsWithdrawn),
@@ -82,46 +82,49 @@ impl From<FundsWithdrawn> for AccountEvent {
     fn from(e: FundsWithdrawn) -> Self { Self::Withdrawn(e) }
 }
 
-// SerializableEvent for persistence
-impl SerializableEvent for AccountEvent {
-    fn to_persistable<C: Codec, M>(
-        self,
-        codec: &C,
-        metadata: M,
-    ) -> Result<PersistableEvent<M>, C::Error> {
-        let (kind, data) = match &self {
-            Self::Deposited(e) => (FundsDeposited::KIND, codec.serialize(e)?),
-            Self::Withdrawn(e) => (FundsWithdrawn::KIND, codec.serialize(e)?),
-        };
-        Ok(PersistableEvent {
-            kind: kind.to_string(),
-            data,
-            metadata,
-        })
+// EventKind for runtime kind dispatch
+impl EventKind for AccountEvent {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Deposited(_) => FundsDeposited::KIND,
+            Self::Withdrawn(_) => FundsWithdrawn::KIND,
+        }
     }
 }
 
-// ProjectionEvent for loading
+// Serialize — serializes only the inner event (no enum wrapper)
+impl serde::Serialize for AccountEvent {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::Deposited(inner) => inner.serialize(serializer),
+            Self::Withdrawn(inner) => inner.serialize(serializer),
+        }
+    }
+}
+
+// ProjectionEvent for loading/deserialization
 impl ProjectionEvent for AccountEvent {
     const EVENT_KINDS: &'static [&'static str] = &[
         FundsDeposited::KIND,
         FundsWithdrawn::KIND,
     ];
 
-    fn from_stored<C: Codec>(
-        kind: &str,
-        data: &[u8],
-        codec: &C,
-    ) -> Result<Self, EventDecodeError<C::Error>> {
-        match kind {
+    fn from_stored<S: EventStore>(
+        stored: &StoredEvent<S::Id, S::Position, S::Data, S::Metadata>,
+        store: &S,
+    ) -> Result<Self, EventDecodeError<S::Error>> {
+        match stored.kind() {
             FundsDeposited::KIND => Ok(Self::Deposited(
-                codec.deserialize(data).map_err(EventDecodeError::Codec)?,
+                store.decode_event(stored).map_err(EventDecodeError::Store)?
             )),
             FundsWithdrawn::KIND => Ok(Self::Withdrawn(
-                codec.deserialize(data).map_err(EventDecodeError::Codec)?,
+                store.decode_event(stored).map_err(EventDecodeError::Store)?
             )),
             _ => Err(EventDecodeError::UnknownKind {
-                kind: kind.to_string(),
+                kind: stored.kind().to_string(),
                 expected: Self::EVENT_KINDS,
             }),
         }
@@ -134,14 +137,14 @@ pub struct Account {
     balance: i64,
 }
 
-// Manual Aggregate implementation — Apply<E> not needed, just match directly
+// Manual Aggregate implementation
 impl Aggregate for Account {
     const KIND: &'static str = "account";
     type Event = AccountEvent;
     type Error = String;
     type Id = String;
 
-    fn apply(&mut self, event: Self::Event) {
+    fn apply(&mut self, event: &Self::Event) {
         match event {
             AccountEvent::Deposited(e) => self.balance += e.amount,
             AccountEvent::Withdrawn(e) => self.balance -= e.amount,
@@ -162,7 +165,7 @@ impl Aggregate for Account {
 |----------|----------------|
 | Standard CRUD aggregate | Use derive macro |
 | Learning the crate | Start with derive, then explore manual |
-| Custom event codec | Manual |
+| Custom event serialization | Manual |
 | Dynamic event types | Manual |
 | Unusual enum structure | Manual |
 

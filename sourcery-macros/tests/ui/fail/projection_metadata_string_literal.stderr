@@ -1,5 +1,0 @@
-error: Unsupported shape `expected `key = Type``
-  --> tests/ui/fail/projection_metadata_string_literal.rs:11:27
-   |
-11 | #[projection(id = String, metadata = "Meta")]
-   |                           ^^^^^^^^

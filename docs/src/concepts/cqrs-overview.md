@@ -53,18 +53,15 @@ repository
     .execute_command::<Account, Deposit>(&id, &command, &metadata)
     .await?;
 
-// Read: build a projection
+// Read: load a projection
 let summary = repository
-    .build_projection::<AccountSummary>()
-    .event::<FundsDeposited>()
-    .event::<FundsWithdrawn>()
-    .load()
+    .load_projection::<AccountSummary>(&())
     .await?;
 ```
 
 ## Eventual Consistency
 
-With CQRS, read models may not immediately reflect the latest write. This is fine for most UIs—users expect slight delays. For operations requiring strong consistency, read from the aggregate itself (via `aggregate_builder`).
+With CQRS, read models may not immediately reflect the latest write. This is fine for most UIs—users expect slight delays. For operations requiring strong consistency, read from the aggregate itself (via `repo.load()`).
 
 ## Next
 

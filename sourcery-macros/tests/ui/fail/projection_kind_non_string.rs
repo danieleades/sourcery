@@ -3,12 +3,12 @@ extern crate self as sourcery;
 #[path = "../common.rs"]
 mod support;
 
-pub use support::{codec, store, Aggregate, Apply, Projection};
+pub use support::{codec, store, Aggregate, Apply, Filters, Projection, Subscribable};
 
 use sourcery_macros::Projection;
 
 #[derive(Projection)]
-#[projection(id = String, kind = AccountLedger)]
+#[projection(kind = AccountLedger)]
 pub struct AccountLedger {}
 
 fn main() {}

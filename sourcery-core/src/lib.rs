@@ -3,8 +3,8 @@
 //! This crate provides the foundational abstractions for event sourcing:
 //!
 //! - [`aggregate`] - Command-side primitives (`Aggregate`, `Apply`, `Handle`)
-//! - [`projection`] - Read-side primitives (`Projection`, `ApplyProjection`,
-//!   `ProjectionBuilder`)
+//! - [`projection`] - Read-side primitives (`Projection`, `Subscribable`,
+//!   `ApplyProjection`, `Filters`)
 //! - [`repository`] - Command execution and aggregate lifecycle (`Repository`)
 //! - [`store`] - Event persistence abstraction (`EventStore`)
 //! - [`snapshot`] - Snapshot storage abstraction (`SnapshotStore`)
@@ -32,6 +32,7 @@ pub mod projection;
 pub mod repository;
 pub mod snapshot;
 pub mod store;
+pub mod subscription;
 
 // Test utilities module: public when feature enabled, internal for crate tests
 #[cfg(feature = "test-util")]

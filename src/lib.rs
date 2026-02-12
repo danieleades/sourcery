@@ -8,11 +8,13 @@ pub use sourcery_core::{
     event,
     event::{DomainEvent, EventDecodeError, EventKind, ProjectionEvent},
     projection,
-    projection::{ApplyProjection, Projection},
+    projection::{ApplyProjection, Filters, Projection, Subscribable},
     repository,
     repository::{
         OptimisticRepository, OptimisticSnapshotRepository, Repository, UncheckedRepository,
     },
+    subscription,
+    subscription::{SubscribableStore, SubscriptionBuilder, SubscriptionError, SubscriptionHandle},
 };
 // Re-export proc macro derives so consumers only depend on `sourcery`.
 pub use sourcery_macros::{Aggregate, Projection};

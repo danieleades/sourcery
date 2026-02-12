@@ -58,7 +58,7 @@ impl Handle<DepositFunds> for Account {
 | **[Aggregates](https://danieleades.github.io/sourcery/core-traits/aggregate.html)** | Rebuild state from events and validate commands via `Apply<E>` and `Handle<C>`. |
 | **[Projections](https://danieleades.github.io/sourcery/core-traits/projections.html)** | Read models that replay events via `ApplyProjection<E>`, potentially across multiple aggregates. |
 | **[Repository](https://danieleades.github.io/sourcery/concepts/architecture.html)** | Orchestrates loading, command execution, and persistence in a single transaction. |
-| **[EventStore](https://danieleades.github.io/sourcery/core-traits/stores.html)** | Trait defining the persistence boundary—implement for Postgres, DynamoDB, S3, etc. |
+| **[EventStore](https://danieleades.github.io/sourcery/core-traits/stores.html)** | Trait defining the persistence boundary—implement for Postgres, `DynamoDB`, S3, etc. |
 
 ## Documentation
 

@@ -61,19 +61,17 @@ The aggregate starts in its `Default` state. Each event is applied in order. The
 
 ## Loading Aggregates
 
-Use `AggregateBuilder` to load an aggregate's current state:
+Use `Repository::load` to load an aggregate's current state:
 
 ```rust,ignore
 let account: Account = repository
-    .aggregate_builder()
     .load(&account_id)
     .await?;
 
 println!("Current balance: {}", account.balance);
 ```
 
-On `Repository` this replays all events for that aggregate ID.
-On `Repository<S, C, Snapshots<SS>>` it loads a snapshot first (when present) and replays only the delta.
+This replays all events for that aggregate ID. When the repository is configured with snapshots (via `with_snapshots()`), it loads a snapshot first (when present) and replays only the delta.
 
 ## Next
 

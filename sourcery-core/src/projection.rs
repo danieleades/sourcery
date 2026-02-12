@@ -2,39 +2,66 @@
 //!
 //! Projections rebuild query models from streams of stored events. This module
 //! provides the projection trait, event application hooks via
-//! [`ApplyProjection`], and the [`ProjectionBuilder`] that wires everything
+//! [`ApplyProjection`], and the [`Filters`] builder that wires everything
 //! together.
-use std::{collections::HashMap, marker::PhantomData};
+use std::collections::HashMap;
 
 use thiserror::Error;
 
 use crate::{
     aggregate::Aggregate,
     event::{DomainEvent, EventDecodeError, ProjectionEvent},
-    snapshot::{Snapshot, SnapshotStore},
-    store::{EventFilter, EventStore, GloballyOrderedStore, StoredEvent},
+    store::{EventFilter, EventStore, StoredEvent},
 };
+
+/// Base trait for types that subscribe to events.
+///
+/// The `filters()` method returns both the event filters AND the handlers
+/// needed to process those events. It is generic over the store type `S`,
+/// allowing the same projection to work with any store that shares the
+/// same `Id` type.
+///
+/// `filters()` must be **pure and deterministic**: given the same
+/// `instance_id`, it must always return the same filter set.
+///
+/// `init()` constructs a fresh instance from the instance identifier.
+/// This replaces the `Default` constraint, allowing instance-aware
+/// projections to capture their identity at construction time.
+// ANCHOR: subscribable_trait
+pub trait Subscribable: Sized {
+    /// Aggregate identifier type this subscriber is compatible with.
+    type Id;
+    /// Instance identifier for this subscriber.
+    ///
+    /// For singleton subscribers use `()`.
+    type InstanceId;
+    /// Metadata type expected by this subscriber's handlers.
+    type Metadata;
+
+    /// Construct a fresh instance from the instance identifier.
+    ///
+    /// For singleton projections (`InstanceId = ()`), this typically
+    /// delegates to `Self::default()`. For instance projections, this
+    /// captures the instance identifier at construction time.
+    fn init(instance_id: &Self::InstanceId) -> Self;
+
+    /// Build the filter set and handler map for this subscriber.
+    fn filters<S>(instance_id: &Self::InstanceId) -> Filters<S, Self>
+    where
+        S: EventStore<Id = Self::Id>,
+        S::Metadata: Clone + Into<Self::Metadata>;
+}
+// ANCHOR_END: subscribable_trait
 
 /// Trait implemented by read models that can be constructed from an event
 /// stream.
 ///
-/// Implementors specify the identifier and metadata types their
-/// [`ApplyProjection`] handlers expect. Projections are typically rebuilt by
-/// calling [`Repository::build_projection`] and configuring the desired event
-/// streams before invoking [`ProjectionBuilder::load`].
+/// Extends [`Subscribable`] with a stable `KIND` identifier for snapshot
+/// storage. Derivable via `#[derive(Projection)]`.
 // ANCHOR: projection_trait
-pub trait Projection: Default {
+pub trait Projection: Subscribable {
     /// Stable identifier for this projection type.
     const KIND: &'static str;
-    /// Aggregate identifier type this projection is compatible with.
-    type Id;
-    /// Metadata type expected by this projection
-    type Metadata;
-    /// Projection instance identifier
-    ///
-    /// For 'singleton' projections (those for which there is only one global
-    /// projection with it's 'KIND') use `()`.
-    type InstanceId;
 }
 // ANCHOR_END: projection_trait
 
@@ -52,7 +79,7 @@ pub trait Projection: Default {
 /// }
 /// ```
 // ANCHOR: apply_projection_trait
-pub trait ApplyProjection<E>: Projection {
+pub trait ApplyProjection<E>: Subscribable {
     fn apply_projection(&mut self, aggregate_id: &Self::Id, event: &E, metadata: &Self::Metadata);
 }
 // ANCHOR_END: apply_projection_trait
@@ -69,9 +96,9 @@ where
     EventDecode(#[source] EventDecodeError<StoreError>),
 }
 
-/// Type alias for event handler closures.
+/// Internal error type for event handler closures.
 #[derive(Debug)]
-enum HandlerError<StoreError> {
+pub(crate) enum HandlerError<StoreError> {
     EventDecode(EventDecodeError<StoreError>),
     Store(StoreError),
 }
@@ -82,7 +109,8 @@ impl<StoreError> From<StoreError> for HandlerError<StoreError> {
     }
 }
 
-type EventHandler<P, S> = Box<
+/// Type alias for event handler closures used by [`Filters`].
+pub(crate) type EventHandler<P, S> = Box<
     dyn Fn(
             &mut P,
             &<S as EventStore>::Id,
@@ -99,69 +127,53 @@ type EventHandler<P, S> = Box<
         + Sync,
 >;
 
-/// Builder used to configure which events should be loaded for a projection.
-pub struct ProjectionBuilder<'a, S, P, SS, Snap = NoSnapshot>
+/// Positioned filters and handler map, ready for event loading.
+pub(crate) type PositionedFilters<S, P> = (
+    Vec<EventFilter<<S as EventStore>::Id, <S as EventStore>::Position>>,
+    HashMap<&'static str, EventHandler<P, S>>,
+);
+
+/// Combined filter configuration and handler map for a subscriber.
+///
+/// `Filters` captures both the event filters (which events to load) and the
+/// handler closures (how to apply them). It is parameterized by the store
+/// type `S` to enable store-mediated decoding.
+///
+/// Filters are constructed without positions. Positions are applied at
+/// load/subscribe time.
+pub struct Filters<S, P>
 where
     S: EventStore,
-    P: Projection<Id = S::Id>,
-    P::InstanceId: Sync,
-    SS: SnapshotStore<P::InstanceId, Position = S::Position>,
 {
-    store: &'a S,
-    snapshots: &'a SS,
-    /// Event kind -> handler mapping for O(1) dispatch
-    handlers: HashMap<&'a str, EventHandler<P, S>>,
-    /// Filters for loading events from the store
-    filters: Vec<EventFilter<S::Id, S::Position>>,
-    _phantom: PhantomData<fn() -> (P, Snap)>,
+    pub(crate) specs: Vec<EventFilter<S::Id, ()>>,
+    pub(crate) handlers: HashMap<&'static str, EventHandler<P, S>>,
 }
 
-/// Type-level marker indicating no snapshot support.
-///
-/// This is an implementation detail of [`ProjectionBuilder`]'s type-state
-/// pattern. You should never need to name this type directly - use the builder
-/// methods instead.
-#[doc(hidden)]
-pub struct NoSnapshot;
-
-/// Type-level marker indicating snapshot support is enabled.
-///
-/// This is an implementation detail of [`ProjectionBuilder`]'s type-state
-/// pattern. You should never need to name this type directly - use the builder
-/// methods instead.
-#[doc(hidden)]
-pub struct WithSnapshot;
-
-impl<'a, S, P, SS, Snap> ProjectionBuilder<'a, S, P, SS, Snap>
+impl<S, P> Default for Filters<S, P>
 where
     S: EventStore,
-    P: Projection<Id = S::Id>,
-    P::InstanceId: Sync,
-    SS: SnapshotStore<P::InstanceId, Position = S::Position>,
+    P: Subscribable<Id = S::Id>,
 {
-    pub(super) fn new(store: &'a S, snapshots: &'a SS) -> Self {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<S, P> Filters<S, P>
+where
+    S: EventStore,
+    P: Subscribable<Id = S::Id>,
+{
+    /// Create an empty filter set.
+    #[must_use]
+    pub fn new() -> Self {
         Self {
-            store,
-            snapshots,
+            specs: Vec::new(),
             handlers: HashMap::new(),
-            filters: Vec::new(),
-            _phantom: PhantomData,
         }
     }
 
-    /// Register a specific event type to load from all aggregates.
-    ///
-    /// # Type Constraints
-    ///
-    /// The store's metadata type must be convertible to the projection's
-    /// metadata type. `Clone` is required because event handlers receive
-    /// metadata by reference, but `Into::into()` requires ownership. The
-    /// metadata is cloned once per event.
-    ///
-    /// # Example
-    /// ```ignore
-    /// builder.event::<ProductRestocked>()  // All products
-    /// ```
+    /// Subscribe to a specific event type globally (all aggregates).
     #[must_use]
     pub fn event<E>(mut self) -> Self
     where
@@ -169,7 +181,7 @@ where
         P: ApplyProjection<E>,
         S::Metadata: Clone + Into<P::Metadata>,
     {
-        self.filters.push(EventFilter::for_event(E::KIND));
+        self.specs.push(EventFilter::for_event(E::KIND));
         self.handlers.insert(
             E::KIND,
             Box::new(|proj, agg_id, stored, metadata, store| {
@@ -182,18 +194,8 @@ where
         self
     }
 
-    /// Register all event kinds supported by a `ProjectionEvent` sum type
-    /// across all aggregates.
-    ///
-    /// This is primarily intended for subscribing to an aggregate's generated
-    /// event enum (`A::Event` from `#[derive(Aggregate)]`) as a single
-    /// "unit", rather than registering each `DomainEvent` type
-    /// individually.
-    ///
-    /// # Example
-    /// ```ignore
-    /// builder.events::<AccountEvent>() // All accounts, all account event variants
-    /// ```
+    /// Subscribe to all event kinds supported by a [`ProjectionEvent`] sum
+    /// type across all aggregates.
     #[must_use]
     pub fn events<E>(mut self) -> Self
     where
@@ -202,7 +204,7 @@ where
         S::Metadata: Clone + Into<P::Metadata>,
     {
         for &kind in E::EVENT_KINDS {
-            self.filters.push(EventFilter::for_event(kind));
+            self.specs.push(EventFilter::for_event(kind));
             self.handlers.insert(
                 kind,
                 Box::new(move |proj, agg_id, stored, metadata, store| {
@@ -216,17 +218,7 @@ where
         self
     }
 
-    /// Register a specific event type to load from a specific aggregate
-    /// instance.
-    ///
-    /// Use this when you only care about a single event kind. If you want to
-    /// subscribe to an aggregate's full event enum (`A::Event`), prefer
-    /// [`ProjectionBuilder::events_for`].
-    ///
-    /// # Example
-    /// ```ignore
-    /// builder.event_for::<Account, FundsDeposited>(&account_id); // One account stream
-    /// ```
+    /// Subscribe to a specific event type from a specific aggregate instance.
     #[must_use]
     pub fn event_for<A, E>(mut self, aggregate_id: &S::Id) -> Self
     where
@@ -235,7 +227,7 @@ where
         P: ApplyProjection<E>,
         S::Metadata: Clone + Into<P::Metadata>,
     {
-        self.filters.push(EventFilter::for_aggregate(
+        self.specs.push(EventFilter::for_aggregate(
             E::KIND,
             A::KIND,
             aggregate_id.clone(),
@@ -252,19 +244,7 @@ where
         self
     }
 
-    /// Register all event kinds for a specific aggregate instance.
-    ///
-    /// This subscribes the projection to the aggregate's event sum type
-    /// (`A::Event`) and loads all events in that stream that correspond to
-    /// `A::Event::EVENT_KINDS`.
-    ///
-    /// # Example
-    /// ```ignore
-    /// let history = repository
-    ///     .build_projection::<AccountHistory>()
-    ///     .events_for::<Account>(&account_id)
-    ///     .load()?;
-    /// ```
+    /// Subscribe to all events from a specific aggregate instance.
     #[must_use]
     pub fn events_for<A>(mut self, aggregate_id: &S::Id) -> Self
     where
@@ -274,7 +254,7 @@ where
         S::Metadata: Clone + Into<P::Metadata>,
     {
         for &kind in <A::Event as ProjectionEvent>::EVENT_KINDS {
-            self.filters.push(EventFilter::for_aggregate(
+            self.specs.push(EventFilter::for_aggregate(
                 kind,
                 A::KIND,
                 aggregate_id.clone(),
@@ -292,231 +272,26 @@ where
         }
         self
     }
-}
 
-impl<'a, S, P, SS> ProjectionBuilder<'a, S, P, SS, NoSnapshot>
-where
-    S: EventStore,
-    P: Projection<Id = S::Id>,
-    P::InstanceId: Sync,
-    SS: SnapshotStore<P::InstanceId, Position = S::Position>,
-{
-    /// Enable snapshot loading/saving for this projection.
-    #[must_use]
-    pub fn with_snapshot(self) -> ProjectionBuilder<'a, S, P, SS, WithSnapshot> {
-        ProjectionBuilder {
-            store: self.store,
-            snapshots: self.snapshots,
-            handlers: self.handlers,
-            filters: self.filters,
-            _phantom: PhantomData,
-        }
-    }
-
-    /// Replays the configured events and materializes the projection.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ProjectionError`] when the store fails to load events or when
-    /// an event cannot be deserialized.
-    #[tracing::instrument(
-        skip(self),
-        fields(
-            projection_type = std::any::type_name::<P>(),
-            filter_count = self.filters.len(),
-            handler_count = self.handlers.len()
-        )
-    )]
-    pub async fn load(self) -> Result<P, ProjectionError<S::Error>>
-    where
-        P: Projection<InstanceId = ()>,
-    {
-        self.load_for(&()).await
-    }
-
-    /// Replays the configured events for a specific projection instance.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ProjectionError`] when the store fails to load events or when
-    /// an event cannot be deserialized.
-    #[tracing::instrument(
-        skip(self, instance_id),
-        fields(
-            projection_type = std::any::type_name::<P>(),
-            filter_count = self.filters.len(),
-            handler_count = self.handlers.len()
-        )
-    )]
-    pub async fn load_for(
-        self,
-        instance_id: &P::InstanceId,
-    ) -> Result<P, ProjectionError<S::Error>> {
-        tracing::debug!("loading projection");
-
-        let events = self
-            .store
-            .load_events(&self.filters)
-            .await
-            .map_err(ProjectionError::Store)?;
-        let mut projection = P::default();
-
-        let event_count = events.len();
-        tracing::debug!(
-            events_to_replay = event_count,
-            "replaying events into projection"
-        );
-
-        for stored in &events {
-            let aggregate_id = stored.aggregate_id();
-            let kind = stored.kind();
-            let metadata = stored.metadata();
-
-            // O(1) handler lookup instead of O(n) linear scan
-            if let Some(handler) = self.handlers.get(kind) {
-                (handler)(&mut projection, aggregate_id, stored, metadata, self.store).map_err(
-                    |error| match error {
-                        HandlerError::Store(error) => {
-                            ProjectionError::EventDecode(EventDecodeError::Store(error))
-                        }
-                        HandlerError::EventDecode(error) => ProjectionError::EventDecode(error),
-                    },
-                )?;
-            }
-        }
-
-        tracing::info!(events_applied = event_count, "projection loaded");
-        let _ = instance_id;
-        Ok(projection)
-    }
-}
-
-impl<S, P, SS> ProjectionBuilder<'_, S, P, SS, WithSnapshot>
-where
-    S: EventStore + GloballyOrderedStore,
-    P: Projection<Id = S::Id> + serde::Serialize + serde::de::DeserializeOwned + Sync,
-    SS: SnapshotStore<P::InstanceId, Position = S::Position>,
-    S::Position: Ord,
-    P::InstanceId: Sync,
-{
-    /// Replays the configured events and materializes the projection.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ProjectionError`] when the store fails to load events or when
-    /// an event cannot be deserialized.
-    #[tracing::instrument(
-        skip(self),
-        fields(
-            projection_type = std::any::type_name::<P>(),
-            filter_count = self.filters.len(),
-            handler_count = self.handlers.len()
-        )
-    )]
-    pub async fn load(self) -> Result<P, ProjectionError<S::Error>>
-    where
-        P: Projection<InstanceId = ()>,
-    {
-        self.load_for(&()).await
-    }
-
-    /// Replays the configured events for a specific projection instance,
-    /// using snapshots when available.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ProjectionError`] when the store fails to load events or when
-    /// an event cannot be deserialized.
-    #[tracing::instrument(
-        skip(self, instance_id),
-        fields(
-            projection_type = std::any::type_name::<P>(),
-            filter_count = self.filters.len(),
-            handler_count = self.handlers.len()
-        )
-    )]
-    pub async fn load_for(
-        self,
-        instance_id: &P::InstanceId,
-    ) -> Result<P, ProjectionError<S::Error>> {
-        tracing::debug!("loading projection");
-
-        let snapshot_result = self
-            .snapshots
-            .load::<P>(P::KIND, instance_id)
-            .await
-            .inspect_err(|e| {
-                tracing::error!(error = %e, "failed to load projection snapshot");
+    /// Convert positionless filter specs into positioned [`EventFilter`]s.
+    pub(crate) fn into_event_filters(self, after: Option<&S::Position>) -> PositionedFilters<S, P> {
+        let filters = self
+            .specs
+            .into_iter()
+            .map(|spec| {
+                let mut filter = EventFilter {
+                    event_kind: spec.event_kind,
+                    aggregate_kind: spec.aggregate_kind,
+                    aggregate_id: spec.aggregate_id,
+                    after_position: None,
+                };
+                if let Some(pos) = after {
+                    filter = filter.after(pos.clone());
+                }
+                filter
             })
-            .ok()
-            .flatten();
-
-        let (mut projection, snapshot_position) = if let Some(snapshot) = snapshot_result {
-            (snapshot.data, Some(snapshot.position))
-        } else {
-            (P::default(), None)
-        };
-
-        let filters = if let Some(position) = snapshot_position {
-            self.filters
-                .into_iter()
-                .map(|filter| filter.after(position.clone()))
-                .collect::<Vec<_>>()
-        } else {
-            self.filters
-        };
-
-        let events = self
-            .store
-            .load_events(&filters)
-            .await
-            .map_err(ProjectionError::Store)?;
-
-        let event_count = events.len();
-        let mut last_position = None;
-
-        for stored in &events {
-            let aggregate_id = stored.aggregate_id();
-            let kind = stored.kind();
-            let metadata = stored.metadata();
-            let position = stored.position();
-
-            if let Some(handler) = self.handlers.get(kind) {
-                (handler)(&mut projection, aggregate_id, stored, metadata, self.store).map_err(
-                    |error| match error {
-                        HandlerError::Store(error) => {
-                            ProjectionError::EventDecode(EventDecodeError::Store(error))
-                        }
-                        HandlerError::EventDecode(error) => ProjectionError::EventDecode(error),
-                    },
-                )?;
-            }
-            last_position = Some(position);
-        }
-
-        if event_count > 0
-            && let Some(position) = last_position
-        {
-            let projection_ref = &projection;
-            let offer = self.snapshots.offer_snapshot(
-                P::KIND,
-                instance_id,
-                event_count as u64,
-                move || -> Result<Snapshot<S::Position, &P>, std::convert::Infallible> {
-                    Ok(Snapshot {
-                        position,
-                        data: projection_ref,
-                    })
-                },
-            );
-
-            if let Err(e) = offer.await {
-                tracing::error!(error = %e, "failed to store projection snapshot");
-            }
-        }
-
-        tracing::info!(events_applied = event_count, "projection loaded");
-        Ok(projection)
+            .collect();
+        (filters, self.handlers)
     }
 }
 
