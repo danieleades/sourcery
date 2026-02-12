@@ -12,7 +12,7 @@ edition = "2024"
 version = "0.2.0"
 rust-version = "1.92.0"
 homepage = "https://github.com/danieleades/sourcery"
-categories = ["asynchronous", "database", "database implementations"]
+categories = ["asynchronous", "database", "database-implementations"]
 keywords = ["event-sourcing", "cqrs"]
 
 [workspace.lints.clippy]
