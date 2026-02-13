@@ -218,9 +218,13 @@ fn generate_aggregate_impl(args: AggregateArgs, input: &DeriveInput) -> TokenStr
     };
 
     let expanded = quote! {
+        #[doc = concat!("Event type for the [`", stringify!(#struct_name), "`] aggregate.")]
         #derives
         #struct_vis enum #event_enum_name {
-            #(#variant_names(#event_types)),*
+            #(
+                #[doc = concat!("[`", stringify!(#event_types), "`]")]
+                #variant_names(#event_types)
+            ),*
         }
 
         impl ::sourcery::event::EventKind for #event_enum_name {

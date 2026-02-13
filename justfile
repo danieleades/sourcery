@@ -14,7 +14,7 @@ test-nightly:
 
 # Update trybuild .stderr files (must be run with stable)
 update-trybuild:
-    TRYBUILD=overwrite cargo +stable test --test trybuild
+    TRYBUILD=overwrite cargo +stable test -p sourcery-macros --test trybuild
 
 lint:
     cargo +nightly clippy --all --all-features --all-targets
