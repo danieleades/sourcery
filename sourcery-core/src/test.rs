@@ -17,8 +17,8 @@
 //!
 //! #[test]
 //! fn adding_value_produces_event() {
-//!     TestFramework::<Counter>::given(&[])
-//!         .when(&AddValue { amount: 10 })
+//!     TestFramework::<Counter>::new()
+//!         .when_create(&AddValue { amount: 10 })
 //!         .then_expect_events(&[
 //!             CounterEvent::Added(ValueAdded { amount: 10 })
 //!         ]);
@@ -60,7 +60,7 @@ use nonempty::NonEmpty;
 use thiserror::Error;
 
 use crate::{
-    aggregate::{Aggregate, Handle},
+    aggregate::{Aggregate, Handle, HandleCreate},
     concurrency::ConcurrencyStrategy,
     repository::Repository,
     store::{CommitError, EventStore},
@@ -136,8 +136,8 @@ pub trait RepositoryTestExt: StoreAccess + Send {
     /// # Arguments
     ///
     /// * `id` - The aggregate instance identifier
-    /// * `events` - Events to append (must implement [`EventKind`] and
-    ///   [`serde::Serialize`])
+    /// * `events` - Events to append (must implement
+    ///   [`crate::event::EventKind`] and [`serde::Serialize`])
     ///
     /// # Errors
     ///
@@ -255,46 +255,103 @@ impl<T> RepositoryTestExt for T where T: StoreAccess + Send {}
 ///
 /// * `A` - The aggregate type being tested
 pub struct TestFramework<A: Aggregate> {
-    aggregate: A,
+    aggregate: Option<A>,
 }
 
 impl<A: Aggregate> TestFramework<A> {
+    /// Start a test scenario with no existing aggregate stream.
+    ///
+    /// Use [`when_create`](Self::when_create) to execute creation commands.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { aggregate: None }
+    }
+
     /// Start a test scenario with previous events already applied.
     ///
-    /// The events are applied in order to rebuild the aggregate state
+    /// The first event is applied via [`Aggregate::create`], then the
+    /// remaining events are applied in order with [`Aggregate::apply`]
     /// before the command is executed.
     ///
-    /// Pass an empty slice `&[]` to test with no previous events.
+    /// Pass an empty slice `&[]` to represent a stream that does not yet
+    /// exist. In that case, use [`when_create`](Self::when_create) to test
+    /// creation commands.
     #[must_use]
     pub fn given(events: &[A::Event]) -> Self {
-        let mut aggregate = A::default();
-        for event in events {
-            aggregate.apply(event);
-        }
+        let mut iter = events.iter();
+        let aggregate = iter.next().map(|first| {
+            let mut aggregate = A::create(first);
+            for event in iter {
+                aggregate.apply(event);
+            }
+            aggregate
+        });
+
         Self { aggregate }
     }
 }
 
+impl<A: Aggregate> Default for TestFramework<A> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<A: Aggregate> TestFramework<A> {
-    /// Execute a command against the aggregate.
+    /// Execute a creation command against a stream that does not yet exist.
     ///
     /// Returns a `TestResult` that can be used to verify the outcome.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the framework already has aggregate state from
+    /// [`given`](Self::given) or [`and`](Self::and).
+    #[must_use]
+    pub fn when_create<C>(self, command: &C) -> TestResult<A>
+    where
+        A: HandleCreate<C>,
+    {
+        assert!(
+            self.aggregate.is_none(),
+            "cannot execute creation command: aggregate state already exists"
+        );
+
+        let result = <A as HandleCreate<C>>::handle_create(command).map_err(Into::into);
+        TestResult { result }
+    }
+
+    /// Execute a command against an existing aggregate.
+    ///
+    /// Returns a `TestResult` that can be used to verify the outcome.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no aggregate exists. Use [`when_create`](Self::when_create)
+    /// for creation commands.
     #[must_use]
     pub fn when<C>(self, command: &C) -> TestResult<A>
     where
         A: Handle<C>,
     {
-        let result = self.aggregate.handle(command);
+        let aggregate = self.aggregate.expect(
+            "cannot execute update command without aggregate state; use when_create() for \
+             creation commands or seed with given()",
+        );
+
+        let result = aggregate.handle(command).map_err(Into::into);
         TestResult { result }
     }
 
-    /// Add more events to the aggregate state before executing the command.
+    /// Add more events to the aggregate state before executing a command.
     ///
     /// Useful for building up complex state in multiple steps.
     #[must_use]
     pub fn and(mut self, events: Vec<A::Event>) -> Self {
         for event in events {
-            self.aggregate.apply(&event);
+            match self.aggregate.as_mut() {
+                Some(aggregate) => aggregate.apply(&event),
+                None => self.aggregate = Some(A::create(&event)),
+            }
         }
         self
     }
@@ -459,7 +516,7 @@ mod tests {
         Subtracted(ValueSubtracted),
     }
 
-    #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+    #[derive(Debug, serde::Serialize, serde::Deserialize)]
     struct Counter {
         value: i32,
     }
@@ -470,6 +527,13 @@ mod tests {
         type Id = String;
 
         const KIND: &'static str = "counter";
+
+        fn create(event: &Self::Event) -> Self {
+            match event {
+                CounterEvent::Added(e) => Self { value: e.amount },
+                CounterEvent::Subtracted(e) => Self { value: -e.amount },
+            }
+        }
 
         fn apply(&mut self, event: &Self::Event) {
             match event {
@@ -488,6 +552,8 @@ mod tests {
     }
 
     impl Handle<AddValue> for Counter {
+        type HandleError = Self::Error;
+
         fn handle(&self, command: &AddValue) -> Result<Vec<Self::Event>, Self::Error> {
             if command.amount <= 0 {
                 return Err("amount must be positive".to_string());
@@ -498,7 +564,22 @@ mod tests {
         }
     }
 
+    impl HandleCreate<AddValue> for Counter {
+        type HandleCreateError = Self::Error;
+
+        fn handle_create(command: &AddValue) -> Result<Vec<Self::Event>, Self::HandleCreateError> {
+            if command.amount <= 0 {
+                return Err("amount must be positive".to_string());
+            }
+            Ok(vec![CounterEvent::Added(ValueAdded {
+                amount: command.amount,
+            })])
+        }
+    }
+
     impl Handle<SubtractValue> for Counter {
+        type HandleError = Self::Error;
+
         fn handle(&self, command: &SubtractValue) -> Result<Vec<Self::Event>, Self::Error> {
             if command.amount <= 0 {
                 return Err("amount must be positive".to_string());
@@ -515,9 +596,9 @@ mod tests {
     type CounterTest = TestFramework<Counter>;
 
     #[test]
-    fn given_no_events_when_add_then_produces_event() {
-        CounterTest::given(&[])
-            .when(&AddValue { amount: 10 })
+    fn new_stream_when_create_then_produces_event() {
+        CounterTest::new()
+            .when_create(&AddValue { amount: 10 })
             .then_expect_events(&[CounterEvent::Added(ValueAdded { amount: 10 })]);
     }
 
@@ -552,15 +633,15 @@ mod tests {
 
     #[test]
     fn invalid_command_returns_error() {
-        CounterTest::given(&[])
-            .when(&AddValue { amount: -5 })
+        CounterTest::new()
+            .when_create(&AddValue { amount: -5 })
             .then_expect_error_message("amount must be positive");
     }
 
     #[test]
     fn inspect_result_returns_raw_result() {
-        let result = CounterTest::given(&[])
-            .when(&AddValue { amount: 10 })
+        let result = CounterTest::new()
+            .when_create(&AddValue { amount: 10 })
             .inspect_result();
 
         assert!(result.is_ok());
@@ -570,6 +651,8 @@ mod tests {
     struct NoOp;
 
     impl Handle<NoOp> for Counter {
+        type HandleError = Self::Error;
+
         fn handle(&self, _: &NoOp) -> Result<Vec<Self::Event>, Self::Error> {
             Ok(vec![])
         }
@@ -577,13 +660,21 @@ mod tests {
 
     #[test]
     fn no_op_command_produces_no_events() {
-        CounterTest::given(&[]).when(&NoOp).then_expect_no_events();
+        CounterTest::given(&[CounterEvent::Added(ValueAdded { amount: 10 })])
+            .when(&NoOp)
+            .then_expect_no_events();
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot execute update command without aggregate state")]
+    fn when_panics_without_existing_state() {
+        CounterTest::new().when(&NoOp).then_expect_no_events();
     }
 
     #[test]
     fn then_expect_error_eq_matches_error_value() {
-        CounterTest::given(&[])
-            .when(&AddValue { amount: -5 })
+        CounterTest::new()
+            .when_create(&AddValue { amount: -5 })
             .then_expect_error_eq(&"amount must be positive".to_string());
     }
 }
@@ -668,6 +759,12 @@ mod repository_test_ext_tests {
 
         const KIND: &'static str = "score";
 
+        fn create(event: &Self::Event) -> Self {
+            let mut this = Self::default();
+            this.apply(event);
+            this
+        }
+
         fn apply(&mut self, event: &Self::Event) {
             match event {
                 ScoreEvent::Added(e) => self.total += e.points,
@@ -697,7 +794,7 @@ mod repository_test_ext_tests {
         );
 
         // Verify events are loadable
-        let loaded: Score = repo.load(&id).await.unwrap();
+        let loaded: Score = repo.load(&id).await.unwrap().expect("score should exist");
         assert_eq!(loaded.total, 30);
     }
 
@@ -723,7 +820,7 @@ mod repository_test_ext_tests {
         );
 
         // Verify both events are reflected
-        let loaded: Score = repo.load(&id).await.unwrap();
+        let loaded: Score = repo.load(&id).await.unwrap().expect("score should exist");
         assert_eq!(loaded.total, 150);
     }
 
@@ -742,7 +839,11 @@ mod repository_test_ext_tests {
         .unwrap();
 
         // Verify event is loadable
-        let loaded: Score = repo.load(&"s1".to_string()).await.unwrap();
+        let loaded: Score = repo
+            .load(&"s1".to_string())
+            .await
+            .unwrap()
+            .expect("score should exist");
         assert_eq!(loaded.total, 42);
     }
 }

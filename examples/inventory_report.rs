@@ -25,7 +25,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use sourcery::{
-    Aggregate, Apply, ApplyProjection, DomainEvent, Handle, Repository, store::inmemory,
+    Aggregate, Apply, ApplyProjection, Create, DomainEvent, Handle, HandleCreate, Repository,
+    store::inmemory,
 };
 
 // =============================================================================
@@ -46,11 +47,20 @@ pub struct AdjustInventory {
 }
 
 #[derive(Default, Serialize, Deserialize, Aggregate)]
-#[aggregate(id = String, error = String, events(ProductRestocked, InventoryAdjusted))]
+#[aggregate(id = String, error = String, events(ProductRestocked, InventoryAdjusted), create(ProductRestocked))]
 pub struct Product {
     // No SKU field! The ID is external metadata
     quantity: i64,
     unit_price_cents: i64,
+}
+
+impl Create<ProductRestocked> for Product {
+    fn create(event: &ProductRestocked) -> Self {
+        Self {
+            quantity: event.quantity,
+            unit_price_cents: event.unit_price_cents,
+        }
+    }
 }
 
 // Pure domain events - no infrastructure data
@@ -89,6 +99,8 @@ impl Apply<InventoryAdjusted> for Product {
 
 // Handle<C> implementations for each command
 impl Handle<Restock> for Product {
+    type HandleError = Self::Error;
+
     fn handle(&self, command: &Restock) -> Result<Vec<Self::Event>, Self::Error> {
         if command.quantity <= 0 {
             return Err("quantity must be positive".to_string());
@@ -103,7 +115,26 @@ impl Handle<Restock> for Product {
     }
 }
 
+impl HandleCreate<Restock> for Product {
+    type HandleCreateError = Self::Error;
+
+    fn handle_create(command: &Restock) -> Result<Vec<Self::Event>, Self::HandleCreateError> {
+        if command.quantity <= 0 {
+            return Err("quantity must be positive".to_string());
+        }
+        Ok(vec![
+            ProductRestocked {
+                quantity: command.quantity,
+                unit_price_cents: command.unit_price_cents,
+            }
+            .into(),
+        ])
+    }
+}
+
 impl Handle<AdjustInventory> for Product {
+    type HandleError = Self::Error;
+
     fn handle(&self, command: &AdjustInventory) -> Result<Vec<Self::Event>, Self::Error> {
         let new_quantity = self.quantity + command.quantity_delta;
         if new_quantity < 0 {
@@ -181,9 +212,17 @@ pub struct RefundSale {
 }
 
 #[derive(Default, Serialize, Deserialize, Aggregate)]
-#[aggregate(id = String, error = String, events(SaleCompleted, SaleRefunded))]
+#[aggregate(id = String, error = String, events(SaleCompleted, SaleRefunded), create(SaleCompleted))]
 pub struct Sale {
     total_cents: i64,
+}
+
+impl Create<SaleCompleted> for Sale {
+    fn create(event: &SaleCompleted) -> Self {
+        Self {
+            total_cents: event.quantity * event.sale_price_cents,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -218,6 +257,8 @@ impl Apply<SaleRefunded> for Sale {
 }
 
 impl Handle<CompleteSale> for Sale {
+    type HandleError = Self::Error;
+
     fn handle(&self, command: &CompleteSale) -> Result<Vec<Self::Event>, Self::Error> {
         if command.quantity <= 0 {
             return Err("sale quantity must be positive".to_string());
@@ -232,7 +273,26 @@ impl Handle<CompleteSale> for Sale {
     }
 }
 
+impl HandleCreate<CompleteSale> for Sale {
+    type HandleCreateError = Self::Error;
+
+    fn handle_create(command: &CompleteSale) -> Result<Vec<Self::Event>, Self::HandleCreateError> {
+        if command.quantity <= 0 {
+            return Err("sale quantity must be positive".to_string());
+        }
+        Ok(vec![
+            SaleCompleted {
+                quantity: command.quantity,
+                sale_price_cents: command.sale_price_cents,
+            }
+            .into(),
+        ])
+    }
+}
+
 impl Handle<RefundSale> for Sale {
+    type HandleError = Self::Error;
+
     fn handle(&self, command: &RefundSale) -> Result<Vec<Self::Event>, Self::Error> {
         if command.amount_cents <= 0 {
             return Err("refund amount must be positive".to_string());
@@ -367,7 +427,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Restock products
     println!("1. Restocking products...");
     repository
-        .execute_command::<Product, Restock>(
+        .create::<Product, Restock>(
             &"WIDGET-001".to_string(),
             &Restock {
                 quantity: 100,
@@ -378,7 +438,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     repository
-        .execute_command::<Product, Restock>(
+        .create::<Product, Restock>(
             &"GADGET-002".to_string(),
             &Restock {
                 quantity: 50,
@@ -403,7 +463,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Convert to String for storage (via Display impl)
     repository
-        .execute_command::<Sale, CompleteSale>(
+        .create::<Sale, CompleteSale>(
             &sale1_id.to_string(),
             &CompleteSale {
                 quantity: 10,
@@ -414,7 +474,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     repository
-        .execute_command::<Sale, CompleteSale>(
+        .create::<Sale, CompleteSale>(
             &sale2_id.to_string(),
             &CompleteSale {
                 quantity: 5,
@@ -427,7 +487,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Adjust inventory
     println!("3. Adjusting inventory for damaged goods...");
     repository
-        .execute_command::<Product, AdjustInventory>(
+        .update::<Product, AdjustInventory>(
             &"WIDGET-001".to_string(),
             &AdjustInventory {
                 quantity_delta: -3,
@@ -440,7 +500,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Process refund
     println!("4. Processing refund...");
     repository
-        .execute_command::<Sale, RefundSale>(
+        .update::<Sale, RefundSale>(
             &sale1_id.to_string(),
             &RefundSale { amount_cents: 5000 },
             &(),
@@ -450,7 +510,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Additional restocking
     println!("5. Additional restocking...");
     repository
-        .execute_command::<Product, Restock>(
+        .update::<Product, Restock>(
             &"WIDGET-001".to_string(),
             &Restock {
                 quantity: 25,

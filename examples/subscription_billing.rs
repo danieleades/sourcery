@@ -13,8 +13,8 @@
 //!
 //! Key patterns demonstrated:
 //!
-//! - **`subscribe()` / `on_update()`** – the projection updates in real time as
-//!   commands are executed, with zero per-query replay cost.
+//! - **`subscribe()` / `StreamExt::next()`** – the projection updates in real
+//!   time as commands are executed, with zero per-query replay cost.
 //! - **Catch-up on start** – `start()` returns only after historical events are
 //!   replayed, so the projection is current before commands execute.
 //! - **Guard conditions from live state** – the command side reads the
@@ -31,8 +31,10 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use sourcery::{
-    Aggregate, Apply, ApplyProjection, DomainEvent, Handle, Projection, Repository, store::inmemory,
+    Aggregate, Apply, ApplyProjection, Create, DomainEvent, Handle, HandleCreate, Projection,
+    Repository, store::inmemory,
 };
+use tokio_stream::StreamExt as _;
 
 // =============================================================================
 // Shared domain types
@@ -54,6 +56,7 @@ pub struct EventMetadata {
     id = String,
     error = String,
     events(SubscriptionStarted, SubscriptionCancelled),
+    create(SubscriptionStarted),
     kind = "subscription"
 )]
 pub struct Subscription {
@@ -102,6 +105,14 @@ impl Apply<SubscriptionCancelled> for Subscription {
     }
 }
 
+impl Create<SubscriptionStarted> for Subscription {
+    fn create(event: &SubscriptionStarted) -> Self {
+        let mut this = Self::default();
+        <Self as Apply<SubscriptionStarted>>::apply(&mut this, event);
+        this
+    }
+}
+
 // Command structs for Subscription aggregate
 #[derive(Debug)]
 pub struct StartSubscription {
@@ -117,6 +128,8 @@ pub struct CancelSubscription {
 
 // Handle<C> implementations for each command
 impl Handle<StartSubscription> for Subscription {
+    type HandleError = Self::Error;
+
     fn handle(&self, command: &StartSubscription) -> Result<Vec<Self::Event>, Self::Error> {
         if self.status == SubscriptionStatus::Active {
             return Err("subscription already active".into());
@@ -134,7 +147,25 @@ impl Handle<StartSubscription> for Subscription {
     }
 }
 
+impl HandleCreate<StartSubscription> for Subscription {
+    type HandleCreateError = Self::Error;
+
+    fn handle_create(
+        command: &StartSubscription,
+    ) -> Result<Vec<Self::Event>, Self::HandleCreateError> {
+        Ok(vec![
+            SubscriptionStarted {
+                plan_name: command.plan_name.clone(),
+                activated_at: command.activated_at.clone(),
+            }
+            .into(),
+        ])
+    }
+}
+
 impl Handle<CancelSubscription> for Subscription {
+    type HandleError = Self::Error;
+
     fn handle(&self, command: &CancelSubscription) -> Result<Vec<Self::Event>, Self::Error> {
         if self.status != SubscriptionStatus::Active {
             return Err("only active subscriptions can be cancelled".into());
@@ -179,6 +210,7 @@ impl fmt::Display for InvoiceId {
     id = String,
     error = String,
     events(InvoiceIssued, PaymentRecorded, InvoiceSettled),
+    create(InvoiceIssued),
     kind = "invoice"
 )]
 pub struct Invoice {
@@ -229,6 +261,14 @@ impl Apply<InvoiceIssued> for Invoice {
     }
 }
 
+impl Create<InvoiceIssued> for Invoice {
+    fn create(event: &InvoiceIssued) -> Self {
+        let mut this = Self::default();
+        <Self as Apply<InvoiceIssued>>::apply(&mut this, event);
+        this
+    }
+}
+
 impl Apply<PaymentRecorded> for Invoice {
     fn apply(&mut self, event: &PaymentRecorded) {
         self.paid_cents += event.amount_cents;
@@ -256,6 +296,8 @@ pub struct RecordPayment {
 
 // Handle<C> implementations for each command
 impl Handle<IssueInvoice> for Invoice {
+    type HandleError = Self::Error;
+
     fn handle(&self, command: &IssueInvoice) -> Result<Vec<Self::Event>, Self::Error> {
         if self.issued {
             return Err("invoice already issued".into());
@@ -274,7 +316,27 @@ impl Handle<IssueInvoice> for Invoice {
     }
 }
 
+impl HandleCreate<IssueInvoice> for Invoice {
+    type HandleCreateError = Self::Error;
+
+    fn handle_create(command: &IssueInvoice) -> Result<Vec<Self::Event>, Self::HandleCreateError> {
+        if command.amount_cents <= 0 {
+            return Err("invoice amount must be positive".to_string());
+        }
+        Ok(vec![
+            InvoiceIssued {
+                customer_id: command.customer_id.clone(),
+                amount_cents: command.amount_cents,
+                due_date: command.due_date.clone(),
+            }
+            .into(),
+        ])
+    }
+}
+
 impl Handle<RecordPayment> for Invoice {
+    type HandleError = Self::Error;
+
     fn handle(&self, command: &RecordPayment) -> Result<Vec<Self::Event>, Self::Error> {
         if !self.issued {
             return Err("invoice not issued yet".into());
@@ -460,23 +522,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The subscription replays any historical events first (catch-up phase),
     // then transitions to processing live events as they are committed.
     // `start()` returns only after catch-up completes.
-    // `on_update` fires after every event is applied.
+    // Each `stream.next()` yields the projection after one applied event.
     // -------------------------------------------------------------------------
 
     // Shared state: the subscription writes, the command side reads.
     let live_projection = Arc::new(Mutex::new(CustomerBillingProjection::default()));
-    let projection_for_callback = live_projection.clone();
-
-    let subscription = repository
+    let mut subscription = repository
         .subscribe::<CustomerBillingProjection>(())
-        .on_update(move |projection| {
-            // Capture the latest state so the command side can read it.
-            *projection_for_callback.lock().expect("lock poisoned") = projection.clone();
-
-            // In production this would push to WebSocket clients, update a
-            // cache, or send to a channel. Here we just print a summary.
-            print_dashboard(projection, "  [live]");
-        })
         .start()
         .await?;
 
@@ -491,7 +543,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 1. Activate the subscription
     repository
-        .execute_command::<Subscription, StartSubscription>(
+        .create::<Subscription, StartSubscription>(
             &customer_id,
             &StartSubscription {
                 plan_name: "Pro Annual".into(),
@@ -503,6 +555,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
         )
         .await?;
+    consume_updates(&mut subscription, &live_projection, 1).await?;
 
     // 2. Issue an invoice
     let invoice_id = InvoiceId::new(customer_id.clone(), "2024-INV-1001");
@@ -510,7 +563,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let invoice_corr = format!("invoice/{}", invoice_id.invoice_number);
 
     repository
-        .execute_command::<Invoice, IssueInvoice>(
+        .create::<Invoice, IssueInvoice>(
             &invoice_stream_id,
             &IssueInvoice {
                 customer_id: customer_id.clone(),
@@ -523,10 +576,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
         )
         .await?;
+    consume_updates(&mut subscription, &live_projection, 1).await?;
 
     // 3. Record a partial payment
     repository
-        .execute_command::<Invoice, RecordPayment>(
+        .update::<Invoice, RecordPayment>(
             &invoice_stream_id,
             &RecordPayment {
                 amount_cents: 5_000,
@@ -537,10 +591,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
         )
         .await?;
+    consume_updates(&mut subscription, &live_projection, 1).await?;
 
     // 4. Record remaining balance (triggers InvoiceSettled)
     repository
-        .execute_command::<Invoice, RecordPayment>(
+        .update::<Invoice, RecordPayment>(
             &invoice_stream_id,
             &RecordPayment {
                 amount_cents: 7_000,
@@ -551,9 +606,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
         )
         .await?;
-
-    // Brief pause to let the subscription task process all pending events.
-    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    // The final payment appends `PaymentRecorded` and `InvoiceSettled`.
+    consume_updates(&mut subscription, &live_projection, 2).await?;
 
     // -------------------------------------------------------------------------
     // Guard: read the live projection before allowing cancellation.
@@ -572,7 +626,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if can_cancel {
         println!("\nBalance is zero – proceeding with cancellation.");
         repository
-            .execute_command::<Subscription, CancelSubscription>(
+            .update::<Subscription, CancelSubscription>(
                 &customer_id,
                 &CancelSubscription {
                     reason: "customer requested cancellation".into(),
@@ -584,13 +638,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
             )
             .await?;
+        consume_updates(&mut subscription, &live_projection, 1).await?;
     } else {
         println!("\nSubscription not cancelled – outstanding balance detected.");
     }
-
-    // Allow the final event to propagate.
-    // Brief pause to let the subscription task process the event.
-    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
     // -------------------------------------------------------------------------
     // Print the final state from the live projection, then shut down.
@@ -605,6 +656,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Graceful shutdown: stop the subscription and wait for its task to finish.
     subscription.stop().await?;
     println!("Subscription stopped.");
+
+    Ok(())
+}
+
+async fn consume_updates(
+    subscription: &mut sourcery::subscription::Subscription<
+        CustomerBillingProjection,
+        sourcery::store::inmemory::InMemoryError,
+    >,
+    live_projection: &Arc<Mutex<CustomerBillingProjection>>,
+    expected: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for _ in 0..expected {
+        let projection = subscription.next().await.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "subscription stream ended unexpectedly",
+            )
+        })?;
+
+        *live_projection.lock().expect("lock poisoned") = projection.clone();
+        print_dashboard(&projection, "  [live]");
+    }
 
     Ok(())
 }

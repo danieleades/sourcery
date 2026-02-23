@@ -43,14 +43,19 @@ A single aggregate might feed multiple projections (account summary, transaction
 
 The crate models CQRS through:
 
-- **`Aggregate`** + **`Handle<C>`** — the write side
+- **`Aggregate`** + **`HandleCreate<C>` / `Handle<C>`** — the write side
 - **`Projection`** + **`ApplyProjection<E>`** — the read side
 - **`Repository`** — orchestrates both
 
 ```rust,ignore
-// Write: execute a command
+// Write: create stream
 repository
-    .execute_command::<Account, Deposit>(&id, &command, &metadata)
+    .create::<Account, OpenAccount>(&id, &open, &metadata)
+    .await?;
+
+// Write: execute command on existing stream
+repository
+    .update::<Account, Deposit>(&id, &command, &metadata)
     .await?;
 
 // Read: load a projection

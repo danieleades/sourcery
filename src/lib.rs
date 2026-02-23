@@ -4,21 +4,24 @@
 pub use sourcery_core::test;
 pub use sourcery_core::{
     aggregate,
-    aggregate::{Aggregate, Apply, Handle},
+    aggregate::{Aggregate, Apply, Create, Handle, HandleCreate},
     event,
-    event::{DomainEvent, EventDecodeError, EventKind, ProjectionEvent},
+    event::{DomainEvent, EventDecodeError, ProjectionEvent},
     projection,
-    projection::{ApplyProjection, Filters, Projection, ProjectionFilters},
+    projection::{ApplyProjection, Filters, Projection},
     repository,
     repository::{
         OptimisticRepository, OptimisticSnapshotRepository, Repository, UncheckedRepository,
     },
     subscription,
-    subscription::{SubscribableStore, SubscriptionBuilder, SubscriptionError, SubscriptionHandle},
+    subscription::{
+        SubscribableStore, Subscription, SubscriptionBuilder, SubscriptionError, SubscriptionHandle,
+    },
 };
 // Re-export proc macro derives so consumers only depend on `sourcery`.
 pub use sourcery_macros::{Aggregate, Projection};
 
+/// Event-store interfaces and built-in store implementations.
 pub mod store {
 
     // Re-export low-level commit types for EventStore implementors only.
@@ -38,6 +41,7 @@ pub mod store {
     pub use sourcery_core::store::inmemory;
 }
 
+/// Snapshot interfaces and built-in snapshot store implementations.
 pub mod snapshot {
 
     pub use sourcery_core::snapshot::{

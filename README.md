@@ -12,7 +12,8 @@ Building blocks for pragmatic event-sourced systems in Rust.
 - **Aggregate derive** – `#[derive(Aggregate)]` generates the event enum plus
   serialisation/deserialisation glue so command handlers stay focused on behaviour.
 - **Repository orchestration** – `Repository` loads aggregates, executes commands via
-  `Handle<C>`, and persists the resulting events in a single transaction.
+  `Handle<C>` / `HandleCreate<C>`, and persists the resulting events in a single
+  transaction.
 - **Metadata-aware projections** – projections receive aggregate IDs, events, and metadata
   via `ApplyProjection`, enabling cross-aggregate correlation using causation, timestamps,
   or custom metadata.
@@ -45,7 +46,9 @@ impl Apply<FundsDeposited> for Account {
 pub struct DepositFunds { pub amount_cents: i64 }
 
 impl Handle<DepositFunds> for Account {
-    fn handle(&self, cmd: &DepositFunds) -> Result<Vec<Self::Event>, Self::Error> {
+    type HandleError = Self::Error;
+
+    fn handle(&self, cmd: &DepositFunds) -> Result<Vec<Self::Event>, Self::HandleError> {
         Ok(vec![FundsDeposited { amount_cents: cmd.amount_cents }.into()])
     }
 }
@@ -55,7 +58,7 @@ impl Handle<DepositFunds> for Account {
 
 | Concept | Description |
 |---------|-------------|
-| **[Aggregates](https://danieleades.github.io/sourcery/core-traits/aggregate.html)** | Rebuild state from events and validate commands via `Apply<E>` and `Handle<C>`. |
+| **[Aggregates](https://danieleades.github.io/sourcery/core-traits/aggregate.html)** | Rebuild state from events and validate commands via `Apply<E>`, `Handle<C>`, and `HandleCreate<C>`. |
 | **[Projections](https://danieleades.github.io/sourcery/core-traits/projections.html)** | Read models that replay events via `ApplyProjection<E>`, potentially across multiple aggregates. |
 | **[Repository](https://danieleades.github.io/sourcery/concepts/architecture.html)** | Orchestrates loading, command execution, and persistence in a single transaction. |
 | **[EventStore](https://danieleades.github.io/sourcery/core-traits/stores.html)** | Trait defining the persistence boundary—implement for Postgres, `DynamoDB`, S3, etc. |

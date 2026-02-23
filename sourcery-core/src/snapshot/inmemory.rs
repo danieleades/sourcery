@@ -86,14 +86,21 @@ pub enum Error {
 }
 
 impl Error {
+    /// Wrap an underlying serialisation failure.
     fn serialization(err: impl std::error::Error + Send + Sync + 'static) -> Self {
         Self::Serialization(Box::new(err))
     }
 
+    /// Wrap an underlying deserialisation failure.
     fn deserialization(err: impl std::error::Error + Send + Sync + 'static) -> Self {
         Self::Deserialization(Box::new(err))
     }
 }
+
+/// Inner map type: one snapshot per (`kind`, `id`) pair.
+type SnapshotMap<Id, Pos> = HashMap<SnapshotKey<Id>, Snapshot<Pos, serde_json::Value>>;
+/// Thread-safe shared handle to the snapshot map.
+type SharedSnapshots<Id, Pos> = Arc<RwLock<SnapshotMap<Id, Pos>>>;
 
 /// In-memory snapshot store with configurable policy.
 ///
@@ -113,9 +120,6 @@ impl Error {
 /// let repo = Repository::new(store::inmemory::Store::new())
 ///     .with_snapshots(snapshot::inmemory::Store::every(100));
 /// ```
-type SnapshotMap<Id, Pos> = HashMap<SnapshotKey<Id>, Snapshot<Pos, serde_json::Value>>;
-type SharedSnapshots<Id, Pos> = Arc<RwLock<SnapshotMap<Id, Pos>>>;
-
 #[derive(Clone, Debug)]
 pub struct Store<Id, Pos> {
     snapshots: SharedSnapshots<Id, Pos>,
@@ -253,6 +257,7 @@ where
     }
 }
 
+/// Hash-map key for snapshots partitioned by aggregate kind and ID.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 struct SnapshotKey<Id> {
     kind: String,
@@ -260,6 +265,7 @@ struct SnapshotKey<Id> {
 }
 
 impl<Id> SnapshotKey<Id> {
+    /// Build a snapshot key from aggregate identity.
     fn new(kind: &str, id: Id) -> Self {
         Self {
             kind: kind.to_string(),

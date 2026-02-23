@@ -52,7 +52,7 @@ Store: EventStore
 Agg: Aggregate
 Snap: SnapshotStore
 
-App -> Repo: "execute_command(id, cmd, meta)"
+App -> Repo: "create/update(id, cmd, meta)"
 Repo -> Snap: "load(id)?"
 Snap -> Repo: "Optional snapshot" {style.stroke-dash: 3}
 Repo -> Store: "load_events(filters)"
@@ -85,7 +85,9 @@ Repo -> Proj: "apply_projection(id, event, meta) [For each event]"
 Repo -> App: "Projection" {style.stroke-dash: 3}
 ```
 
-Projections define their event filters centrally in the `ProjectionFilters` trait. The repository calls `filters()` to determine which events to load, then replays them into the projection.
+Projections define their event filters centrally in the `Projection` trait.
+The repository calls `filters()` to determine which events to load, then
+replays them into the projection.
 
 ## Key Types
 
@@ -95,8 +97,7 @@ Projections define their event filters centrally in the `ProjectionFilters` trai
 | `EventStore` | Trait for event persistence |
 | `SnapshotStore` | Trait for aggregate/projection snapshots |
 | `Aggregate` | Trait for command-side entities |
-| `ProjectionFilters` | Base trait for event subscribers (projections) |
-| `Projection` | Stable `KIND` identifier for projection snapshot storage |
+| `Projection` | Base trait for projections (`KIND`, identity types, `init`, `filters`) |
 | `ApplyProjection<E>` | Per-event handler for projections |
 | `Filters` | Builder for event filter specs + handler closures |
 | `DomainEvent` | Marker trait for event structs |

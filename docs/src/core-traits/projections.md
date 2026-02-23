@@ -32,7 +32,7 @@ impl ApplyProjection<FundsWithdrawn> for AccountSummary {
 }
 ```
 
-`#[projection(events(...))]` auto-generates `ProjectionFilters` for the common case.
+`#[projection(events(...))]` auto-generates `Projection::filters()` for the common case.
 
 ## Loading Projections
 
@@ -48,7 +48,7 @@ let report = repository
     .await?;
 ```
 
-## When to Implement `ProjectionFilters` Manually
+## When to Implement `Projection` Manually
 
 Use manual filters when you need:
 
@@ -60,7 +60,7 @@ Use manual filters when you need:
 ### Example: Scoped Instance Filter
 
 ```rust,ignore
-impl ProjectionFilters for AccountComparison {
+impl Projection for AccountComparison {
     type Id = String;
     type InstanceId = (String, String);
     type Metadata = ();
@@ -142,14 +142,12 @@ For full signatures, see the API docs:
 
 - `Projection`
 - `ApplyProjection<E>`
-- `ProjectionFilters`
 
 You can also inspect the trait definitions directly:
 
 ```rust,ignore
 {{#include ../../../sourcery-core/src/projection.rs:projection_trait}}
 {{#include ../../../sourcery-core/src/projection.rs:apply_projection_trait}}
-{{#include ../../../sourcery-core/src/projection.rs:projection_filters_trait}}
 ```
 
 ## Snapshotting Projections

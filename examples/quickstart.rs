@@ -6,9 +6,20 @@
 
 // ANCHOR: full_example
 use serde::{Deserialize, Serialize};
-use sourcery::{Apply, ApplyProjection, DomainEvent, Handle, Repository, store::inmemory};
+use sourcery::{
+    Apply, ApplyProjection, Create, DomainEvent, Handle, HandleCreate, Repository, store::inmemory,
+};
 
 // ANCHOR: events
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountOpened {
+    pub initial_balance: i64,
+}
+
+impl DomainEvent for AccountOpened {
+    const KIND: &'static str = "account.opened";
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FundsDeposited {
     pub amount: i64,
@@ -21,6 +32,11 @@ impl DomainEvent for FundsDeposited {
 
 // ANCHOR: commands
 #[derive(Debug)]
+pub struct OpenAccount {
+    pub initial_balance: i64,
+}
+
+#[derive(Debug)]
 pub struct Deposit {
     pub amount: i64,
 }
@@ -31,11 +47,26 @@ pub struct Deposit {
 #[aggregate(
     id = String,
     error = String,
-    events(FundsDeposited),
+    events(AccountOpened, FundsDeposited),
+    create(AccountOpened),
     derives(Debug, PartialEq, Eq)
 )]
 pub struct Account {
     balance: i64,
+}
+
+impl Create<AccountOpened> for Account {
+    fn create(event: &AccountOpened) -> Self {
+        Self {
+            balance: event.initial_balance,
+        }
+    }
+}
+
+impl Apply<AccountOpened> for Account {
+    fn apply(&mut self, event: &AccountOpened) {
+        self.balance = event.initial_balance;
+    }
 }
 
 impl Apply<FundsDeposited> for Account {
@@ -44,10 +75,63 @@ impl Apply<FundsDeposited> for Account {
     }
 }
 
+impl Handle<OpenAccount> for Account {
+    type HandleError = Self::Error;
+
+    fn handle(&self, cmd: &OpenAccount) -> Result<Vec<Self::Event>, Self::Error> {
+        Ok(vec![
+            AccountOpened {
+                initial_balance: cmd.initial_balance,
+            }
+            .into(),
+        ])
+    }
+}
+
+impl HandleCreate<OpenAccount> for Account {
+    type HandleCreateError = Self::Error;
+
+    fn handle_create(cmd: &OpenAccount) -> Result<Vec<Self::Event>, Self::HandleCreateError> {
+        Ok(vec![
+            AccountOpened {
+                initial_balance: cmd.initial_balance,
+            }
+            .into(),
+        ])
+    }
+}
+
+/// Error returned when a deposit amount is not positive.
+///
+/// Returning a narrow, concrete error type (rather than `Self::Error`) lets
+/// callers handle only the cases that can actually occur. Here, the `Deposit`
+/// handler can only fail in one specific way, so that is expressed directly in
+/// the return type.
+#[derive(Debug)]
+pub struct NonPositiveDeposit {
+    pub amount: i64,
+}
+
+impl std::fmt::Display for NonPositiveDeposit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "deposit amount must be positive, got {}", self.amount)
+    }
+}
+
+impl std::error::Error for NonPositiveDeposit {}
+
+impl From<NonPositiveDeposit> for String {
+    fn from(e: NonPositiveDeposit) -> Self {
+        e.to_string()
+    }
+}
+
 impl Handle<Deposit> for Account {
-    fn handle(&self, cmd: &Deposit) -> Result<Vec<Self::Event>, Self::Error> {
+    type HandleError = NonPositiveDeposit;
+
+    fn handle(&self, cmd: &Deposit) -> Result<Vec<Self::Event>, NonPositiveDeposit> {
         if cmd.amount <= 0 {
-            return Err("amount must be positive".into());
+            return Err(NonPositiveDeposit { amount: cmd.amount });
         }
         Ok(vec![FundsDeposited { amount: cmd.amount }.into()])
     }
@@ -75,9 +159,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = inmemory::Store::new();
     let repository = Repository::new(store);
 
-    // Execute a command
+    // Open a new account — this is the creation event, handled by
+    // Create<AccountOpened>
     repository
-        .execute_command::<Account, Deposit>(&"ACC-001".to_string(), &Deposit { amount: 100 }, &())
+        .create::<Account, OpenAccount>(
+            &"ACC-001".to_string(),
+            &OpenAccount { initial_balance: 0 },
+            &(),
+        )
+        .await?;
+
+    // Execute a deposit command
+    repository
+        .update::<Account, Deposit>(&"ACC-001".to_string(), &Deposit { amount: 100 }, &())
         .await?;
 
     // Load a projection

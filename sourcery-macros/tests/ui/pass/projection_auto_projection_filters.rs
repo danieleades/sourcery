@@ -4,7 +4,7 @@ extern crate self as sourcery;
 mod support;
 
 pub use support::{
-    ApplyProjection, DomainEvent, Filters, Projection, ProjectionFilters, codec, store,
+    ApplyProjection, DomainEvent, Filters, Projection, codec, store,
 };
 
 use sourcery_macros::Projection;

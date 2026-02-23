@@ -5,8 +5,9 @@ Commands request a state change. They can be rejected.
 ## Basic Usage
 
 1. Define a command struct
-2. Implement `Handle<C>` on your aggregate
-3. Return events or a domain error
+2. Implement `HandleCreate<C>` for create commands (new streams)
+3. Implement `Handle<C>` for existing aggregate commands
+4. Return events or a domain error
 
 ```rust,ignore
 #[derive(Debug)]
@@ -15,7 +16,9 @@ pub struct Deposit {
 }
 
 impl Handle<Deposit> for Account {
-    fn handle(&self, cmd: &Deposit) -> Result<Vec<Self::Event>, Self::Error> {
+    type HandleError = Self::Error;
+
+    fn handle(&self, cmd: &Deposit) -> Result<Vec<Self::Event>, Self::HandleError> {
         if cmd.amount <= 0 {
             return Err(AccountError::InvalidAmount);
         }
@@ -27,8 +30,14 @@ impl Handle<Deposit> for Account {
 ## Executing Commands
 
 ```rust,ignore
+// First command for a new stream
 repository
-    .execute_command::<Account, Deposit>(&account_id, &Deposit { amount: 100 }, &metadata)
+    .create::<Account, OpenAccount>(&account_id, &OpenAccount { initial_balance: 0 }, &metadata)
+    .await?;
+
+// Subsequent commands for an existing stream
+repository
+    .update::<Account, Deposit>(&account_id, &Deposit { amount: 100 }, &metadata)
     .await?;
 ```
 
@@ -55,8 +64,18 @@ if cmd.amount == 0 {
 Key points:
 
 - Takes `&self` (validate against current state)
+- Uses `HandleError` for command-specific errors, converted into `Aggregate::Error`
 - Returns `Vec<Event>` (0..n events)
 - Returns `Result` (commands can fail)
+
+### The `HandleCreate<C>` Trait
+
+```rust,ignore
+pub trait HandleCreate<C>: Aggregate {
+    type HandleCreateError: Into<<Self as Aggregate>::Error>;
+    fn handle_create(command: &C) -> Result<Vec<Self::Event>, Self::HandleCreateError>;
+}
+```
 
 ## Command Naming
 

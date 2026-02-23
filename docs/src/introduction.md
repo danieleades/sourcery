@@ -37,7 +37,9 @@ pub struct Account {
 }
 
 impl Handle<Deposit> for Account {
-    fn handle(&self, cmd: &Deposit) -> Result<Vec<Self::Event>, Self::Error> {
+    type HandleError = Self::Error;
+
+    fn handle(&self, cmd: &Deposit) -> Result<Vec<Self::Event>, Self::HandleError> {
         Ok(vec![FundsDeposited { amount: cmd.amount }.into()])
     }
 }

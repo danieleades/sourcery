@@ -17,7 +17,8 @@ pub struct Account {
 Then add:
 
 - `Apply<E>` impls for each event
-- `Handle<C>` impls for each command
+- `HandleCreate<C>` impls for create commands
+- `Handle<C>` impls for commands on existing streams
 
 ## Attribute Reference
 

@@ -13,13 +13,12 @@ use syn::{DeriveInput, Ident, Path, parse_macro_input, parse_quote};
 #[allow(clippy::doc_markdown, reason = "false positive")]
 /// Build a PascalCase enum variant name from a type path.
 fn path_to_pascal_ident(path: &Path) -> Ident {
-    let mut combined = String::new();
-    for (index, segment) in path.segments.iter().enumerate() {
-        if index > 0 {
-            combined.push('_');
-        }
-        combined.push_str(&segment.ident.to_string());
-    }
+    let combined = path
+        .segments
+        .iter()
+        .map(|s| s.ident.to_string())
+        .collect::<Vec<_>>()
+        .join("_");
     let pascal = combined.to_upper_camel_case();
     let span = path
         .segments
@@ -81,6 +80,13 @@ struct AggregateArgs {
     event_enum: Option<String>,
     #[darling(default)]
     derives: Option<PathList>,
+    /// Event types that act as creation events for this aggregate.
+    ///
+    /// When specified, `fn create` dispatches to `Create<E>::create` for each
+    /// listed event type and panics for all others. When absent, falls back to
+    /// `Default::default()` + `apply` (requires `Self: Default`).
+    #[darling(default)]
+    create: PathList,
 }
 
 /// Configuration for the `#[projection(...)]` attribute.
@@ -139,7 +145,7 @@ where
 ///
 /// **Note:** Commands are handled via individual `Handle<C>` trait
 /// implementations. No command enum is generated - use
-/// `execute_command::<Aggregate, Command>()` directly.
+/// `update::<Aggregate, Command>()` directly.
 ///
 /// # Attributes
 ///
@@ -184,6 +190,7 @@ fn derive_aggregate_impl(input: &DeriveInput) -> TokenStream2 {
 }
 
 /// Generate the aggregate derive implementation tokens.
+#[allow(clippy::too_many_lines)]
 fn generate_aggregate_impl(args: AggregateArgs, input: &DeriveInput) -> TokenStream2 {
     let event_specs: Vec<EventSpec<'_>> = args.events.iter().map(EventSpec::new).collect();
 
@@ -210,11 +217,39 @@ fn generate_aggregate_impl(args: AggregateArgs, input: &DeriveInput) -> TokenStr
     let variant_names: Vec<&Ident> = event_specs.iter().map(|spec| &spec.variant).collect();
 
     // Build derives list - always include Clone, add user-specified traits
-    let derives = if let Some(user_derives) = &args.derives {
-        let user_paths: Vec<&Path> = user_derives.iter().collect();
-        quote! { #[derive(Clone, #(#user_paths),*)] }
+    let user_derives = args.derives.unwrap_or_default();
+    let derives = quote! { #[derive(Clone, #(#user_derives),*)] };
+
+    // Generate fn create — dispatching to Create<E> impls for each listed
+    // creation event type, or falling back to Default + apply when none are
+    // specified.
+    let create_specs: Vec<EventSpec<'_>> = args.create.iter().map(EventSpec::new).collect();
+    let create_fn = if create_specs.is_empty() {
+        quote! {
+            fn create(event: &Self::Event) -> Self {
+                let mut this = <Self as ::core::default::Default>::default();
+                <Self as ::sourcery::Aggregate>::apply(&mut this, event);
+                this
+            }
+        }
     } else {
-        quote! { #[derive(Clone)] }
+        let create_event_types = create_specs.iter().map(|s| s.path);
+        let create_variant_names = create_specs.iter().map(|s| &s.variant);
+        quote! {
+            fn create(event: &Self::Event) -> Self {
+                match event {
+                    #(#event_enum_name::#create_variant_names(e) => {
+                        <Self as ::sourcery::Create<#create_event_types>>::create(e)
+                    }),*,
+                    _ => panic!(
+                        "event `{}` is not a creation event for aggregate `{}`; \
+                         check the `create(...)` attribute or inspect for stream corruption",
+                        ::sourcery::event::EventKind::kind(event),
+                        Self::KIND,
+                    ),
+                }
+            }
+        }
     };
 
     let expanded = quote! {
@@ -279,6 +314,8 @@ fn generate_aggregate_impl(args: AggregateArgs, input: &DeriveInput) -> TokenStr
             type Error = #error_type;
             type Id = #id_type;
 
+            #create_fn
+
             fn apply(&mut self, event: &Self::Event) {
                 match event {
                     #(#event_enum_name::#variant_names(e) => ::sourcery::Apply::apply(self, e)),*
@@ -292,32 +329,29 @@ fn generate_aggregate_impl(args: AggregateArgs, input: &DeriveInput) -> TokenStr
 
 /// Derives the `Projection` trait for a struct.
 ///
-/// This macro always generates:
-/// - `Projection` trait implementation with `KIND` constant
+/// Generates a complete `Projection` impl including `KIND`, associated types,
+/// `init()`, and `filters()`. Uses `Default` for `init()`, so the struct must
+/// implement `Default`.
 ///
-/// It can also generate [`ProjectionFilters`] for the common case via
-/// `events(...)` (or explicit `id` / `instance_id` / `metadata`
-/// attributes), using `Default` for initialisation and a simple
-/// `Filters::new().event::<E>()...` filter set.
+/// For projections that need custom `filters()` logic (e.g. scoped
+/// subscriptions, non-`()` `InstanceId` with custom init), implement
+/// `Projection` manually instead of using this derive.
 ///
 /// # Attributes
 ///
 /// ## Optional
 /// - `kind = "name"` - Projection type identifier (default: kebab-case struct
 ///   name)
-/// - `events(Event1, Event2, ...)` - Auto-generate `ProjectionFilters::filters`
-///   with global event subscriptions.
-/// - `id = Type` - Override `ProjectionFilters::Id` (default: `String` when
-///   auto-generating `ProjectionFilters`)
-/// - `instance_id = Type` - Override `ProjectionFilters::InstanceId` (default:
-///   `()` when auto-generating `ProjectionFilters`)
-/// - `metadata = Type` - Override `ProjectionFilters::Metadata` (default: `()`
-///   when auto-generating `ProjectionFilters`)
+/// - `events(Event1, Event2, ...)` - Subscribe to these event types globally.
+/// - `id = Type` - Override `Projection::Id` (default: `String`)
+/// - `instance_id = Type` - Override `Projection::InstanceId` (default: `()`)
+/// - `metadata = Type` - Override `Projection::Metadata` (default: `()`)
 ///
 /// # Example
 ///
 /// ```ignore
 /// #[derive(Default, Projection)]
+/// #[projection(events(FundsDeposited))]
 /// pub struct AccountLedger {
 ///     total: i64,
 /// }
@@ -340,21 +374,6 @@ fn generate_projection_impl(args: ProjectionArgs, input: &DeriveInput) -> TokenS
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
     let kind = default_kind(struct_name, args.kind);
 
-    let projection_impl = quote! {
-        impl #impl_generics ::sourcery::Projection for #struct_name #ty_generics #where_clause {
-            const KIND: &'static str = #kind;
-        }
-    };
-
-    let auto_projection_filters = !args.events.is_empty()
-        || args.id.is_some()
-        || args.instance_id.is_some()
-        || args.metadata.is_some();
-
-    if !auto_projection_filters {
-        return projection_impl;
-    }
-
     let id_ty = args.id.map_or_else(|| parse_quote!(String), |ty| ty.0);
     let instance_id_ty = args.instance_id.map_or_else(|| parse_quote!(()), |ty| ty.0);
     let metadata_ty = args.metadata.map_or_else(|| parse_quote!(()), |ty| ty.0);
@@ -366,7 +385,7 @@ fn generate_projection_impl(args: ProjectionArgs, input: &DeriveInput) -> TokenS
         quote! { ::sourcery::Filters::new() #(.event::<#subscribed_events>())* }
     };
 
-    let projection_filters_where = if let Some(where_clause) = where_clause {
+    let projection_where = if let Some(where_clause) = where_clause {
         let predicates = &where_clause.predicates;
         quote! {
             where
@@ -381,11 +400,10 @@ fn generate_projection_impl(args: ProjectionArgs, input: &DeriveInput) -> TokenS
     };
 
     quote! {
-        #projection_impl
-
-        impl #impl_generics ::sourcery::ProjectionFilters for #struct_name #ty_generics
-        #projection_filters_where
+        impl #impl_generics ::sourcery::Projection for #struct_name #ty_generics
+        #projection_where
         {
+            const KIND: &'static str = #kind;
             type Id = #id_ty;
             type InstanceId = #instance_id_ty;
             type Metadata = #metadata_ty;
@@ -491,7 +509,8 @@ mod tests {
     }
 
     #[test]
-    /// Confirms default kind for projections (no attributes required).
+    /// Confirms default kind and associated types for projections with no
+    /// attributes.
     fn generate_projection_impl_uses_default_kind() {
         let input: DeriveInput = parse_quote! {
             pub struct AccountLedger;
@@ -502,6 +521,9 @@ mod tests {
 
         assert!(compact.contains("impl::sourcery::ProjectionforAccountLedger"));
         assert!(compact.contains("constKIND:&'staticstr=\"account-ledger\""));
+        assert!(compact.contains("typeId=String"));
+        assert!(compact.contains("typeInstanceId=()"));
+        assert!(compact.contains("typeMetadata=()"));
     }
 
     #[test]
@@ -519,8 +541,8 @@ mod tests {
     }
 
     #[test]
-    /// Confirms events(...) generates a [`ProjectionFilters`] impl with
-    /// defaults.
+    /// Confirms events(...) generates a complete `Projection` impl with
+    /// filters.
     fn generate_projection_impl_with_events_generates_projection_filters() {
         let input: DeriveInput = parse_quote! {
             #[projection(events(FundsDeposited, FundsWithdrawn))]
@@ -530,7 +552,7 @@ mod tests {
         let expanded = derive_projection_impl(&input);
         let compact = compact(&expanded);
 
-        assert!(compact.contains("impl::sourcery::ProjectionFiltersforAccountLedger"));
+        assert!(compact.contains("impl::sourcery::ProjectionforAccountLedger"));
         assert!(compact.contains("typeId=String"));
         assert!(compact.contains("typeInstanceId=()"));
         assert!(compact.contains("typeMetadata=()"));
@@ -539,7 +561,7 @@ mod tests {
     }
 
     #[test]
-    /// Confirms projection filter type overrides are honored.
+    /// Confirms projection type overrides are honored.
     fn generate_projection_impl_respects_projection_filter_type_overrides() {
         let input: DeriveInput = parse_quote! {
             #[projection(

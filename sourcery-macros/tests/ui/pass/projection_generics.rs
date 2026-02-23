@@ -3,16 +3,14 @@ extern crate self as sourcery;
 #[path = "../common.rs"]
 mod support;
 
-pub use support::{codec, store, Aggregate, Apply, Filters, Projection, ProjectionFilters};
+pub use support::{codec, store, Aggregate, Apply, Filters, Projection};
 
-use sourcery_macros::Projection;
-
-#[derive(Projection)]
 pub struct AccountLedger<'a, T: 'static> {
     marker: std::marker::PhantomData<&'a T>,
 }
 
-impl<'a, T: 'static> ProjectionFilters for AccountLedger<'a, T> {
+impl<'a, T: 'static> Projection for AccountLedger<'a, T> {
+    const KIND: &'static str = "account-ledger";
     type Id = String;
     type InstanceId = ();
     type Metadata = ();

@@ -50,6 +50,7 @@ pub trait DomainEvent {
 /// **You never need to implement this trait yourself** - it's automatically
 /// available on any type that implements `DomainEvent`.
 pub trait EventKind {
+    /// Return the event kind string for this instance.
     fn kind(&self) -> &'static str;
 }
 

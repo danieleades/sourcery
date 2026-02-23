@@ -1,8 +1,9 @@
 # The Projection Derive
 
-`#[derive(Projection)]` generates a stable projection `KIND`.
+`#[derive(Projection)]` generates a complete `Projection` implementation.
 
-For common cases, `#[projection(events(...))]` also generates `ProjectionFilters`.
+For common cases, `#[projection(events(...))]` also generates
+`Projection::filters()` automatically.
 
 ## Basic Usage
 
@@ -35,10 +36,10 @@ That is the recommended default path.
 | Attribute | Default | Description |
 |-----------|---------|-------------|
 | `kind = "name"` | kebab-case struct name | Projection identifier for snapshots |
-| `events(E1, E2, ...)` | none | Auto-generate `ProjectionFilters::filters()` |
-| `id = Type` | `String` | Auto-generated `ProjectionFilters::Id` |
-| `instance_id = Type` | `()` | Auto-generated `ProjectionFilters::InstanceId` |
-| `metadata = Type` | `()` | Auto-generated `ProjectionFilters::Metadata` |
+| `events(E1, E2, ...)` | none | Auto-generate `Projection::filters()` with `.event::<E>()` calls |
+| `id = Type` | `String` | Sets `Projection::Id` |
+| `instance_id = Type` | `()` | Sets `Projection::InstanceId` |
+| `metadata = Type` | `()` | Sets `Projection::Metadata` |
 
 ## What Is Generated
 
@@ -47,18 +48,31 @@ Always:
 ```rust,ignore
 impl Projection for MyProjection {
     const KIND: &'static str = "my-projection";
+    type Id = String;
+    type InstanceId = ();
+    type Metadata = ();
+
+    fn init(_instance_id: &Self::InstanceId) -> Self {
+        Self::default()
+    }
+
+    fn filters<S>(_instance_id: &Self::InstanceId) -> Filters<S, Self>
+    where
+        S: EventStore<Id = Self::Id, Metadata = Self::Metadata>,
+    {
+        Filters::new()
+    }
 }
 ```
 
-When `events(...)` (or filter type overrides) are present, also generates:
+When `events(...)` is present, the generated `filters(...)` body becomes:
 
-- `impl ProjectionFilters for MyProjection`
-- `init(...) -> Self::default()`
-- `filters(...) -> Filters::new().event::<...>()...`
+- `Filters::new().event::<Event1>()...`
+- one `.event::<...>()` call per listed event type
 
 ## When to Go Manual
 
-Manually implement `ProjectionFilters` when you need:
+Manually implement `Projection` when you need:
 
 - Dynamic filtering
 - `event_for` / `events_for`
@@ -66,14 +80,15 @@ Manually implement `ProjectionFilters` when you need:
 - Full control over filter construction
 
 ```rust,ignore
-use sourcery::{ApplyProjection, Filters, ProjectionFilters, store::EventStore};
+use sourcery::{ApplyProjection, Filters, Projection, store::EventStore};
 
-#[derive(Debug, Default, sourcery::Projection)]
+#[derive(Debug, Default)]
 pub struct AccountSummary {
     totals: HashMap<String, i64>,
 }
 
-impl ProjectionFilters for AccountSummary {
+impl Projection for AccountSummary {
+    const KIND: &'static str = "account-summary";
     type Id = String;
     type InstanceId = ();
     type Metadata = ();

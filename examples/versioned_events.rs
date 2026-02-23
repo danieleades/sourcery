@@ -21,7 +21,7 @@
 use serde::{Deserialize, Serialize};
 use serde_evolve::Versioned;
 use sourcery::{
-    Aggregate, Apply, DomainEvent, Handle, ProjectionEvent, Repository,
+    Aggregate, Apply, Create, DomainEvent, Handle, HandleCreate, ProjectionEvent, Repository,
     store::{EventFilter, EventStore, inmemory},
 };
 
@@ -238,7 +238,7 @@ impl DomainEvent for OrderCancelled {
 // =============================================================================
 
 #[derive(Default, Serialize, Deserialize, Aggregate)]
-#[aggregate(id = String, error = String, events(OrderPlaced, OrderShipped, OrderCancelled))]
+#[aggregate(id = String, error = String, events(OrderPlaced, OrderShipped, OrderCancelled), create(OrderPlaced))]
 pub struct Order {
     items: Vec<OrderItem>,
     customer_id: Option<String>,
@@ -268,6 +268,14 @@ impl Apply<OrderPlaced> for Order {
         });
         self.customer_id = Some(event.customer_id.clone());
         self.delivery_address = Some(event.delivery_address.clone());
+    }
+}
+
+impl Create<OrderPlaced> for Order {
+    fn create(event: &OrderPlaced) -> Self {
+        let mut this = Self::default();
+        <Self as Apply<OrderPlaced>>::apply(&mut this, event);
+        this
     }
 }
 
@@ -304,6 +312,8 @@ pub struct CancelOrder {
 
 // Handle<C> implementations for each command
 impl Handle<PlaceOrder> for Order {
+    type HandleError = Self::Error;
+
     fn handle(&self, command: &PlaceOrder) -> Result<Vec<Self::Event>, Self::Error> {
         if !self.items.is_empty() {
             return Err("Order already exists".to_string());
@@ -320,7 +330,25 @@ impl Handle<PlaceOrder> for Order {
     }
 }
 
+impl HandleCreate<PlaceOrder> for Order {
+    type HandleCreateError = Self::Error;
+
+    fn handle_create(command: &PlaceOrder) -> Result<Vec<Self::Event>, Self::HandleCreateError> {
+        Ok(vec![
+            OrderPlaced {
+                product_sku: command.product_sku.clone(),
+                quantity: command.quantity,
+                customer_id: command.customer_id.clone(),
+                delivery_address: command.delivery_address.clone(),
+            }
+            .into(),
+        ])
+    }
+}
+
 impl Handle<ShipOrder> for Order {
+    type HandleError = Self::Error;
+
     fn handle(&self, command: &ShipOrder) -> Result<Vec<Self::Event>, Self::Error> {
         if self.status != OrderStatus::Pending {
             return Err("Order cannot be shipped".to_string());
@@ -335,6 +363,8 @@ impl Handle<ShipOrder> for Order {
 }
 
 impl Handle<CancelOrder> for Order {
+    type HandleError = Self::Error;
+
     fn handle(&self, command: &CancelOrder) -> Result<Vec<Self::Event>, Self::Error> {
         if self.status != OrderStatus::Pending {
             return Err("Order cannot be cancelled".to_string());
@@ -407,7 +437,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     repository
-        .execute_command::<Order, PlaceOrder>(
+        .create::<Order, PlaceOrder>(
             &order_id,
             &PlaceOrder {
                 product_sku: "DOOHICKEY-003".to_string(),
@@ -443,7 +473,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n4. Shipping the order...");
 
     repository
-        .execute_command::<Order, ShipOrder>(
+        .update::<Order, ShipOrder>(
             &order_id,
             &ShipOrder {
                 tracking_number: "TRACK-123456".to_string(),

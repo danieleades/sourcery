@@ -1,8 +1,8 @@
-//! Advanced projection example using the `ProjectionFilters` trait.
+//! Advanced projection example using the `Projection` trait.
 //!
 //! This example demonstrates how to compose a projection that mixes
 //! global and scoped event subscriptions without relying on the
-//! aggregate event enums. The `ProjectionFilters` impl registers:
+//! aggregate event enums. The `Projection` impl registers:
 //!
 //! - All `ProductRestocked` events (global)
 //! - `InventoryAdjusted` events scoped to a specific product SKU
@@ -13,7 +13,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use sourcery::{
-    Aggregate, Apply, ApplyProjection, DomainEvent, Filters, ProjectionFilters, Repository,
+    Aggregate, Apply, ApplyProjection, Create, DomainEvent, Filters, Projection, Repository,
     store::{EventStore, inmemory},
     test::RepositoryTestExt,
 };
@@ -23,8 +23,10 @@ use sourcery::{
 // =============================================================================
 
 #[derive(Default, Serialize, Deserialize, Aggregate)]
-#[aggregate(id = String, error = String, events(ProductRestocked, InventoryAdjusted))]
-struct Product;
+#[aggregate(id = String, error = String, events(ProductRestocked, InventoryAdjusted), create(ProductRestocked))]
+struct Product {
+    quantity: i64,
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct ProductRestocked {
@@ -47,16 +49,30 @@ impl DomainEvent for InventoryAdjusted {
 }
 
 impl Apply<ProductRestocked> for Product {
-    fn apply(&mut self, _event: &ProductRestocked) {}
+    fn apply(&mut self, event: &ProductRestocked) {
+        self.quantity += event.quantity;
+    }
 }
 
 impl Apply<InventoryAdjusted> for Product {
-    fn apply(&mut self, _event: &InventoryAdjusted) {}
+    fn apply(&mut self, event: &InventoryAdjusted) {
+        self.quantity += event.delta;
+    }
+}
+
+impl Create<ProductRestocked> for Product {
+    fn create(event: &ProductRestocked) -> Self {
+        Self {
+            quantity: event.quantity,
+        }
+    }
 }
 
 #[derive(Default, Serialize, Deserialize, Aggregate)]
-#[aggregate(id = String, error = String, events(SaleCompleted))]
-struct Sale;
+#[aggregate(id = String, error = String, events(SaleCompleted), create(SaleCompleted))]
+struct Sale {
+    quantity_sold: i64,
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct SaleCompleted {
@@ -70,12 +86,24 @@ impl DomainEvent for SaleCompleted {
 }
 
 impl Apply<SaleCompleted> for Sale {
-    fn apply(&mut self, _event: &SaleCompleted) {}
+    fn apply(&mut self, event: &SaleCompleted) {
+        self.quantity_sold += event.quantity;
+    }
+}
+
+impl Create<SaleCompleted> for Sale {
+    fn create(event: &SaleCompleted) -> Self {
+        Self {
+            quantity_sold: event.quantity,
+        }
+    }
 }
 
 #[derive(Default, Serialize, Deserialize, Aggregate)]
-#[aggregate(id = String, error = String, events(PromotionApplied))]
-struct Promotion;
+#[aggregate(id = String, error = String, events(PromotionApplied), create(PromotionApplied))]
+struct Promotion {
+    amount_cents: i64,
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct PromotionApplied {
@@ -89,7 +117,17 @@ impl DomainEvent for PromotionApplied {
 }
 
 impl Apply<PromotionApplied> for Promotion {
-    fn apply(&mut self, _event: &PromotionApplied) {}
+    fn apply(&mut self, event: &PromotionApplied) {
+        self.amount_cents += event.amount_cents;
+    }
+}
+
+impl Create<PromotionApplied> for Promotion {
+    fn create(event: &PromotionApplied) -> Self {
+        Self {
+            amount_cents: event.amount_cents,
+        }
+    }
 }
 
 // =============================================================================
@@ -105,17 +143,25 @@ struct ProductSummaryParams {
     promotion: String,
 }
 
-#[derive(Debug, Default, sourcery::Projection)]
+#[derive(Debug, Default)]
 struct ProductSummary {
     stock_levels: HashMap<String, i64>,
     sales: HashMap<String, i64>,
     promotion_totals: HashMap<String, i64>,
 }
 
-impl ProjectionFilters for ProductSummary {
+/// Manual `Projection` impl: mixes global and instance-scoped subscriptions.
+///
+/// When a projection's `filters()` method depends on instance-specific IDs
+/// (like `ProductSummaryParams`), implement `Projection` directly rather than
+/// using `#[derive(Projection)]`. The derive always generates a singleton
+/// (`InstanceId = ()`) with global-only filters.
+impl Projection for ProductSummary {
     type Id = String;
     type InstanceId = ProductSummaryParams;
     type Metadata = ();
+
+    const KIND: &'static str = "product-summary";
 
     fn init(_params: &ProductSummaryParams) -> Self {
         Self::default()
@@ -236,7 +282,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?;
 
-    // Load the projection using the centralized filter configuration.
+    // Load the projection using the centralised filter configuration.
     let params = ProductSummaryParams {
         product: product_id.clone(),
         sale: sale_id.clone(),

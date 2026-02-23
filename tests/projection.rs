@@ -6,8 +6,9 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use sourcery::{
-    Aggregate, Apply, ApplyProjection, DomainEvent, EventKind, Filters, Handle, Projection,
-    ProjectionFilters, Repository,
+    Aggregate, Apply, ApplyProjection, Create, DomainEvent, Filters, Handle, HandleCreate,
+    Projection, Repository,
+    event::EventKind,
     projection::ProjectionError,
     store::{EventStore, inmemory},
     test::RepositoryTestExt,
@@ -51,6 +52,7 @@ impl serde::Serialize for InvalidValueAdded {
     id = String,
     error = String,
     events(ValueAdded),
+    create(ValueAdded),
     derives(Debug, PartialEq, Eq)
 )]
 struct Counter {
@@ -63,12 +65,38 @@ impl Apply<ValueAdded> for Counter {
     }
 }
 
+impl Create<ValueAdded> for Counter {
+    fn create(event: &ValueAdded) -> Self {
+        let mut this = Self::default();
+        <Self as Apply<ValueAdded>>::apply(&mut this, event);
+        this
+    }
+}
+
 struct AddValue {
     amount: i32,
 }
 
 impl Handle<AddValue> for Counter {
+    type HandleError = Self::Error;
+
     fn handle(&self, command: &AddValue) -> Result<Vec<Self::Event>, Self::Error> {
+        if command.amount <= 0 {
+            return Err("amount must be positive".to_string());
+        }
+        Ok(vec![
+            ValueAdded {
+                amount: command.amount,
+            }
+            .into(),
+        ])
+    }
+}
+
+impl HandleCreate<AddValue> for Counter {
+    type HandleCreateError = Self::Error;
+
+    fn handle_create(command: &AddValue) -> Result<Vec<Self::Event>, Self::HandleCreateError> {
         if command.amount <= 0 {
             return Err("amount must be positive".to_string());
         }
@@ -106,15 +134,17 @@ impl ApplyProjection<ValueAdded> for TotalsProjection {
 // Filtered projection for event_for tests
 // ============================================================================
 
-#[derive(Debug, Default, Projection)]
+#[derive(Debug, Default)]
 struct FilteredTotalsProjection {
     totals: HashMap<String, i32>,
 }
 
-impl ProjectionFilters for FilteredTotalsProjection {
+impl Projection for FilteredTotalsProjection {
     type Id = String;
     type InstanceId = String;
     type Metadata = ();
+
+    const KIND: &'static str = "filtered-totals-projection";
 
     fn init(_id: &String) -> Self {
         Self::default()
@@ -148,10 +178,10 @@ async fn event_for_filters_by_aggregate() {
     let store = inmemory::Store::new();
     let repo = Repository::new(store);
 
-    repo.execute_command::<Counter, AddValue>(&"c1".to_string(), &AddValue { amount: 10 }, &())
+    repo.create::<Counter, AddValue>(&"c1".to_string(), &AddValue { amount: 10 }, &())
         .await
         .unwrap();
-    repo.execute_command::<Counter, AddValue>(&"c2".to_string(), &AddValue { amount: 20 }, &())
+    repo.create::<Counter, AddValue>(&"c2".to_string(), &AddValue { amount: 20 }, &())
         .await
         .unwrap();
 
@@ -216,6 +246,7 @@ impl DomainEvent for ValueReset {
     id = String,
     error = String,
     events(ValueAdded, ValueReset),
+    create(ValueAdded, ValueReset),
     derives(Debug, PartialEq, Eq)
 )]
 struct MultiEventCounter {
@@ -234,11 +265,29 @@ impl Apply<ValueReset> for MultiEventCounter {
     }
 }
 
+impl Create<ValueAdded> for MultiEventCounter {
+    fn create(event: &ValueAdded) -> Self {
+        Self {
+            value: event.amount,
+        }
+    }
+}
+
+impl Create<ValueReset> for MultiEventCounter {
+    fn create(event: &ValueReset) -> Self {
+        Self {
+            value: event.new_value,
+        }
+    }
+}
+
 struct ResetValue {
     new_value: i32,
 }
 
 impl Handle<AddValue> for MultiEventCounter {
+    type HandleError = Self::Error;
+
     fn handle(&self, command: &AddValue) -> Result<Vec<Self::Event>, Self::Error> {
         Ok(vec![
             ValueAdded {
@@ -249,7 +298,22 @@ impl Handle<AddValue> for MultiEventCounter {
     }
 }
 
+impl HandleCreate<AddValue> for MultiEventCounter {
+    type HandleCreateError = Self::Error;
+
+    fn handle_create(command: &AddValue) -> Result<Vec<Self::Event>, Self::HandleCreateError> {
+        Ok(vec![
+            ValueAdded {
+                amount: command.amount,
+            }
+            .into(),
+        ])
+    }
+}
+
 impl Handle<ResetValue> for MultiEventCounter {
+    type HandleError = Self::Error;
+
     fn handle(&self, command: &ResetValue) -> Result<Vec<Self::Event>, Self::Error> {
         Ok(vec![
             ValueReset {
@@ -261,17 +325,19 @@ impl Handle<ResetValue> for MultiEventCounter {
 }
 
 /// Projection using `events()` to load via the aggregate's event enum
-#[derive(Debug, Default, Projection)]
+#[derive(Debug, Default)]
 struct EnumProjection {
     additions: i32,
     resets: i32,
     last_value: Option<i32>,
 }
 
-impl ProjectionFilters for EnumProjection {
+impl Projection for EnumProjection {
     type Id = String;
     type InstanceId = ();
     type Metadata = ();
+
+    const KIND: &'static str = "enum-projection";
 
     fn init((): &()) -> Self {
         Self::default()
@@ -305,17 +371,19 @@ impl ApplyProjection<MultiEventCounterEvent> for EnumProjection {
 }
 
 /// Projection using `events_for()` to load from a specific aggregate instance
-#[derive(Debug, Default, Projection)]
+#[derive(Debug, Default)]
 struct EventsForProjection {
     additions: i32,
     resets: i32,
     last_value: Option<i32>,
 }
 
-impl ProjectionFilters for EventsForProjection {
+impl Projection for EventsForProjection {
     type Id = String;
     type InstanceId = String;
     type Metadata = ();
+
+    const KIND: &'static str = "events-for-projection";
 
     fn init(_id: &String) -> Self {
         Self::default()
@@ -354,15 +422,11 @@ async fn events_loads_all_events_from_aggregate_enum() {
     let repo = Repository::new(store);
 
     // Execute commands that produce different event types
-    repo.execute_command::<MultiEventCounter, AddValue>(
-        &"c1".to_string(),
-        &AddValue { amount: 10 },
-        &(),
-    )
-    .await
-    .unwrap();
+    repo.create::<MultiEventCounter, AddValue>(&"c1".to_string(), &AddValue { amount: 10 }, &())
+        .await
+        .unwrap();
 
-    repo.execute_command::<MultiEventCounter, ResetValue>(
+    repo.update::<MultiEventCounter, ResetValue>(
         &"c1".to_string(),
         &ResetValue { new_value: 5 },
         &(),
@@ -370,15 +434,11 @@ async fn events_loads_all_events_from_aggregate_enum() {
     .await
     .unwrap();
 
-    repo.execute_command::<MultiEventCounter, AddValue>(
-        &"c1".to_string(),
-        &AddValue { amount: 3 },
-        &(),
-    )
-    .await
-    .unwrap();
+    repo.update::<MultiEventCounter, AddValue>(&"c1".to_string(), &AddValue { amount: 3 }, &())
+        .await
+        .unwrap();
 
-    // Use events() via the EnumProjection's ProjectionFilters impl
+    // Use events() via the EnumProjection's Projection impl
     let projection: EnumProjection = repo.load_projection(&()).await.unwrap();
 
     assert_eq!(projection.additions, 13); // 10 + 3
@@ -392,23 +452,15 @@ async fn events_for_loads_events_for_specific_aggregate_instance() {
     let repo = Repository::new(store);
 
     // Create events for two different aggregate instances
-    repo.execute_command::<MultiEventCounter, AddValue>(
-        &"c1".to_string(),
-        &AddValue { amount: 10 },
-        &(),
-    )
-    .await
-    .unwrap();
+    repo.create::<MultiEventCounter, AddValue>(&"c1".to_string(), &AddValue { amount: 10 }, &())
+        .await
+        .unwrap();
 
-    repo.execute_command::<MultiEventCounter, AddValue>(
-        &"c2".to_string(),
-        &AddValue { amount: 20 },
-        &(),
-    )
-    .await
-    .unwrap();
+    repo.create::<MultiEventCounter, AddValue>(&"c2".to_string(), &AddValue { amount: 20 }, &())
+        .await
+        .unwrap();
 
-    repo.execute_command::<MultiEventCounter, ResetValue>(
+    repo.update::<MultiEventCounter, ResetValue>(
         &"c1".to_string(),
         &ResetValue { new_value: 5 },
         &(),
@@ -416,7 +468,7 @@ async fn events_for_loads_events_for_specific_aggregate_instance() {
     .await
     .unwrap();
 
-    // Use events_for() via the EventsForProjection's ProjectionFilters impl
+    // Use events_for() via the EventsForProjection's Projection impl
     let projection: EventsForProjection = repo.load_projection(&"c1".to_string()).await.unwrap();
 
     assert_eq!(projection.additions, 10); // only c1's addition
@@ -460,10 +512,10 @@ async fn projection_with_snapshot_exercises_snapshots_wrapper_load() {
     let repo = Repository::new(store).with_snapshots(snapshots);
 
     // Add some events
-    repo.execute_command::<Counter, AddValue>(&"c1".to_string(), &AddValue { amount: 10 }, &())
+    repo.create::<Counter, AddValue>(&"c1".to_string(), &AddValue { amount: 10 }, &())
         .await
         .unwrap();
-    repo.execute_command::<Counter, AddValue>(&"c1".to_string(), &AddValue { amount: 20 }, &())
+    repo.update::<Counter, AddValue>(&"c1".to_string(), &AddValue { amount: 20 }, &())
         .await
         .unwrap();
 
@@ -486,7 +538,7 @@ async fn projection_with_snapshot_offers_snapshot_after_load() {
     let repo = Repository::new(store).with_snapshots(snapshots);
 
     // Add events
-    repo.execute_command::<Counter, AddValue>(&"c1".to_string(), &AddValue { amount: 5 }, &())
+    repo.create::<Counter, AddValue>(&"c1".to_string(), &AddValue { amount: 5 }, &())
         .await
         .unwrap();
 
@@ -500,7 +552,7 @@ async fn projection_with_snapshot_offers_snapshot_after_load() {
     assert_eq!(projection.total, 5);
 
     // Add more events
-    repo.execute_command::<Counter, AddValue>(&"c1".to_string(), &AddValue { amount: 7 }, &())
+    repo.update::<Counter, AddValue>(&"c1".to_string(), &AddValue { amount: 7 }, &())
         .await
         .unwrap();
 
