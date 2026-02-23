@@ -37,7 +37,10 @@ struct PaymentReceived { /* ... */ }
 ```rust,ignore
 // ID is infrastructure
 repository
-    .execute_command::<Account, Deposit>(&account_id, &command, &metadata)
+    .create::<Account, OpenAccount>(&account_id, &open, &metadata)
+    .await?;
+repository
+    .update::<Account, Deposit>(&account_id, &deposit, &metadata)
     .await?;
 
 // Event doesn't contain ID
@@ -46,7 +49,7 @@ struct FundsDeposited { amount: i64 }  // No account_id field
 
 ## No Built-In Command Bus
 
-**Decision**: The crate provides `Repository::execute_command()` but no command routing infrastructure.
+**Decision**: The crate provides `Repository::create()` / `Repository::update()` but no command routing infrastructure.
 
 **Why**:
 - Command buses vary widely (sync, async, distributed, in-process)

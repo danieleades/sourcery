@@ -31,7 +31,8 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use sourcery::{
-    Aggregate, Apply, ApplyProjection, DomainEvent, Handle, Projection, Repository, store::inmemory,
+    Aggregate, Apply, ApplyProjection, Create, DomainEvent, Handle, HandleCreate, Projection,
+    Repository, store::inmemory,
 };
 
 // =============================================================================
@@ -54,6 +55,7 @@ pub struct EventMetadata {
     id = String,
     error = String,
     events(SubscriptionStarted, SubscriptionCancelled),
+    create(SubscriptionStarted),
     kind = "subscription"
 )]
 pub struct Subscription {
@@ -102,6 +104,14 @@ impl Apply<SubscriptionCancelled> for Subscription {
     }
 }
 
+impl Create<SubscriptionStarted> for Subscription {
+    fn create(event: &SubscriptionStarted) -> Self {
+        let mut this = Self::default();
+        <Self as Apply<SubscriptionStarted>>::apply(&mut this, event);
+        this
+    }
+}
+
 // Command structs for Subscription aggregate
 #[derive(Debug)]
 pub struct StartSubscription {
@@ -117,6 +127,8 @@ pub struct CancelSubscription {
 
 // Handle<C> implementations for each command
 impl Handle<StartSubscription> for Subscription {
+    type HandleError = Self::Error;
+
     fn handle(&self, command: &StartSubscription) -> Result<Vec<Self::Event>, Self::Error> {
         if self.status == SubscriptionStatus::Active {
             return Err("subscription already active".into());
@@ -134,7 +146,25 @@ impl Handle<StartSubscription> for Subscription {
     }
 }
 
+impl HandleCreate<StartSubscription> for Subscription {
+    type HandleCreateError = Self::Error;
+
+    fn handle_create(
+        command: &StartSubscription,
+    ) -> Result<Vec<Self::Event>, Self::HandleCreateError> {
+        Ok(vec![
+            SubscriptionStarted {
+                plan_name: command.plan_name.clone(),
+                activated_at: command.activated_at.clone(),
+            }
+            .into(),
+        ])
+    }
+}
+
 impl Handle<CancelSubscription> for Subscription {
+    type HandleError = Self::Error;
+
     fn handle(&self, command: &CancelSubscription) -> Result<Vec<Self::Event>, Self::Error> {
         if self.status != SubscriptionStatus::Active {
             return Err("only active subscriptions can be cancelled".into());
@@ -179,6 +209,7 @@ impl fmt::Display for InvoiceId {
     id = String,
     error = String,
     events(InvoiceIssued, PaymentRecorded, InvoiceSettled),
+    create(InvoiceIssued),
     kind = "invoice"
 )]
 pub struct Invoice {
@@ -229,6 +260,14 @@ impl Apply<InvoiceIssued> for Invoice {
     }
 }
 
+impl Create<InvoiceIssued> for Invoice {
+    fn create(event: &InvoiceIssued) -> Self {
+        let mut this = Self::default();
+        <Self as Apply<InvoiceIssued>>::apply(&mut this, event);
+        this
+    }
+}
+
 impl Apply<PaymentRecorded> for Invoice {
     fn apply(&mut self, event: &PaymentRecorded) {
         self.paid_cents += event.amount_cents;
@@ -256,6 +295,8 @@ pub struct RecordPayment {
 
 // Handle<C> implementations for each command
 impl Handle<IssueInvoice> for Invoice {
+    type HandleError = Self::Error;
+
     fn handle(&self, command: &IssueInvoice) -> Result<Vec<Self::Event>, Self::Error> {
         if self.issued {
             return Err("invoice already issued".into());
@@ -274,7 +315,27 @@ impl Handle<IssueInvoice> for Invoice {
     }
 }
 
+impl HandleCreate<IssueInvoice> for Invoice {
+    type HandleCreateError = Self::Error;
+
+    fn handle_create(command: &IssueInvoice) -> Result<Vec<Self::Event>, Self::HandleCreateError> {
+        if command.amount_cents <= 0 {
+            return Err("invoice amount must be positive".to_string());
+        }
+        Ok(vec![
+            InvoiceIssued {
+                customer_id: command.customer_id.clone(),
+                amount_cents: command.amount_cents,
+                due_date: command.due_date.clone(),
+            }
+            .into(),
+        ])
+    }
+}
+
 impl Handle<RecordPayment> for Invoice {
+    type HandleError = Self::Error;
+
     fn handle(&self, command: &RecordPayment) -> Result<Vec<Self::Event>, Self::Error> {
         if !self.issued {
             return Err("invoice not issued yet".into());
@@ -491,7 +552,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 1. Activate the subscription
     repository
-        .execute_command::<Subscription, StartSubscription>(
+        .create::<Subscription, StartSubscription>(
             &customer_id,
             &StartSubscription {
                 plan_name: "Pro Annual".into(),
@@ -510,7 +571,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let invoice_corr = format!("invoice/{}", invoice_id.invoice_number);
 
     repository
-        .execute_command::<Invoice, IssueInvoice>(
+        .create::<Invoice, IssueInvoice>(
             &invoice_stream_id,
             &IssueInvoice {
                 customer_id: customer_id.clone(),
@@ -526,7 +587,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 3. Record a partial payment
     repository
-        .execute_command::<Invoice, RecordPayment>(
+        .update::<Invoice, RecordPayment>(
             &invoice_stream_id,
             &RecordPayment {
                 amount_cents: 5_000,
@@ -540,7 +601,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 4. Record remaining balance (triggers InvoiceSettled)
     repository
-        .execute_command::<Invoice, RecordPayment>(
+        .update::<Invoice, RecordPayment>(
             &invoice_stream_id,
             &RecordPayment {
                 amount_cents: 7_000,
@@ -572,7 +633,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if can_cancel {
         println!("\nBalance is zero – proceeding with cancellation.");
         repository
-            .execute_command::<Subscription, CancelSubscription>(
+            .update::<Subscription, CancelSubscription>(
                 &customer_id,
                 &CancelSubscription {
                     reason: "customer requested cancellation".into(),

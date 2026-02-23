@@ -4,7 +4,7 @@
 pub use sourcery_core::test;
 pub use sourcery_core::{
     aggregate,
-    aggregate::{Aggregate, Apply, Handle},
+    aggregate::{Aggregate, Apply, Create, Handle, HandleCreate},
     event,
     event::{DomainEvent, EventDecodeError, EventKind, ProjectionEvent},
     projection,

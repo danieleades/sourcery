@@ -9,7 +9,8 @@ use std::sync::{
 
 use serde::{Deserialize, Serialize};
 use sourcery::{
-    Aggregate, Apply, ApplyProjection, DomainEvent, Handle, Projection, Repository, store::inmemory,
+    Aggregate, Apply, ApplyProjection, Create, DomainEvent, Handle, HandleCreate, Projection,
+    Repository, repository::CommandError, store::inmemory,
 };
 
 // ============================================================================
@@ -30,6 +31,7 @@ impl DomainEvent for ItemAdded {
     id = String,
     error = String,
     events(ItemAdded),
+    create(ItemAdded),
     derives(Debug, PartialEq, Eq)
 )]
 struct Inventory {
@@ -42,12 +44,33 @@ impl Apply<ItemAdded> for Inventory {
     }
 }
 
+impl Create<ItemAdded> for Inventory {
+    fn create(_event: &ItemAdded) -> Self {
+        Self { count: 1 }
+    }
+}
+
 struct AddItem {
     name: String,
 }
 
 impl Handle<AddItem> for Inventory {
+    type HandleError = Self::Error;
+
     fn handle(&self, command: &AddItem) -> Result<Vec<Self::Event>, Self::Error> {
+        Ok(vec![
+            ItemAdded {
+                name: command.name.clone(),
+            }
+            .into(),
+        ])
+    }
+}
+
+impl HandleCreate<AddItem> for Inventory {
+    type HandleCreateError = Self::Error;
+
+    fn handle_create(command: &AddItem) -> Result<Vec<Self::Event>, Self::HandleCreateError> {
         Ok(vec![
             ItemAdded {
                 name: command.name.clone(),
@@ -83,15 +106,20 @@ impl ApplyProjection<ItemAdded> for ItemCount {
 // ============================================================================
 
 async fn add_item(repo: &Repository<inmemory::Store<String, ()>>, id: &str, name: &str) {
-    repo.execute_command::<Inventory, AddItem>(
-        &id.to_string(),
-        &AddItem {
-            name: name.to_string(),
-        },
-        &(),
-    )
-    .await
-    .unwrap();
+    let command = AddItem {
+        name: name.to_string(),
+    };
+    let id = id.to_string();
+
+    match repo.create::<Inventory, AddItem>(&id, &command, &()).await {
+        Ok(()) => {}
+        Err(CommandError::Lifecycle(_)) => {
+            repo.update::<Inventory, AddItem>(&id, &command, &())
+                .await
+                .unwrap();
+        }
+        Err(err) => panic!("failed to append command: {err}"),
+    }
 }
 
 // ============================================================================

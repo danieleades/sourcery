@@ -6,9 +6,20 @@
 
 // ANCHOR: full_example
 use serde::{Deserialize, Serialize};
-use sourcery::{Apply, ApplyProjection, DomainEvent, Handle, Repository, store::inmemory};
+use sourcery::{
+    Apply, ApplyProjection, Create, DomainEvent, Handle, HandleCreate, Repository, store::inmemory,
+};
 
 // ANCHOR: events
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountOpened {
+    pub initial_balance: i64,
+}
+
+impl DomainEvent for AccountOpened {
+    const KIND: &'static str = "account.opened";
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FundsDeposited {
     pub amount: i64,
@@ -21,6 +32,11 @@ impl DomainEvent for FundsDeposited {
 
 // ANCHOR: commands
 #[derive(Debug)]
+pub struct OpenAccount {
+    pub initial_balance: i64,
+}
+
+#[derive(Debug)]
 pub struct Deposit {
     pub amount: i64,
 }
@@ -31,11 +47,26 @@ pub struct Deposit {
 #[aggregate(
     id = String,
     error = String,
-    events(FundsDeposited),
+    events(AccountOpened, FundsDeposited),
+    create(AccountOpened),
     derives(Debug, PartialEq, Eq)
 )]
 pub struct Account {
     balance: i64,
+}
+
+impl Create<AccountOpened> for Account {
+    fn create(event: &AccountOpened) -> Self {
+        Self {
+            balance: event.initial_balance,
+        }
+    }
+}
+
+impl Apply<AccountOpened> for Account {
+    fn apply(&mut self, event: &AccountOpened) {
+        self.balance = event.initial_balance;
+    }
 }
 
 impl Apply<FundsDeposited> for Account {
@@ -44,7 +75,35 @@ impl Apply<FundsDeposited> for Account {
     }
 }
 
+impl Handle<OpenAccount> for Account {
+    type HandleError = Self::Error;
+
+    fn handle(&self, cmd: &OpenAccount) -> Result<Vec<Self::Event>, Self::Error> {
+        Ok(vec![
+            AccountOpened {
+                initial_balance: cmd.initial_balance,
+            }
+            .into(),
+        ])
+    }
+}
+
+impl HandleCreate<OpenAccount> for Account {
+    type HandleCreateError = Self::Error;
+
+    fn handle_create(cmd: &OpenAccount) -> Result<Vec<Self::Event>, Self::HandleCreateError> {
+        Ok(vec![
+            AccountOpened {
+                initial_balance: cmd.initial_balance,
+            }
+            .into(),
+        ])
+    }
+}
+
 impl Handle<Deposit> for Account {
+    type HandleError = Self::Error;
+
     fn handle(&self, cmd: &Deposit) -> Result<Vec<Self::Event>, Self::Error> {
         if cmd.amount <= 0 {
             return Err("amount must be positive".into());
@@ -75,9 +134,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = inmemory::Store::new();
     let repository = Repository::new(store);
 
-    // Execute a command
+    // Open a new account — this is the creation event, handled by
+    // Create<AccountOpened>
     repository
-        .execute_command::<Account, Deposit>(&"ACC-001".to_string(), &Deposit { amount: 100 }, &())
+        .create::<Account, OpenAccount>(
+            &"ACC-001".to_string(),
+            &OpenAccount { initial_balance: 0 },
+            &(),
+        )
+        .await?;
+
+    // Execute a deposit command
+    repository
+        .update::<Account, Deposit>(&"ACC-001".to_string(), &Deposit { amount: 100 }, &())
         .await?;
 
     // Load a projection

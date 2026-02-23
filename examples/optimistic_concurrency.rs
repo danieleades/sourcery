@@ -8,8 +8,8 @@
 
 use serde::{Deserialize, Serialize};
 use sourcery::{
-    Apply, DomainEvent, Handle, Repository, repository::CommandError, store::inmemory,
-    test::RepositoryTestExt,
+    Apply, Create, DomainEvent, Handle, HandleCreate, Repository, repository::CommandError,
+    store::inmemory, test::RepositoryTestExt,
 };
 
 // =============================================================================
@@ -53,9 +53,17 @@ pub struct RestockItem {
 // =============================================================================
 
 #[derive(Default, Serialize, Deserialize, sourcery::Aggregate)]
-#[aggregate(id = String, error = InventoryError, events(ItemReserved, ItemRestocked))]
+#[aggregate(id = String, error = InventoryError, events(ItemReserved, ItemRestocked), create(ItemRestocked))]
 pub struct InventoryItem {
     available: u32,
+}
+
+impl Create<ItemRestocked> for InventoryItem {
+    fn create(event: &ItemRestocked) -> Self {
+        Self {
+            available: event.quantity,
+        }
+    }
 }
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -77,6 +85,8 @@ impl Apply<ItemRestocked> for InventoryItem {
 }
 
 impl Handle<ReserveItem> for InventoryItem {
+    type HandleError = Self::Error;
+
     fn handle(&self, cmd: &ReserveItem) -> Result<Vec<Self::Event>, Self::Error> {
         if cmd.quantity > self.available {
             return Err(InventoryError::InsufficientStock {
@@ -94,7 +104,22 @@ impl Handle<ReserveItem> for InventoryItem {
 }
 
 impl Handle<RestockItem> for InventoryItem {
+    type HandleError = Self::Error;
+
     fn handle(&self, cmd: &RestockItem) -> Result<Vec<Self::Event>, Self::Error> {
+        Ok(vec![
+            ItemRestocked {
+                quantity: cmd.quantity,
+            }
+            .into(),
+        ])
+    }
+}
+
+impl HandleCreate<RestockItem> for InventoryItem {
+    type HandleCreateError = Self::Error;
+
+    fn handle_create(cmd: &RestockItem) -> Result<Vec<Self::Event>, Self::HandleCreateError> {
         Ok(vec![
             ItemRestocked {
                 quantity: cmd.quantity,
@@ -124,26 +149,24 @@ async fn part1_basic_usage() -> Result<(OptimisticRepo, String), Box<dyn std::er
 
     // Initialize inventory
     println!("1. Restocking item with 100 units...");
-    repo.execute_command::<InventoryItem, RestockItem>(
-        &item_id,
-        &RestockItem { quantity: 100 },
-        &(),
-    )
-    .await?;
+    repo.create::<InventoryItem, RestockItem>(&item_id, &RestockItem { quantity: 100 }, &())
+        .await?;
 
-    let item: InventoryItem = repo.load(&item_id).await?;
+    let item: InventoryItem = repo
+        .load(&item_id)
+        .await?
+        .expect("item exists after restocking");
     println!("   Available: {}\n", item.available);
 
     // Normal reservation (no conflict)
     println!("2. Reserving 30 units (no concurrent modification)...");
-    repo.execute_command::<InventoryItem, ReserveItem>(
-        &item_id,
-        &ReserveItem { quantity: 30 },
-        &(),
-    )
-    .await?;
+    repo.update::<InventoryItem, ReserveItem>(&item_id, &ReserveItem { quantity: 30 }, &())
+        .await?;
 
-    let item: InventoryItem = repo.load(&item_id).await?;
+    let item: InventoryItem = repo
+        .load(&item_id)
+        .await?
+        .expect("item exists after restocking");
     println!("   Available: {}\n", item.available);
 
     Ok((repo, item_id))
@@ -165,20 +188,20 @@ async fn part2_conflict_detection(
     repo.inject_concurrent_event::<InventoryItem>(item_id, ItemReserved { quantity: 20 }.into())
         .await?;
 
-    let item: InventoryItem = repo.load(item_id).await?;
+    let item: InventoryItem = repo.load(item_id).await?.expect("item exists");
     println!(
         "   Available after concurrent modification: {}\n",
         item.available
     );
 
-    // Now try to reserve - this will succeed because execute_command loads fresh
+    // Now try to reserve - this will succeed because update loads fresh
     // state The conflict would only occur if we had pre-loaded state before the
     // concurrent modification
     println!("4. Reserving 10 more units (loads fresh state, so no conflict)...");
-    repo.execute_command::<InventoryItem, ReserveItem>(item_id, &ReserveItem { quantity: 10 }, &())
+    repo.update::<InventoryItem, ReserveItem>(item_id, &ReserveItem { quantity: 10 }, &())
         .await?;
 
-    let item: InventoryItem = repo.load(item_id).await?;
+    let item: InventoryItem = repo.load(item_id).await?.expect("item exists");
     println!("   Available: {}\n", item.available);
 
     Ok(())
@@ -186,7 +209,7 @@ async fn part2_conflict_detection(
 
 /// Part 3: Retry pattern for handling conflicts.
 ///
-/// Demonstrates the built-in `execute_with_retry` method for automatic conflict
+/// Demonstrates the built-in `update_with_retry` method for automatic conflict
 /// handling.
 async fn part3_retry_pattern() -> Result<(OptimisticRepo, String), Box<dyn std::error::Error>> {
     println!("PART 3: Retry pattern for handling conflicts\n");
@@ -197,12 +220,8 @@ async fn part3_retry_pattern() -> Result<(OptimisticRepo, String), Box<dyn std::
     let item_id = "SKU-002".to_string();
 
     // Initialize
-    repo.execute_command::<InventoryItem, RestockItem>(
-        &item_id,
-        &RestockItem { quantity: 50 },
-        &(),
-    )
-    .await?;
+    repo.create::<InventoryItem, RestockItem>(&item_id, &RestockItem { quantity: 50 }, &())
+        .await?;
     println!("5. Initialized SKU-002 with 50 units");
 
     // Inject a conflict before the retry helper runs
@@ -211,15 +230,15 @@ async fn part3_retry_pattern() -> Result<(OptimisticRepo, String), Box<dyn std::
         .await?;
     println!("   Injected concurrent reservation of 5 units (simulating race condition)");
 
-    // Use the built-in execute_with_retry method.
+    // Use the built-in update_with_retry method.
     // This automatically reloads and retries on ConcurrencyConflict errors.
-    println!("\n6. Attempting to reserve 10 units with execute_with_retry...");
+    println!("\n6. Attempting to reserve 10 units with update_with_retry...");
     let attempts = repo
-        .execute_with_retry::<InventoryItem, _>(&item_id, &ReserveItem { quantity: 10 }, &(), 3)
+        .update_with_retry::<InventoryItem, _>(&item_id, &ReserveItem { quantity: 10 }, &(), 3)
         .await?;
     println!("   Succeeded on attempt {attempts}");
 
-    let item: InventoryItem = repo.load(&item_id).await?;
+    let item: InventoryItem = repo.load(&item_id).await?.expect("item exists");
     println!(
         "   Final available: {} (50 - 5 - 10 = 35)\n",
         item.available
@@ -235,11 +254,8 @@ async fn part4_business_rules(repo: &OptimisticRepo, item_id: &String) {
     println!("PART 4: Business rules with optimistic concurrency\n");
 
     println!("7. Attempting to reserve 40 units (should fail - only 35 available)...");
-    let result = repo.execute_command::<InventoryItem, ReserveItem>(
-        item_id,
-        &ReserveItem { quantity: 40 },
-        &(),
-    );
+    let result =
+        repo.update::<InventoryItem, ReserveItem>(item_id, &ReserveItem { quantity: 40 }, &());
 
     match result.await {
         Err(CommandError::Aggregate(InventoryError::InsufficientStock {
@@ -263,7 +279,7 @@ fn print_summary() {
     println!("\nKey takeaways:");
     println!("  1. Optimistic concurrency is enabled by default");
     println!("  2. Conflicts are detected when the stream version changes between load and commit");
-    println!("  3. Use execute_with_retry() for automatic retry on ConcurrencyConflict");
+    println!("  3. Use update_with_retry() for automatic retry on ConcurrencyConflict");
     println!(
         "  4. Business rules are always evaluated against fresh state after conflict resolution"
     );

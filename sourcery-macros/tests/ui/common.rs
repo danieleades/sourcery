@@ -2,11 +2,17 @@ pub trait Apply<E> {
     fn apply(&mut self, event: &E);
 }
 
+pub trait Create<E>: Sized {
+    fn create(event: &E) -> Self;
+}
+
 pub trait Aggregate {
     const KIND: &'static str;
     type Event;
     type Error;
     type Id;
+
+    fn create(event: &Self::Event) -> Self;
 
     fn apply(&mut self, event: &Self::Event);
 }

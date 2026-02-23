@@ -8,7 +8,8 @@ For most aggregates:
 
 1. `#[derive(Aggregate)]`
 2. Implement `Apply<E>` per event
-3. Implement `Handle<C>` per command
+3. Implement `HandleCreate<C>` for create commands
+4. Implement `Handle<C>` for existing aggregate commands
 
 ```rust,ignore
 #[derive(Default, sourcery::Aggregate)]
@@ -67,10 +68,9 @@ This replays events for that aggregate ID. If snapshots are configured, replay s
 shape: sequence_diagram
 
 Store: Event Store
-Agg: Account (Default)
+Agg: Account (created from first event)
 
-Agg: "balance = 0" {shape: text}
-Store -> Agg: "apply(FundsDeposited { amount: 100 })"
+Store -> Agg: "create(FundsDeposited { amount: 100 })"
 Agg: "balance = 100" {shape: text}
 Store -> Agg: "apply(FundsWithdrawn { amount: 30 })"
 Agg: "balance = 70" {shape: text}

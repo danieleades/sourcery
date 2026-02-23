@@ -4,7 +4,7 @@ extern crate serde_json;
 #[path = "../common.rs"]
 mod support;
 
-pub use support::{codec, event, store, Aggregate, Apply, ProjectionEvent, Projection};
+pub use support::{codec, event, store, Aggregate, Apply, Create, ProjectionEvent, Projection};
 
 use event::DomainEvent;
 use serde::{Deserialize, Serialize};
@@ -34,8 +34,8 @@ mod bar {
 
 pub struct AggregateError;
 
-#[derive(Aggregate)]
-#[aggregate(id = String, error = AggregateError, events(foo::Event, bar::Event))]
+#[derive(Default, Aggregate)]
+#[aggregate(id = String, error = AggregateError, events(foo::Event, bar::Event), create(foo::Event))]
 pub struct Account;
 
 impl Apply<foo::Event> for Account {
@@ -44,6 +44,12 @@ impl Apply<foo::Event> for Account {
 
 impl Apply<bar::Event> for Account {
     fn apply(&mut self, _event: &bar::Event) {}
+}
+
+impl Create<foo::Event> for Account {
+    fn create(_event: &foo::Event) -> Self {
+        Self
+    }
 }
 
 fn assert_variant_names() {

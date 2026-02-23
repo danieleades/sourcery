@@ -13,13 +13,12 @@ use syn::{DeriveInput, Ident, Path, parse_macro_input, parse_quote};
 #[allow(clippy::doc_markdown, reason = "false positive")]
 /// Build a PascalCase enum variant name from a type path.
 fn path_to_pascal_ident(path: &Path) -> Ident {
-    let mut combined = String::new();
-    for (index, segment) in path.segments.iter().enumerate() {
-        if index > 0 {
-            combined.push('_');
-        }
-        combined.push_str(&segment.ident.to_string());
-    }
+    let combined = path
+        .segments
+        .iter()
+        .map(|s| s.ident.to_string())
+        .collect::<Vec<_>>()
+        .join("_");
     let pascal = combined.to_upper_camel_case();
     let span = path
         .segments
@@ -81,6 +80,13 @@ struct AggregateArgs {
     event_enum: Option<String>,
     #[darling(default)]
     derives: Option<PathList>,
+    /// Event types that act as creation events for this aggregate.
+    ///
+    /// When specified, `fn create` dispatches to `Create<E>::create` for each
+    /// listed event type and panics for all others. When absent, falls back to
+    /// `Default::default()` + `apply` (requires `Self: Default`).
+    #[darling(default)]
+    create: PathList,
 }
 
 /// Configuration for the `#[projection(...)]` attribute.
@@ -139,7 +145,7 @@ where
 ///
 /// **Note:** Commands are handled via individual `Handle<C>` trait
 /// implementations. No command enum is generated - use
-/// `execute_command::<Aggregate, Command>()` directly.
+/// `update::<Aggregate, Command>()` directly.
 ///
 /// # Attributes
 ///
@@ -184,6 +190,7 @@ fn derive_aggregate_impl(input: &DeriveInput) -> TokenStream2 {
 }
 
 /// Generate the aggregate derive implementation tokens.
+#[allow(clippy::too_many_lines)]
 fn generate_aggregate_impl(args: AggregateArgs, input: &DeriveInput) -> TokenStream2 {
     let event_specs: Vec<EventSpec<'_>> = args.events.iter().map(EventSpec::new).collect();
 
@@ -210,11 +217,39 @@ fn generate_aggregate_impl(args: AggregateArgs, input: &DeriveInput) -> TokenStr
     let variant_names: Vec<&Ident> = event_specs.iter().map(|spec| &spec.variant).collect();
 
     // Build derives list - always include Clone, add user-specified traits
-    let derives = if let Some(user_derives) = &args.derives {
-        let user_paths: Vec<&Path> = user_derives.iter().collect();
-        quote! { #[derive(Clone, #(#user_paths),*)] }
+    let user_derives = args.derives.unwrap_or_default();
+    let derives = quote! { #[derive(Clone, #(#user_derives),*)] };
+
+    // Generate fn create — dispatching to Create<E> impls for each listed
+    // creation event type, or falling back to Default + apply when none are
+    // specified.
+    let create_specs: Vec<EventSpec<'_>> = args.create.iter().map(EventSpec::new).collect();
+    let create_fn = if create_specs.is_empty() {
+        quote! {
+            fn create(event: &Self::Event) -> Self {
+                let mut this = <Self as ::core::default::Default>::default();
+                <Self as ::sourcery::Aggregate>::apply(&mut this, event);
+                this
+            }
+        }
     } else {
-        quote! { #[derive(Clone)] }
+        let create_event_types = create_specs.iter().map(|s| s.path);
+        let create_variant_names = create_specs.iter().map(|s| &s.variant);
+        quote! {
+            fn create(event: &Self::Event) -> Self {
+                match event {
+                    #(#event_enum_name::#create_variant_names(e) => {
+                        <Self as ::sourcery::Create<#create_event_types>>::create(e)
+                    }),*,
+                    _ => panic!(
+                        "event `{}` is not a creation event for aggregate `{}`; \
+                         check the `create(...)` attribute or inspect for stream corruption",
+                        ::sourcery::event::EventKind::kind(event),
+                        Self::KIND,
+                    ),
+                }
+            }
+        }
     };
 
     let expanded = quote! {
@@ -278,6 +313,8 @@ fn generate_aggregate_impl(args: AggregateArgs, input: &DeriveInput) -> TokenStr
             type Event = #event_enum_name;
             type Error = #error_type;
             type Id = #id_type;
+
+            #create_fn
 
             fn apply(&mut self, event: &Self::Event) {
                 match event {

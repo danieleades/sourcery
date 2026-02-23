@@ -272,17 +272,11 @@ where
         let filters = self
             .specs
             .into_iter()
-            .map(|spec| {
-                let mut filter = EventFilter {
-                    event_kind: spec.event_kind,
-                    aggregate_kind: spec.aggregate_kind,
-                    aggregate_id: spec.aggregate_id,
-                    after_position: None,
-                };
-                if let Some(pos) = after {
-                    filter = filter.after(pos.clone());
-                }
-                filter
+            .map(|spec| EventFilter {
+                event_kind: spec.event_kind,
+                aggregate_kind: spec.aggregate_kind,
+                aggregate_id: spec.aggregate_id,
+                after_position: after.cloned(),
             })
             .collect();
         (filters, self.handlers)

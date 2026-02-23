@@ -258,7 +258,7 @@ pub struct TestFramework<A: Aggregate> {
     aggregate: A,
 }
 
-impl<A: Aggregate> TestFramework<A> {
+impl<A: Aggregate + Default> TestFramework<A> {
     /// Start a test scenario with previous events already applied.
     ///
     /// The events are applied in order to rebuild the aggregate state
@@ -284,7 +284,7 @@ impl<A: Aggregate> TestFramework<A> {
     where
         A: Handle<C>,
     {
-        let result = self.aggregate.handle(command);
+        let result = self.aggregate.handle(command).map_err(Into::into);
         TestResult { result }
     }
 
@@ -471,6 +471,12 @@ mod tests {
 
         const KIND: &'static str = "counter";
 
+        fn create(event: &Self::Event) -> Self {
+            let mut this = Self::default();
+            <Self as Aggregate>::apply(&mut this, event);
+            this
+        }
+
         fn apply(&mut self, event: &Self::Event) {
             match event {
                 CounterEvent::Added(e) => self.value += e.amount,
@@ -488,6 +494,8 @@ mod tests {
     }
 
     impl Handle<AddValue> for Counter {
+        type HandleError = Self::Error;
+
         fn handle(&self, command: &AddValue) -> Result<Vec<Self::Event>, Self::Error> {
             if command.amount <= 0 {
                 return Err("amount must be positive".to_string());
@@ -499,6 +507,8 @@ mod tests {
     }
 
     impl Handle<SubtractValue> for Counter {
+        type HandleError = Self::Error;
+
         fn handle(&self, command: &SubtractValue) -> Result<Vec<Self::Event>, Self::Error> {
             if command.amount <= 0 {
                 return Err("amount must be positive".to_string());
@@ -570,6 +580,8 @@ mod tests {
     struct NoOp;
 
     impl Handle<NoOp> for Counter {
+        type HandleError = Self::Error;
+
         fn handle(&self, _: &NoOp) -> Result<Vec<Self::Event>, Self::Error> {
             Ok(vec![])
         }
@@ -668,6 +680,12 @@ mod repository_test_ext_tests {
 
         const KIND: &'static str = "score";
 
+        fn create(event: &Self::Event) -> Self {
+            let mut this = Self::default();
+            this.apply(event);
+            this
+        }
+
         fn apply(&mut self, event: &Self::Event) {
             match event {
                 ScoreEvent::Added(e) => self.total += e.points,
@@ -697,7 +715,7 @@ mod repository_test_ext_tests {
         );
 
         // Verify events are loadable
-        let loaded: Score = repo.load(&id).await.unwrap();
+        let loaded: Score = repo.load(&id).await.unwrap().expect("score should exist");
         assert_eq!(loaded.total, 30);
     }
 
@@ -723,7 +741,7 @@ mod repository_test_ext_tests {
         );
 
         // Verify both events are reflected
-        let loaded: Score = repo.load(&id).await.unwrap();
+        let loaded: Score = repo.load(&id).await.unwrap().expect("score should exist");
         assert_eq!(loaded.total, 150);
     }
 
@@ -742,7 +760,11 @@ mod repository_test_ext_tests {
         .unwrap();
 
         // Verify event is loadable
-        let loaded: Score = repo.load(&"s1".to_string()).await.unwrap();
+        let loaded: Score = repo
+            .load(&"s1".to_string())
+            .await
+            .unwrap()
+            .expect("score should exist");
         assert_eq!(loaded.total, 42);
     }
 }

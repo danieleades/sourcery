@@ -9,7 +9,7 @@ use std::{
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sourcery::{
-    Aggregate, Apply, DomainEvent, Handle, Repository,
+    Aggregate, Apply, Create, DomainEvent, Handle, HandleCreate, Repository,
     repository::CommandError,
     snapshot::{
         OfferSnapshotError, Snapshot, SnapshotOffer, SnapshotStore,
@@ -37,6 +37,7 @@ impl sourcery::DomainEvent for ValueAdded {
     id = String,
     error = String,
     events(ValueAdded),
+    create(ValueAdded),
     derives(Debug, PartialEq, Eq)
 )]
 struct Counter {
@@ -49,12 +50,86 @@ impl Apply<ValueAdded> for Counter {
     }
 }
 
+impl Create<ValueAdded> for Counter {
+    fn create(event: &ValueAdded) -> Self {
+        let mut this = Self::default();
+        <Self as Apply<ValueAdded>>::apply(&mut this, event);
+        this
+    }
+}
+
 struct AddValue {
     amount: i32,
 }
 
+struct AddValueNonSync {
+    amount: i32,
+    _marker: std::rc::Rc<()>,
+}
+
+impl AddValueNonSync {
+    fn new(amount: i32) -> Self {
+        Self {
+            amount,
+            _marker: std::rc::Rc::new(()),
+        }
+    }
+}
+
 impl Handle<AddValue> for Counter {
+    type HandleError = Self::Error;
+
     fn handle(&self, command: &AddValue) -> Result<Vec<Self::Event>, Self::Error> {
+        if command.amount <= 0 {
+            return Err("amount must be positive".to_string());
+        }
+        Ok(vec![
+            ValueAdded {
+                amount: command.amount,
+            }
+            .into(),
+        ])
+    }
+}
+
+impl HandleCreate<AddValue> for Counter {
+    type HandleCreateError = Self::Error;
+
+    fn handle_create(command: &AddValue) -> Result<Vec<Self::Event>, Self::HandleCreateError> {
+        if command.amount <= 0 {
+            return Err("amount must be positive".to_string());
+        }
+        Ok(vec![
+            ValueAdded {
+                amount: command.amount,
+            }
+            .into(),
+        ])
+    }
+}
+
+impl Handle<AddValueNonSync> for Counter {
+    type HandleError = Self::Error;
+
+    fn handle(&self, command: &AddValueNonSync) -> Result<Vec<Self::Event>, Self::Error> {
+        if command.amount <= 0 {
+            return Err("amount must be positive".to_string());
+        }
+        Ok(vec![
+            ValueAdded {
+                amount: command.amount,
+            }
+            .into(),
+        ])
+    }
+}
+
+impl HandleCreate<AddValueNonSync> for Counter {
+    type HandleCreateError = Self::Error;
+
+    fn handle_create(
+        command: &AddValueNonSync,
+    ) -> Result<Vec<Self::Event>, Self::HandleCreateError> {
         if command.amount <= 0 {
             return Err("amount must be positive".to_string());
         }
@@ -70,7 +145,17 @@ impl Handle<AddValue> for Counter {
 struct NoOp;
 
 impl Handle<NoOp> for Counter {
+    type HandleError = Self::Error;
+
     fn handle(&self, _: &NoOp) -> Result<Vec<Self::Event>, Self::Error> {
+        Ok(vec![])
+    }
+}
+
+impl HandleCreate<NoOp> for Counter {
+    type HandleCreateError = Self::Error;
+
+    fn handle_create(_: &NoOp) -> Result<Vec<Self::Event>, Self::HandleCreateError> {
         Ok(vec![])
     }
 }
@@ -80,6 +165,8 @@ struct RequireAtLeast {
 }
 
 impl Handle<RequireAtLeast> for Counter {
+    type HandleError = Self::Error;
+
     fn handle(&self, command: &RequireAtLeast) -> Result<Vec<Self::Event>, Self::Error> {
         if self.value < command.min {
             return Err("insufficient value".to_string());
@@ -226,7 +313,7 @@ async fn saves_snapshot_and_exposes_snapshot_store() {
         .without_concurrency_checking();
 
     let id = "c1".to_string();
-    repo.execute_command::<Counter, AddValue>(&id, &AddValue { amount: 5 }, &())
+    repo.create::<Counter, AddValue>(&id, &AddValue { amount: 5 }, &())
         .await
         .unwrap();
 
@@ -247,9 +334,7 @@ async fn no_events_does_not_persist_or_snapshot() {
         .without_concurrency_checking();
 
     let id = "c1".to_string();
-    repo.execute_command::<Counter, NoOp>(&id, &NoOp, &())
-        .await
-        .unwrap();
+    repo.create::<Counter, NoOp>(&id, &NoOp, &()).await.unwrap();
 
     assert!(
         repo.event_store()
@@ -275,11 +360,11 @@ async fn snapshot_load_failure_falls_back_to_full_replay() {
         .without_concurrency_checking();
 
     let id = "c1".to_string();
-    repo.execute_command::<Counter, AddValue>(&id, &AddValue { amount: 10 }, &())
+    repo.create::<Counter, AddValue>(&id, &AddValue { amount: 10 }, &())
         .await
         .unwrap();
 
-    repo.execute_command::<Counter, RequireAtLeast>(&id, &RequireAtLeast { min: 5 }, &())
+    repo.update::<Counter, RequireAtLeast>(&id, &RequireAtLeast { min: 5 }, &())
         .await
         .unwrap();
 }
@@ -291,7 +376,7 @@ async fn corrupt_snapshot_ignores_error() {
         .with_snapshots(CorruptSnapshotStore)
         .without_concurrency_checking();
 
-    repo.execute_command::<Counter, AddValue>(&"c1".to_string(), &AddValue { amount: 1 }, &())
+    repo.create::<Counter, AddValue>(&"c1".to_string(), &AddValue { amount: 1 }, &())
         .await
         .unwrap();
 }
@@ -300,9 +385,14 @@ async fn corrupt_snapshot_ignores_error() {
 async fn retry_with_zero_retries_still_attempts_once() {
     let store = inmemory::Store::new();
     let repo = Repository::new(store);
+    let id = "c1".to_string();
+
+    repo.create::<Counter, AddValue>(&id, &AddValue { amount: 1 }, &())
+        .await
+        .unwrap();
 
     let attempts = repo
-        .execute_with_retry::<Counter, AddValue>(&"c1".to_string(), &AddValue { amount: 1 }, &(), 0)
+        .update_with_retry::<Counter, AddValue>(&id, &AddValue { amount: 1 }, &(), 0)
         .await
         .unwrap();
 
@@ -313,13 +403,50 @@ async fn retry_with_zero_retries_still_attempts_once() {
 async fn retry_surfaces_non_concurrency_errors() {
     let store = inmemory::Store::new();
     let repo = Repository::new(store);
+    let id = "c1".to_string();
+
+    repo.create::<Counter, AddValue>(&id, &AddValue { amount: 1 }, &())
+        .await
+        .unwrap();
 
     let err = repo
-        .execute_with_retry::<Counter, AddValue>(&"c1".to_string(), &AddValue { amount: 0 }, &(), 3)
+        .update_with_retry::<Counter, AddValue>(&id, &AddValue { amount: 0 }, &(), 3)
         .await
         .unwrap_err();
 
     assert!(matches!(err, CommandError::Aggregate(_)));
+}
+
+#[tokio::test]
+async fn upsert_creates_when_stream_does_not_exist() {
+    let store = inmemory::Store::new();
+    let repo = Repository::new(store).without_concurrency_checking();
+    let id = "c1".to_string();
+
+    repo.upsert::<Counter, AddValue>(&id, &AddValue { amount: 5 }, &())
+        .await
+        .unwrap();
+
+    let counter: Counter = repo.load(&id).await.unwrap().expect("counter should exist");
+    assert_eq!(counter.value, 5);
+}
+
+#[tokio::test]
+async fn upsert_updates_when_stream_already_exists() {
+    let store = inmemory::Store::new();
+    let repo = Repository::new(store).without_concurrency_checking();
+    let id = "c1".to_string();
+
+    repo.create::<Counter, AddValue>(&id, &AddValue { amount: 3 }, &())
+        .await
+        .unwrap();
+
+    repo.upsert::<Counter, AddValue>(&id, &AddValue { amount: 7 }, &())
+        .await
+        .unwrap();
+
+    let counter: Counter = repo.load(&id).await.unwrap().expect("counter should exist");
+    assert_eq!(counter.value, 10);
 }
 
 #[tokio::test]
@@ -328,8 +455,44 @@ async fn load_consults_snapshot_store() {
     let snapshots = TrackingSnapshotStore::new();
     let repo = Repository::new(store).with_snapshots(snapshots);
 
-    let counter: Counter = repo.load(&"c1".to_string()).await.unwrap();
+    // No events have been committed, so load returns None.
+    let counter: Option<Counter> = repo.load(&"c1".to_string()).await.unwrap();
 
-    assert_eq!(counter.value, 0);
+    assert!(counter.is_none());
     assert!(repo.snapshot_store().load_called());
+}
+
+#[tokio::test]
+async fn repository_commands_accept_non_sync_commands() {
+    let id = "c1".to_string();
+
+    let store = inmemory::Store::new();
+    let repo = Repository::new(store).without_concurrency_checking();
+
+    let create_command = AddValueNonSync::new(5);
+    repo.create::<Counter, AddValueNonSync>(&id, &create_command, &())
+        .await
+        .unwrap();
+
+    let update_command = AddValueNonSync::new(7);
+    repo.update::<Counter, AddValueNonSync>(&id, &update_command, &())
+        .await
+        .unwrap();
+
+    let upsert_command = AddValueNonSync::new(11);
+    repo.upsert::<Counter, AddValueNonSync>(&id, &upsert_command, &())
+        .await
+        .unwrap();
+
+    let store = inmemory::Store::new();
+    let repo = Repository::new(store);
+    repo.create::<Counter, AddValueNonSync>(&id, &AddValueNonSync::new(1), &())
+        .await
+        .unwrap();
+
+    let attempts = repo
+        .update_with_retry::<Counter, AddValueNonSync>(&id, &AddValueNonSync::new(1), &(), 0)
+        .await
+        .unwrap();
+    assert_eq!(attempts, 1);
 }

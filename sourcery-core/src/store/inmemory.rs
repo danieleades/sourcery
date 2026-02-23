@@ -149,26 +149,8 @@ where
             }
 
             let mut inner = self.inner.write().expect("in-memory store lock poisoned");
-            let stream_key = StreamKey::new(aggregate_kind, aggregate_id.clone());
-            let mut last_position = 0;
-            let mut stored = Vec::with_capacity(staged.len());
-
-            for (kind, data) in staged {
-                let position = inner.next_position;
-                inner.next_position += 1;
-                last_position = position;
-                stored.push(StoredEvent {
-                    aggregate_kind: aggregate_kind.to_string(),
-                    aggregate_id: aggregate_id.clone(),
-                    kind,
-                    position,
-                    data,
-                    metadata: metadata.clone(),
-                });
-            }
-
-            inner.streams.entry(stream_key).or_default().extend(stored);
-            let notify_tx = inner.notify_tx.clone();
+            let (last_position, notify_tx) =
+                commit_staged(&mut inner, aggregate_kind, aggregate_id, staged, metadata);
             drop(inner);
             // Notify subscribers of the new position (ignore send errors -- no
             // receivers is fine)
@@ -243,25 +225,8 @@ where
                 }
             }
 
-            let mut last_position = 0;
-            let mut stored = Vec::with_capacity(staged.len());
-
-            for (kind, data) in staged {
-                let position = inner.next_position;
-                inner.next_position += 1;
-                last_position = position;
-                stored.push(StoredEvent {
-                    aggregate_kind: aggregate_kind.to_string(),
-                    aggregate_id: aggregate_id.clone(),
-                    kind,
-                    position,
-                    data,
-                    metadata: metadata.clone(),
-                });
-            }
-
-            inner.streams.entry(stream_key).or_default().extend(stored);
-            let notify_tx = inner.notify_tx.clone();
+            let (last_position, notify_tx) =
+                commit_staged(&mut inner, aggregate_kind, aggregate_id, staged, metadata);
             drop(inner);
             let _ = notify_tx.send(last_position);
             tracing::debug!(
@@ -358,59 +323,64 @@ where
                 yield Ok(event);
             }
 
-            // 2. Process live events from broadcast
-            loop {
-                match rx.recv().await {
-                    Ok(notified_position) => {
-                        // Skip positions we've already seen
-                        if let Some(ref lp) = last_position
-                            && notified_position <= *lp
-                        {
-                            continue;
-                        }
+            // 2. Process live events from broadcast; stop when the store is dropped.
+            while let Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) = rx.recv().await {
+                let events = {
+                    let guard = inner.read().expect("in-memory store lock poisoned");
+                    load_matching_events(&guard, &filters)
+                };
 
-                        // Load the event at this position and check filters
-                        let events = {
-                            let guard = inner.read().expect("in-memory store lock poisoned");
-                            load_matching_events(&guard, &filters)
-                        };
-
-                        for event in events {
-                            if let Some(ref lp) = last_position
-                                && event.position <= *lp
-                            {
-                                continue;
-                            }
-                            last_position = Some(event.position);
-                            yield Ok(event);
-                        }
+                for event in events {
+                    if let Some(ref lp) = last_position
+                        && event.position <= *lp
+                    {
+                        continue;
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                        // We missed some notifications. Re-load from our last
-                        // known position to catch up.
-                        let events = {
-                            let guard = inner.read().expect("in-memory store lock poisoned");
-                            load_matching_events(&guard, &filters)
-                        };
-
-                        for event in events {
-                            if let Some(ref lp) = last_position
-                                && event.position <= *lp
-                            {
-                                continue;
-                            }
-                            last_position = Some(event.position);
-                            yield Ok(event);
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Closed) => {
-                        // Store dropped, end stream
-                        break;
-                    }
+                    last_position = Some(event.position);
+                    yield Ok(event);
                 }
             }
         })
     }
+}
+
+/// Append a batch of pre-serialised events to the store, assigning positions.
+///
+/// The caller must hold the write lock and pass `&mut *inner`. The function
+/// clones `notify_tx` before returning so the caller can drop the lock and
+/// then send the notification outside of the critical section.
+fn commit_staged<Id, M>(
+    inner: &mut Inner<Id, M>,
+    aggregate_kind: &str,
+    aggregate_id: &Id,
+    staged: Vec<(String, serde_json::Value)>,
+    metadata: &M,
+) -> (u64, broadcast::Sender<u64>)
+where
+    Id: Clone + Eq + std::hash::Hash,
+    M: Clone,
+{
+    let stream_key = StreamKey::new(aggregate_kind, aggregate_id.clone());
+    let mut last_position = 0;
+    let mut stored = Vec::with_capacity(staged.len());
+
+    for (kind, data) in staged {
+        let position = inner.next_position;
+        inner.next_position += 1;
+        last_position = position;
+        stored.push(StoredEvent {
+            aggregate_kind: aggregate_kind.to_string(),
+            aggregate_id: aggregate_id.clone(),
+            kind,
+            position,
+            data,
+            metadata: metadata.clone(),
+        });
+    }
+
+    inner.streams.entry(stream_key).or_default().extend(stored);
+    let notify_tx = inner.notify_tx.clone();
+    (last_position, notify_tx)
 }
 
 /// Load all events matching the given filters, sorted by position.

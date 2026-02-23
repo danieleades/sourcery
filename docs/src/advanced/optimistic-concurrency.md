@@ -37,15 +37,18 @@ The two concurrency strategies use different error types:
 | `Optimistic` (default) | `CommandError` | Yes |
 | `Unchecked` | `CommandError` | No (Concurrency = `Infallible`) |
 
-When using optimistic concurrency, `execute_command` returns
+When using optimistic concurrency, `update` returns
 `CommandError::Concurrency(conflict)` if the stream version changed between
 loading and committing:
 
 ```rust,ignore
 use sourcery::repository::CommandError;
 
+// Ensure stream exists first
+repo.create::<MyAggregate, CreateCommand>(&id, &create, &metadata).await?;
+
 match repo
-    .execute_command::<MyAggregate, MyCommand>(&id, &command, &metadata)
+    .update::<MyAggregate, MyCommand>(&id, &command, &metadata)
     .await
 {
     Ok(()) => println!("Success!"),
@@ -64,15 +67,18 @@ match repo
 
 The most common pattern for handling conflicts is to **retry** the operation.
 
-The repository provides a helper for this: `execute_with_retry`.
+The repository provides a helper for this: `update_with_retry`.
 
 ```rust,ignore
 use sourcery::repository::RetryResult;
 
 let attempts: RetryResult<MyAggregate, MyStore> =
-    repo.execute_with_retry::<MyAggregate, MyCommand>(&id, &command, &metadata, 3).await?;
+    repo.update_with_retry::<MyAggregate, MyCommand>(&id, &command, &metadata, 3).await?;
 println!("Succeeded after {attempts} attempt(s)");
 ```
+
+`update_with_retry` retries existing-stream commands. Use `create` for
+the initial command.
 
 Each retry loads fresh state from the event store, so business rules are always validated
 against the current aggregate state.

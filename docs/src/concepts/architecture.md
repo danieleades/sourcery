@@ -52,7 +52,7 @@ Store: EventStore
 Agg: Aggregate
 Snap: SnapshotStore
 
-App -> Repo: "execute_command(id, cmd, meta)"
+App -> Repo: "create/update(id, cmd, meta)"
 Repo -> Snap: "load(id)?"
 Snap -> Repo: "Optional snapshot" {style.stroke-dash: 3}
 Repo -> Store: "load_events(filters)"

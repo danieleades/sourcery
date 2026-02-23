@@ -4,7 +4,7 @@
 #[cfg(feature = "test-util")]
 mod with_test_util {
     use serde::{Deserialize, Serialize};
-    use sourcery::{Aggregate, Apply, DomainEvent, Handle, test::TestFramework};
+    use sourcery::{Aggregate, Apply, Create, DomainEvent, Handle, test::TestFramework};
 
     // ============================================================================
     // Test Domain: Bank Account
@@ -42,6 +42,7 @@ mod with_test_util {
         id = String,
         error = String,
         events(AccountOpened, MoneyDeposited, MoneyWithdrawn),
+        create(AccountOpened),
         derives(Debug, PartialEq)
     )]
     struct BankAccount {
@@ -53,6 +54,15 @@ mod with_test_util {
         fn apply(&mut self, event: &AccountOpened) {
             self.is_open = true;
             self.balance = event.initial_balance;
+        }
+    }
+
+    impl Create<AccountOpened> for BankAccount {
+        fn create(event: &AccountOpened) -> Self {
+            Self {
+                balance: event.initial_balance,
+                is_open: true,
+            }
         }
     }
 
@@ -82,6 +92,8 @@ mod with_test_util {
     }
 
     impl Handle<OpenAccount> for BankAccount {
+        type HandleError = Self::Error;
+
         fn handle(&self, command: &OpenAccount) -> Result<Vec<Self::Event>, Self::Error> {
             if self.is_open {
                 return Err("account already open".to_string());
@@ -96,6 +108,8 @@ mod with_test_util {
     }
 
     impl Handle<Deposit> for BankAccount {
+        type HandleError = Self::Error;
+
         fn handle(&self, command: &Deposit) -> Result<Vec<Self::Event>, Self::Error> {
             if !self.is_open {
                 return Err("account not open".to_string());
@@ -113,6 +127,8 @@ mod with_test_util {
     }
 
     impl Handle<Withdraw> for BankAccount {
+        type HandleError = Self::Error;
+
         fn handle(&self, command: &Withdraw) -> Result<Vec<Self::Event>, Self::Error> {
             if !self.is_open {
                 return Err("account not open".to_string());

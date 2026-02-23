@@ -41,13 +41,16 @@ let metadata = EventMetadata {
     timestamp: Utc::now(),
 };
 
-repository.execute_command::<Account, Deposit>(
+repository.update::<Account, Deposit>(
     &account_id,
     &Deposit { amount: 100 },
     &metadata,
 )
 .await?;
 ```
+
+Use `create` when creating a new stream for the first time. Use
+`update` for commands on an existing stream, or `upsert` for commands that work on both.
 
 Each event produced by the command receives this metadata.
 
@@ -108,7 +111,7 @@ If you don't need metadata, use `()`:
 let store: inmemory::Store<String, ()> = inmemory::Store::new();
 
 repository
-    .execute_command::<Account, Deposit>(&id, &cmd, &())
+    .create::<Account, OpenAccount>(&id, &OpenAccount { initial_balance: 0 }, &())
     .await?;
 ```
 

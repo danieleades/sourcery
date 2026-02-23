@@ -17,7 +17,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use sourcery::{
-    Aggregate, Apply, ApplyProjection, DomainEvent, Handle, Repository,
+    Aggregate, Apply, ApplyProjection, Create, DomainEvent, Handle, HandleCreate, Repository,
     snapshot::inmemory::Store as InMemorySnapshotStore, store::inmemory,
 };
 
@@ -60,12 +60,21 @@ impl DomainEvent for PointsRedeemed {
     id = String,
     error = String,
     events(PointsEarned, PointsRedeemed),
+    create(PointsEarned),
     derives(Debug, PartialEq, Eq)
 )]
 pub struct LoyaltyAccount {
     points: u64,
     lifetime_earned: u64,
     lifetime_redeemed: u64,
+}
+
+impl Create<PointsEarned> for LoyaltyAccount {
+    fn create(event: &PointsEarned) -> Self {
+        let mut this = Self::default();
+        <Self as Apply<PointsEarned>>::apply(&mut this, event);
+        this
+    }
 }
 
 impl LoyaltyAccount {
@@ -114,6 +123,8 @@ pub struct RedeemPoints {
 }
 
 impl Handle<EarnPoints> for LoyaltyAccount {
+    type HandleError = Self::Error;
+
     fn handle(&self, command: &EarnPoints) -> Result<Vec<Self::Event>, Self::Error> {
         if command.amount == 0 {
             return Err("Cannot earn zero points".to_string());
@@ -128,7 +139,26 @@ impl Handle<EarnPoints> for LoyaltyAccount {
     }
 }
 
+impl HandleCreate<EarnPoints> for LoyaltyAccount {
+    type HandleCreateError = Self::Error;
+
+    fn handle_create(command: &EarnPoints) -> Result<Vec<Self::Event>, Self::HandleCreateError> {
+        if command.amount == 0 {
+            return Err("Cannot earn zero points".to_string());
+        }
+        Ok(vec![
+            PointsEarned {
+                amount: command.amount,
+                reason: command.reason.clone(),
+            }
+            .into(),
+        ])
+    }
+}
+
 impl Handle<RedeemPoints> for LoyaltyAccount {
+    type HandleError = Self::Error;
+
     fn handle(&self, command: &RedeemPoints) -> Result<Vec<Self::Event>, Self::Error> {
         if command.amount > self.points {
             return Err(format!(
@@ -197,18 +227,33 @@ async fn run_repository_without_snapshots() -> ExampleResult {
     let customer_id = "CUST-001".to_string();
 
     for i in 1..=10 {
-        repo.execute_command::<LoyaltyAccount, EarnPoints>(
-            &customer_id,
-            &EarnPoints {
-                amount: 100,
-                reason: format!("Purchase #{i}"),
-            },
-            &(),
-        )
-        .await?;
+        if i == 1 {
+            repo.create::<LoyaltyAccount, EarnPoints>(
+                &customer_id,
+                &EarnPoints {
+                    amount: 100,
+                    reason: format!("Purchase #{i}"),
+                },
+                &(),
+            )
+            .await?;
+        } else {
+            repo.update::<LoyaltyAccount, EarnPoints>(
+                &customer_id,
+                &EarnPoints {
+                    amount: 100,
+                    reason: format!("Purchase #{i}"),
+                },
+                &(),
+            )
+            .await?;
+        }
     }
 
-    let account: LoyaltyAccount = repo.load(&customer_id).await?;
+    let account: LoyaltyAccount = repo
+        .load(&customer_id)
+        .await?
+        .expect("account exists after earning points");
     println!(
         "   Points balance: {} (replayed 10 events)",
         account.points()
@@ -227,19 +272,34 @@ async fn run_always_snapshot_policy() -> ExampleResult {
     let customer_id = "CUST-002".to_string();
 
     for i in 1..=5 {
-        repo.execute_command::<LoyaltyAccount, EarnPoints>(
-            &customer_id,
-            &EarnPoints {
-                amount: 200,
-                reason: format!("Purchase #{i}"),
-            },
-            &(),
-        )
-        .await?;
+        if i == 1 {
+            repo.create::<LoyaltyAccount, EarnPoints>(
+                &customer_id,
+                &EarnPoints {
+                    amount: 200,
+                    reason: format!("Purchase #{i}"),
+                },
+                &(),
+            )
+            .await?;
+        } else {
+            repo.update::<LoyaltyAccount, EarnPoints>(
+                &customer_id,
+                &EarnPoints {
+                    amount: 200,
+                    reason: format!("Purchase #{i}"),
+                },
+                &(),
+            )
+            .await?;
+        }
         println!("   After purchase #{i}: snapshot saved");
     }
 
-    let account: LoyaltyAccount = repo.load(&customer_id).await?;
+    let account: LoyaltyAccount = repo
+        .load(&customer_id)
+        .await?
+        .expect("account exists after earning points");
     println!(
         "   Final points: {} (loaded from snapshot + 0 events)",
         account.points()
@@ -258,21 +318,36 @@ async fn run_every_n_snapshot_policy() -> ExampleResult {
     let customer_id = "CUST-003".to_string();
 
     for i in 1..=12 {
-        repo.execute_command::<LoyaltyAccount, EarnPoints>(
-            &customer_id,
-            &EarnPoints {
-                amount: 50,
-                reason: format!("Purchase #{i}"),
-            },
-            &(),
-        )
-        .await?;
+        if i == 1 {
+            repo.create::<LoyaltyAccount, EarnPoints>(
+                &customer_id,
+                &EarnPoints {
+                    amount: 50,
+                    reason: format!("Purchase #{i}"),
+                },
+                &(),
+            )
+            .await?;
+        } else {
+            repo.update::<LoyaltyAccount, EarnPoints>(
+                &customer_id,
+                &EarnPoints {
+                    amount: 50,
+                    reason: format!("Purchase #{i}"),
+                },
+                &(),
+            )
+            .await?;
+        }
     }
 
     // With 12 events and snapshots every 5:
     // - Snapshot at position ~5 or ~10 (depending on when threshold triggered)
     // - Remaining events replayed
-    let account: LoyaltyAccount = repo.load(&customer_id).await?;
+    let account: LoyaltyAccount = repo
+        .load(&customer_id)
+        .await?
+        .expect("account exists after earning points");
     println!(
         "   Points balance: {} (12 events, snapshots every 5)",
         account.points()
@@ -292,21 +367,36 @@ async fn run_snapshot_restoration() -> ExampleResult {
     let customer_id = "CUST-004".to_string();
 
     for i in 1..=5 {
-        repo.execute_command::<LoyaltyAccount, EarnPoints>(
-            &customer_id,
-            &EarnPoints {
-                amount: 100,
-                reason: format!("Earning #{i}"),
-            },
-            &(),
-        )
-        .await?;
+        if i == 1 {
+            repo.create::<LoyaltyAccount, EarnPoints>(
+                &customer_id,
+                &EarnPoints {
+                    amount: 100,
+                    reason: format!("Earning #{i}"),
+                },
+                &(),
+            )
+            .await?;
+        } else {
+            repo.update::<LoyaltyAccount, EarnPoints>(
+                &customer_id,
+                &EarnPoints {
+                    amount: 100,
+                    reason: format!("Earning #{i}"),
+                },
+                &(),
+            )
+            .await?;
+        }
     }
 
-    let account: LoyaltyAccount = repo.load(&customer_id).await?;
+    let account: LoyaltyAccount = repo
+        .load(&customer_id)
+        .await?
+        .expect("account exists after earning points");
     println!("   After 5 earnings: {} points", account.points());
 
-    repo.execute_command::<LoyaltyAccount, RedeemPoints>(
+    repo.update::<LoyaltyAccount, RedeemPoints>(
         &customer_id,
         &RedeemPoints {
             amount: 200,
@@ -316,7 +406,10 @@ async fn run_snapshot_restoration() -> ExampleResult {
     )
     .await?;
 
-    let account: LoyaltyAccount = repo.load(&customer_id).await?;
+    let account: LoyaltyAccount = repo
+        .load(&customer_id)
+        .await?
+        .expect("account exists after redemption");
     println!("   After redemption: {} points", account.points());
     println!("   Lifetime earned: {}", account.lifetime_earned());
     println!("   Lifetime redeemed: {}", account.lifetime_redeemed());
@@ -334,18 +427,33 @@ async fn run_never_snapshot_policy() -> ExampleResult {
     let customer_id = "CUST-005".to_string();
 
     for i in 1..=3 {
-        repo.execute_command::<LoyaltyAccount, EarnPoints>(
-            &customer_id,
-            &EarnPoints {
-                amount: 100,
-                reason: format!("Purchase #{i}"),
-            },
-            &(),
-        )
-        .await?;
+        if i == 1 {
+            repo.create::<LoyaltyAccount, EarnPoints>(
+                &customer_id,
+                &EarnPoints {
+                    amount: 100,
+                    reason: format!("Purchase #{i}"),
+                },
+                &(),
+            )
+            .await?;
+        } else {
+            repo.update::<LoyaltyAccount, EarnPoints>(
+                &customer_id,
+                &EarnPoints {
+                    amount: 100,
+                    reason: format!("Purchase #{i}"),
+                },
+                &(),
+            )
+            .await?;
+        }
     }
 
-    let account: LoyaltyAccount = repo.load(&customer_id).await?;
+    let account: LoyaltyAccount = repo
+        .load(&customer_id)
+        .await?
+        .expect("account exists after earning points");
     println!(
         "   Points: {} (full replay, no snapshots saved)",
         account.points()
@@ -366,7 +474,7 @@ async fn run_projection_snapshotting() -> ExampleResult {
     let customer_a = "CUST-P1".to_string();
     let customer_b = "CUST-P2".to_string();
 
-    repo.execute_command::<LoyaltyAccount, EarnPoints>(
+    repo.create::<LoyaltyAccount, EarnPoints>(
         &customer_a,
         &EarnPoints {
             amount: 120,
@@ -375,7 +483,7 @@ async fn run_projection_snapshotting() -> ExampleResult {
         &(),
     )
     .await?;
-    repo.execute_command::<LoyaltyAccount, EarnPoints>(
+    repo.create::<LoyaltyAccount, EarnPoints>(
         &customer_b,
         &EarnPoints {
             amount: 75,
@@ -384,7 +492,7 @@ async fn run_projection_snapshotting() -> ExampleResult {
         &(),
     )
     .await?;
-    repo.execute_command::<LoyaltyAccount, RedeemPoints>(
+    repo.update::<LoyaltyAccount, RedeemPoints>(
         &customer_a,
         &RedeemPoints {
             amount: 50,

@@ -13,7 +13,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use sourcery::{
-    Aggregate, Apply, ApplyProjection, DomainEvent, Filters, ProjectionFilters, Repository,
+    Aggregate, Apply, ApplyProjection, Create, DomainEvent, Filters, ProjectionFilters, Repository,
     store::{EventStore, inmemory},
     test::RepositoryTestExt,
 };
@@ -23,7 +23,7 @@ use sourcery::{
 // =============================================================================
 
 #[derive(Default, Serialize, Deserialize, Aggregate)]
-#[aggregate(id = String, error = String, events(ProductRestocked, InventoryAdjusted))]
+#[aggregate(id = String, error = String, events(ProductRestocked, InventoryAdjusted), create(ProductRestocked))]
 struct Product;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -54,8 +54,14 @@ impl Apply<InventoryAdjusted> for Product {
     fn apply(&mut self, _event: &InventoryAdjusted) {}
 }
 
+impl Create<ProductRestocked> for Product {
+    fn create(_event: &ProductRestocked) -> Self {
+        Self
+    }
+}
+
 #[derive(Default, Serialize, Deserialize, Aggregate)]
-#[aggregate(id = String, error = String, events(SaleCompleted))]
+#[aggregate(id = String, error = String, events(SaleCompleted), create(SaleCompleted))]
 struct Sale;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -73,8 +79,14 @@ impl Apply<SaleCompleted> for Sale {
     fn apply(&mut self, _event: &SaleCompleted) {}
 }
 
+impl Create<SaleCompleted> for Sale {
+    fn create(_event: &SaleCompleted) -> Self {
+        Self
+    }
+}
+
 #[derive(Default, Serialize, Deserialize, Aggregate)]
-#[aggregate(id = String, error = String, events(PromotionApplied))]
+#[aggregate(id = String, error = String, events(PromotionApplied), create(PromotionApplied))]
 struct Promotion;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -90,6 +102,12 @@ impl DomainEvent for PromotionApplied {
 
 impl Apply<PromotionApplied> for Promotion {
     fn apply(&mut self, _event: &PromotionApplied) {}
+}
+
+impl Create<PromotionApplied> for Promotion {
+    fn create(_event: &PromotionApplied) -> Self {
+        Self
+    }
 }
 
 // =============================================================================
