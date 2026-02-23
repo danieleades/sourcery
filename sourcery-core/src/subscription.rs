@@ -10,16 +10,21 @@
 //! A subscription:
 //! 1. Replays historical events (catch-up phase)
 //! 2. Transitions to processing live events as they are committed
-//! 3. Fires callbacks on each update
+//! 3. Yields projection updates via a stream
 //!
 //! # Example
 //!
 //! ```ignore
-//! let subscription = repository
+//! use tokio_stream::StreamExt as _;
+//!
+//! let mut subscription = repository
 //!     .subscribe::<Dashboard>(())
-//!     .on_update(|dashboard| println!("{dashboard:?}"))
 //!     .start()
 //!     .await?;
+//!
+//! if let Some(dashboard) = subscription.next().await {
+//!     println!("{dashboard:?}");
+//! }
 //!
 //! // Later, shut down gracefully
 //! subscription.stop().await?;
@@ -27,7 +32,11 @@
 //!
 //! [`Repository::load_projection`]: crate::repository::Repository::load_projection
 
-use std::{collections::HashMap, pin::Pin};
+use std::{
+    collections::HashMap,
+    pin::Pin,
+    task::{Context, Poll},
+};
 
 use futures_core::Stream;
 use serde::{Serialize, de::DeserializeOwned};
@@ -174,16 +183,58 @@ where
     }
 }
 
-/// Type alias for the update callback.
-type UpdateCallback<P> = Box<dyn Fn(&P) + Send + Sync + 'static>;
+/// Stream-first subscription handle that yields projection snapshots.
+///
+/// Each `Stream` item is the projection state after one event has been applied.
+/// Consume updates with `StreamExt::next()`, and call [`stop()`] for graceful
+/// shutdown.
+///
+/// [`stop()`]: Self::stop
+pub struct Subscription<P, StoreError>
+where
+    StoreError: std::error::Error + 'static,
+{
+    updates: tokio::sync::mpsc::UnboundedReceiver<P>,
+    handle: SubscriptionHandle<StoreError>,
+}
+
+impl<P, StoreError> Subscription<P, StoreError>
+where
+    StoreError: std::error::Error + 'static,
+{
+    /// Stop the subscription gracefully and wait for it to finish.
+    ///
+    /// # Errors
+    ///
+    /// Returns the subscription's error if it failed before being stopped.
+    pub async fn stop(self) -> Result<(), SubscriptionError<StoreError>> {
+        self.handle.stop().await
+    }
+
+    /// Check if the subscription task is still running.
+    #[must_use]
+    pub fn is_running(&self) -> bool {
+        self.handle.is_running()
+    }
+}
+
+impl<P, StoreError> Stream for Subscription<P, StoreError>
+where
+    StoreError: std::error::Error + 'static,
+{
+    type Item = P;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.updates.poll_recv(cx)
+    }
+}
 
 /// Builder for configuring and starting a subscription.
 ///
-/// Created via [`Repository::subscribe()`]. Use [`on_update()`] to register
-/// callbacks, then call [`start()`] to begin processing events.
+/// Created via [`Repository::subscribe()`]. Call [`start()`] to begin
+/// processing events and obtain a stream of projection updates.
 ///
 /// [`Repository::subscribe()`]: crate::repository::Repository::subscribe
-/// [`on_update()`]: SubscriptionBuilder::on_update
 /// [`start()`]: SubscriptionBuilder::start
 pub struct SubscriptionBuilder<S, P, SS>
 where
@@ -193,7 +244,6 @@ where
     store: S,
     snapshots: SS,
     instance_id: P::InstanceId,
-    on_update: Option<UpdateCallback<P>>,
 }
 
 impl<S, P, SS> SubscriptionBuilder<S, P, SS>
@@ -212,27 +262,14 @@ where
     P::Metadata: Send,
     SS: SnapshotStore<P::InstanceId, Position = S::Position> + Send + Sync + 'static,
 {
-    pub(crate) fn new(store: S, snapshots: SS, instance_id: P::InstanceId) -> Self {
+    /// Create a builder. Called internally by [`Repository::subscribe`] and
+    /// [`Repository::subscribe_with_snapshots`].
+    pub(crate) const fn new(store: S, snapshots: SS, instance_id: P::InstanceId) -> Self {
         Self {
             store,
             snapshots,
             instance_id,
-            on_update: None,
         }
-    }
-
-    /// Register a callback invoked after each event is applied.
-    ///
-    /// Callbacks must complete quickly. Long-running work should be dispatched
-    /// to a separate task via a channel. Blocking the callback stalls the
-    /// subscription loop and delays event processing.
-    #[must_use]
-    pub fn on_update<F>(mut self, callback: F) -> Self
-    where
-        F: Fn(&P) + Send + Sync + 'static,
-    {
-        self.on_update = Some(Box::new(callback));
-        self
     }
 
     /// Start the subscription.
@@ -244,19 +281,28 @@ where
     /// 2. Subscribes to the event stream from the snapshot position
     /// 3. Replays historical events (catch-up phase)
     /// 4. Waits until catch-up is complete
-    /// 5. Continues processing live events and firing `on_update`
+    /// 5. Continues processing live events and yielding projection updates
     ///
     /// # Errors
     ///
     /// Returns an error if the initial snapshot load or stream setup fails.
+    ///
+    /// # Type Requirements
+    ///
+    /// `P` must implement [`Clone`] because each stream item yields an owned
+    /// snapshot of the projection state.
     #[allow(clippy::too_many_lines)]
-    pub async fn start(self) -> Result<SubscriptionHandle<S::Error>, SubscriptionError<S::Error>> {
+    pub async fn start(self) -> Result<Subscription<P, S::Error>, SubscriptionError<S::Error>>
+    where
+        P: Clone,
+    {
         let Self {
             store,
             snapshots,
             instance_id,
-            on_update,
         } = self;
+
+        let (update_tx, update_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let (mut projection, snapshot_position) =
             load_snapshot::<P, SS>(&snapshots, &instance_id).await;
@@ -282,7 +328,7 @@ where
                 stored,
                 &handlers,
                 &store,
-                on_update.as_ref(),
+                &update_tx,
                 &mut last_position,
                 &mut events_since_snapshot,
             )?;
@@ -367,7 +413,7 @@ where
                             &stored,
                             &handlers,
                             &store,
-                            on_update.as_ref(),
+                            &update_tx,
                             &mut last_position,
                             &mut events_since_snapshot,
                         )?;
@@ -414,9 +460,12 @@ where
         });
 
         match ready_rx.await {
-            Ok(()) => Ok(SubscriptionHandle {
-                stop_tx: Some(stop_tx),
-                task: Some(task),
+            Ok(()) => Ok(Subscription {
+                updates: update_rx,
+                handle: SubscriptionHandle {
+                    stop_tx: Some(stop_tx),
+                    task: Some(task),
+                },
             }),
             Err(_) => match task.await {
                 Ok(Ok(())) => Err(SubscriptionError::CatchupInterrupted),
@@ -427,6 +476,10 @@ where
     }
 }
 
+/// Load the latest projection snapshot, falling back to `P::init`.
+///
+/// Snapshot load failures are logged and treated as cache misses so the
+/// subscription can still start from event replay.
 async fn load_snapshot<P, SS>(
     snapshots: &SS,
     instance_id: &P::InstanceId,
@@ -452,6 +505,8 @@ where
     }
 }
 
+/// Apply one decoded handler closure and normalise its error into
+/// [`SubscriptionError`].
 fn apply_handler<P, S>(
     handler: &crate::projection::EventHandler<P, S>,
     projection: &mut P,
@@ -477,20 +532,24 @@ where
     })
 }
 
+/// Process one event through handler dispatch, position tracking, and update
+/// emission.
 fn process_subscription_event<P, S>(
     projection: &mut P,
     stored: &StoredEvent<S::Id, S::Position, S::Data, S::Metadata>,
     handlers: &HashMap<&'static str, crate::projection::EventHandler<P, S>>,
     store: &S,
-    on_update: Option<&UpdateCallback<P>>,
+    updates_tx: &tokio::sync::mpsc::UnboundedSender<P>,
     last_position: &mut Option<S::Position>,
     events_since_snapshot: &mut u64,
 ) -> Result<(), SubscriptionError<S::Error>>
 where
-    P: Projection<Id = S::Id>,
+    P: Projection<Id = S::Id> + Clone,
     S: EventStore,
     S::Position: Clone,
 {
+    // Unknown kinds are ignored: filters can intentionally include wider sets
+    // than this projection currently handles.
     if let Some(handler) = handlers.get(stored.kind()) {
         apply_handler(handler, projection, stored, store)?;
     }
@@ -498,13 +557,14 @@ where
     *last_position = Some(stored.position());
     *events_since_snapshot += 1;
 
-    if let Some(callback) = on_update {
-        callback(projection);
-    }
+    let _ = updates_tx.send(projection.clone());
 
     Ok(())
 }
 
+/// Offer a projection snapshot and report whether it was stored.
+///
+/// Errors are logged and treated as "not stored" so subscriptions remain live.
 async fn offer_projection_snapshot<P, SS>(
     snapshots: &SS,
     instance_id: &P::InstanceId,

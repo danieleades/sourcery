@@ -25,8 +25,21 @@ pub trait Aggregate {
     /// `"user-account"`, etc.
     const KIND: &'static str;
 
+    /// The sum type of all events this aggregate can produce and handle.
+    ///
+    /// Generated automatically by `#[derive(Aggregate)]` as `{Struct}Event`.
     type Event;
+
+    /// The top-level error type returned by command handlers.
+    ///
+    /// Individual [`Handle<C>`] and [`HandleCreate<C>`] implementations may
+    /// define narrower `HandleError` / `HandleCreateError` types that convert
+    /// into this via `Into`.
     type Error;
+
+    /// The aggregate instance identifier type.
+    ///
+    /// Must match the `EventStore::Id` type used in the same repository.
     type Id;
 
     /// Construct aggregate state from its very first event.
@@ -37,7 +50,7 @@ pub trait Aggregate {
     ///
     /// When using `#[derive(Aggregate)]` with a `create(EventType)` attribute,
     /// this dispatches to your [`Create<E>`] implementation. Without the
-    /// attribute it falls back to `Default::default()` + `apply`.
+    /// `create(...)` attribute it falls back to `Default::default()` + `apply`.
     fn create(event: &Self::Event) -> Self;
 
     /// Apply an event to update aggregate state.
@@ -74,6 +87,7 @@ pub trait Aggregate {
 /// ```
 // ANCHOR: create_trait
 pub trait Create<E>: Sized {
+    /// Construct `Self` from the creation event.
     fn create(event: &E) -> Self;
 }
 // ANCHOR_END: create_trait
@@ -97,6 +111,7 @@ pub trait Create<E>: Sized {
 /// ```
 // ANCHOR: apply_trait
 pub trait Apply<E> {
+    /// Apply `event` to update `self` in place.
     fn apply(&mut self, event: &E);
 }
 // ANCHOR_END: apply_trait
@@ -120,6 +135,11 @@ pub trait Apply<E> {
 /// ```
 // ANCHOR: handle_trait
 pub trait Handle<C>: Aggregate {
+    /// Narrower error type for this specific command.
+    ///
+    /// Must convert into [`Aggregate::Error`] via `Into`, which the repository
+    /// performs automatically when surfacing errors. For simple cases, use
+    /// `type HandleError = Self::Error` directly.
     type HandleError: Into<<Self as Aggregate>::Error>;
 
     /// Handle a command and produce events.
@@ -138,6 +158,10 @@ pub trait Handle<C>: Aggregate {
 /// It allows create commands to have their own validation logic and error
 /// type, which is converted into the aggregate's top-level error type.
 pub trait HandleCreate<C>: Aggregate {
+    /// Narrower error type for this specific creation command.
+    ///
+    /// Must convert into [`Aggregate::Error`] via `Into`. For simple cases,
+    /// use `type HandleCreateError = Self::Error` directly.
     type HandleCreateError: Into<<Self as Aggregate>::Error>;
 
     /// Handle a creation command and produce events.

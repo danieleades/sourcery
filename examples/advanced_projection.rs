@@ -24,7 +24,9 @@ use sourcery::{
 
 #[derive(Default, Serialize, Deserialize, Aggregate)]
 #[aggregate(id = String, error = String, events(ProductRestocked, InventoryAdjusted), create(ProductRestocked))]
-struct Product;
+struct Product {
+    quantity: i64,
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct ProductRestocked {
@@ -47,22 +49,30 @@ impl DomainEvent for InventoryAdjusted {
 }
 
 impl Apply<ProductRestocked> for Product {
-    fn apply(&mut self, _event: &ProductRestocked) {}
+    fn apply(&mut self, event: &ProductRestocked) {
+        self.quantity += event.quantity;
+    }
 }
 
 impl Apply<InventoryAdjusted> for Product {
-    fn apply(&mut self, _event: &InventoryAdjusted) {}
+    fn apply(&mut self, event: &InventoryAdjusted) {
+        self.quantity += event.delta;
+    }
 }
 
 impl Create<ProductRestocked> for Product {
-    fn create(_event: &ProductRestocked) -> Self {
-        Self
+    fn create(event: &ProductRestocked) -> Self {
+        Self {
+            quantity: event.quantity,
+        }
     }
 }
 
 #[derive(Default, Serialize, Deserialize, Aggregate)]
 #[aggregate(id = String, error = String, events(SaleCompleted), create(SaleCompleted))]
-struct Sale;
+struct Sale {
+    quantity_sold: i64,
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct SaleCompleted {
@@ -76,18 +86,24 @@ impl DomainEvent for SaleCompleted {
 }
 
 impl Apply<SaleCompleted> for Sale {
-    fn apply(&mut self, _event: &SaleCompleted) {}
+    fn apply(&mut self, event: &SaleCompleted) {
+        self.quantity_sold += event.quantity;
+    }
 }
 
 impl Create<SaleCompleted> for Sale {
-    fn create(_event: &SaleCompleted) -> Self {
-        Self
+    fn create(event: &SaleCompleted) -> Self {
+        Self {
+            quantity_sold: event.quantity,
+        }
     }
 }
 
 #[derive(Default, Serialize, Deserialize, Aggregate)]
 #[aggregate(id = String, error = String, events(PromotionApplied), create(PromotionApplied))]
-struct Promotion;
+struct Promotion {
+    amount_cents: i64,
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct PromotionApplied {
@@ -101,12 +117,16 @@ impl DomainEvent for PromotionApplied {
 }
 
 impl Apply<PromotionApplied> for Promotion {
-    fn apply(&mut self, _event: &PromotionApplied) {}
+    fn apply(&mut self, event: &PromotionApplied) {
+        self.amount_cents += event.amount_cents;
+    }
 }
 
 impl Create<PromotionApplied> for Promotion {
-    fn create(_event: &PromotionApplied) -> Self {
-        Self
+    fn create(event: &PromotionApplied) -> Self {
+        Self {
+            amount_cents: event.amount_cents,
+        }
     }
 }
 

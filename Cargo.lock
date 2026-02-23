@@ -2303,6 +2303,7 @@ dependencies = [
  "sourcery-postgres",
  "thiserror",
  "tokio",
+ "tokio-stream",
  "tracing",
 ]
 

@@ -45,6 +45,7 @@ CREATE INDEX idx_events_kind
 ```rust,ignore
 use std::future::Future;
 use nonempty::NonEmpty;
+use sourcery::event::{DomainEvent, EventKind};
 use sourcery::store::{
     CommitError, Committed, EventFilter, EventStore,
     OptimisticCommitError, StoredEvent,

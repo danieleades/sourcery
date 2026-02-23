@@ -51,15 +51,22 @@ use crate::{
     subscription::{SubscribableStore, SubscriptionBuilder},
 };
 
+/// Internal alias for aggregate load/replay failures.
 type LoadError<S> = ProjectionError<<S as EventStore>::Error>;
+/// Internal alias for store-backed event decode failures.
 type EventDecodeError<S> = crate::event::EventDecodeError<<S as EventStore>::Error>;
+/// Internal representation of a rebuilt aggregate and its latest position.
 type RebuiltAggregate<A, S> = Option<(A, <S as EventStore>::Position)>;
 
 /// Lifecycle mismatch when executing a command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum LifecycleError {
+    /// Returned by [`Repository::update`] when no events exist for the given
+    /// aggregate ID.
     #[error("aggregate not found")]
     AggregateNotFound,
+    /// Returned by [`Repository::create`] when the aggregate stream already
+    /// exists (i.e., at least one event has been committed for that ID).
     #[error("aggregate already exists")]
     AggregateAlreadyExists,
 }
@@ -149,14 +156,18 @@ pub type SnapshotRetryResult<A, S, SS> = Result<
 
 #[doc(hidden)]
 pub enum CommitPolicyError<C, S> {
+    /// Commit failed due to optimistic version mismatch.
     Concurrency(C),
+    /// Commit failed due to store or serialisation error.
     Store(S),
 }
 
 #[doc(hidden)]
 pub trait CommitPolicy<S: EventStore>: private::Sealed {
+    /// Concurrency error emitted by this commit strategy.
     type ConcurrencyError: std::error::Error + 'static;
 
+    /// Persist a batch of events with strategy-specific concurrency handling.
     fn commit<E>(
         store: &S,
         kind: &str,
@@ -174,23 +185,29 @@ pub trait CommitPolicy<S: EventStore>: private::Sealed {
 
 #[doc(hidden)]
 pub trait SnapshotPolicy<S: EventStore, A: Aggregate<Id = S::Id>>: private::Sealed {
+    /// Snapshot-layer error type for this policy.
     type SnapshotError: std::error::Error + 'static;
+    /// Precomputed snapshot payload representation.
     type Prepared;
 
+    /// Load the snapshot baseline for an aggregate, if available.
     fn load_base(
         &self,
         kind: &str,
         id: &S::Id,
     ) -> impl std::future::Future<Output = Option<(A, S::Position)>> + Send;
 
+    /// Prepare snapshot state after appending events to an existing aggregate.
     fn prepare_snapshot_from_existing(
         &self,
         aggregate: A,
         events: &NonEmpty<A::Event>,
     ) -> Self::Prepared;
 
+    /// Prepare snapshot state when creating a new aggregate stream.
     fn prepare_snapshot_from_new(&self, events: &NonEmpty<A::Event>) -> Self::Prepared;
 
+    /// Offer a prepared snapshot payload to the underlying snapshot store.
     fn offer_snapshot(
         &self,
         kind: &str,
@@ -201,12 +218,17 @@ pub trait SnapshotPolicy<S: EventStore, A: Aggregate<Id = S::Id>>: private::Seal
     ) -> impl std::future::Future<Output = Result<(), Self::SnapshotError>> + Send;
 }
 
+/// Internal aggregate load result enriched with version/snapshot counters.
 struct LoadedAggregate<A, Pos> {
+    /// Rebuilt aggregate state after replay.
     aggregate: A,
+    /// Latest stream position used for optimistic commits.
     version: Option<Pos>,
+    /// Number of events replayed since the last snapshot baseline.
     events_since_snapshot: u64,
 }
 
+/// Build aggregate-scoped filters for every event kind in `E`.
 fn aggregate_event_filters<S, E>(
     aggregate_kind: &str,
     aggregate_id: &S::Id,
@@ -229,6 +251,7 @@ where
         .collect()
 }
 
+/// Replay stored events into an existing aggregate state value.
 fn apply_stored_events<A, S>(
     aggregate: &mut A,
     store: &S,
@@ -280,6 +303,7 @@ where
     Ok(aggregate.zip(last_position))
 }
 
+/// Build aggregate state from newly emitted events (before persistence).
 fn create_from_new_events<A>(events: &NonEmpty<A::Event>) -> A
 where
     A: Aggregate,
@@ -295,6 +319,7 @@ where
     aggregate
 }
 
+/// Replay projection events using the projection's registered handlers.
 fn replay_projection_events<P, S>(
     projection: &mut P,
     events: &StoredEvents<S::Id, S::Position, S::Data, S::Metadata>,
@@ -389,6 +414,7 @@ where
 }
 
 mod private {
+    /// Sealed marker used to constrain type-state policies.
     pub trait Sealed {}
 
     impl Sealed for crate::concurrency::Unchecked {}
@@ -690,6 +716,7 @@ impl<S> Repository<S>
 where
     S: EventStore,
 {
+    /// Construct a repository with optimistic concurrency and no snapshots.
     #[must_use]
     pub const fn new(store: S) -> Self {
         Self {
@@ -720,11 +747,13 @@ where
     S: EventStore,
     C: ConcurrencyStrategy,
 {
+    /// Access the underlying event store.
     #[must_use]
     pub const fn event_store(&self) -> &S {
         &self.store
     }
 
+    /// Enable snapshot support for this repository.
     #[must_use]
     pub fn with_snapshots<SS>(self, snapshots: SS) -> Repository<S, C, Snapshots<SS>>
     where
@@ -804,6 +833,8 @@ where
         Ok(self.load_aggregate::<A>(id).await?.map(|la| la.aggregate))
     }
 
+    /// Load and rebuild an aggregate, returning enriched load metadata needed
+    /// for command handling (version + snapshot event counter).
     async fn load_aggregate<A>(
         &self,
         id: &S::Id,
@@ -852,6 +883,11 @@ where
         }
     }
 
+    /// Commit events to the store and, on success, offer a snapshot.
+    ///
+    /// `expected_version` is `None` for new streams and `Some(v)` for existing
+    /// ones. `prepared_snapshot` is computed before this call so that snapshot
+    /// serialisation does not happen inside the store's critical section.
     async fn persist_events<A>(
         &self,
         id: &S::Id,
@@ -1212,6 +1248,7 @@ where
     SS: SnapshotStore<S::Id, Position = S::Position>,
     C: ConcurrencyStrategy,
 {
+    /// Access the configured snapshot store.
     #[must_use]
     pub const fn snapshot_store(&self) -> &SS {
         &self.snapshots.0
@@ -1225,9 +1262,9 @@ where
 {
     /// Start a continuous subscription for a projection.
     ///
-    /// Returns a [`SubscriptionBuilder`] that can be configured with callbacks
-    /// before starting. The subscription replays historical events first
-    /// (catch-up phase), then processes live events as they are committed.
+    /// Returns a [`SubscriptionBuilder`] for starting a stream of projection
+    /// updates. The subscription replays historical events first (catch-up
+    /// phase), then processes live events as they are committed.
     ///
     /// Subscription snapshots are disabled. Use [`subscribe_with_snapshots()`]
     /// to provide a snapshot store for the subscription.
@@ -1237,11 +1274,16 @@ where
     /// # Example
     ///
     /// ```ignore
-    /// let subscription = repo
+    /// use tokio_stream::StreamExt as _;
+    ///
+    /// let mut subscription = repo
     ///     .subscribe::<Dashboard>(())
-    ///     .on_update(|d| println!("{d:?}"))
     ///     .start()
     ///     .await?;
+    ///
+    /// while let Some(dashboard) = subscription.next().await {
+    ///     println!("{dashboard:?}");
+    /// }
     /// ```
     pub fn subscribe<P>(
         &self,

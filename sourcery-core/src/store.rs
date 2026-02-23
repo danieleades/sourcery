@@ -345,6 +345,7 @@ pub trait EventStore: Send + Sync {
 pub trait GloballyOrderedStore: EventStore {}
 // ANCHOR_END: event_store_trait
 
+/// Internal identifier for a single aggregate stream.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct StreamKey<Id> {
     aggregate_kind: String,
@@ -352,6 +353,7 @@ pub(crate) struct StreamKey<Id> {
 }
 
 impl<Id> StreamKey<Id> {
+    /// Construct a stable key for a single aggregate stream.
     pub(crate) fn new(aggregate_kind: impl Into<String>, aggregate_id: Id) -> Self {
         Self {
             aggregate_kind: aggregate_kind.into(),

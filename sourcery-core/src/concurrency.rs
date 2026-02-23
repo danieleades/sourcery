@@ -29,10 +29,11 @@ pub struct Unchecked;
 /// Optimistic concurrency control - version checked on every write.
 ///
 /// This is the default concurrency strategy for
-/// [`Repository`](crate::Repository). With this strategy, the repository tracks
-/// the stream version when loading an aggregate and verifies it hasn't changed
-/// before appending new events. If the version changed (another writer appended
-/// events), the operation fails with a [`ConcurrencyConflict`] error.
+/// [`Repository`](crate::repository::Repository). With this strategy, the
+/// repository tracks the stream version when loading an aggregate and verifies
+/// it hasn't changed before appending new events. If the version changed
+/// (another writer appended events), the operation fails with a
+/// [`ConcurrencyConflict`] error.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Optimistic;
 
@@ -75,6 +76,8 @@ pub struct ConcurrencyConflict<Pos: fmt::Debug> {
     pub actual: Option<Pos>,
 }
 
+/// Build a human-readable message for a [`ConcurrencyConflict`], including an
+/// actionable hint for the caller.
 fn format_conflict<Pos: fmt::Debug>(expected: Option<&Pos>, actual: Option<&Pos>) -> String {
     match (expected, actual) {
         (None, Some(actual)) => {

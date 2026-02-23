@@ -46,7 +46,8 @@ impl Apply<FundsWithdrawn> for Account {
 ### Without Derive Macro
 
 ```rust,ignore
-use sourcery::{Aggregate, DomainEvent, EventKind, ProjectionEvent};
+use sourcery::{Aggregate, DomainEvent, ProjectionEvent};
+use sourcery::event::EventKind;
 use sourcery::event::EventDecodeError;
 use sourcery::store::{EventStore, StoredEvent};
 use serde::{Deserialize, Serialize};

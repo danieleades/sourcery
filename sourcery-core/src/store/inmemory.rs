@@ -1,7 +1,7 @@
 //! In-memory event store implementation for testing.
 //!
 //! This module provides [`Store`], a thread-safe in-memory implementation of
-//! [`EventStore`](super::EventStore) suitable for unit tests and examples.
+//! [`EventStore`] suitable for unit tests and examples.
 //!
 //! # Example
 //!
@@ -48,8 +48,12 @@ pub struct Store<Id, M> {
     inner: Arc<RwLock<Inner<Id, M>>>,
 }
 
+/// Shared mutable state of the in-memory store, protected by an `RwLock`.
 struct Inner<Id, M> {
+    /// All event streams, keyed by (`aggregate_kind`, `aggregate_id`).
     streams: HashMap<StreamKey<Id>, InMemoryStream<Id, M>>,
+    /// Monotonically increasing counter used to assign globally ordered
+    /// positions to every committed event.
     next_position: u64,
     /// Broadcasts the position of newly committed events. Subscribers use this
     /// to detect live writes without polling.
@@ -57,6 +61,9 @@ struct Inner<Id, M> {
 }
 
 impl<Id, M> Store<Id, M> {
+    /// Create an empty in-memory store.
+    ///
+    /// Event positions start at `0` and increase globally across all streams.
     #[must_use]
     pub fn new() -> Self {
         let (notify_tx, _) = broadcast::channel(1024);
@@ -395,8 +402,13 @@ where
     use std::collections::HashSet;
 
     let mut result = Vec::new();
+    // Tracks (stream, kind) pairs already satisfied by aggregate-scoped
+    // filters so we do not duplicate them when applying global kind filters.
     let mut seen: HashSet<(StreamKey<Id>, String)> = HashSet::new();
 
+    // Split filters into:
+    // - aggregate scoped: (aggregate_kind, aggregate_id) -> {event_kind -> after}
+    // - global kind scoped: event_kind -> after
     let mut all_kinds: HashMap<String, Option<u64>> = HashMap::new();
     let mut by_aggregate: HashMap<StreamKey<Id>, HashMap<String, Option<u64>>> = HashMap::new();
 
@@ -416,6 +428,8 @@ where
             after_position.is_none_or(|after| event.position > after)
         };
 
+    // Apply aggregate-specific filters first. These are more precise and take
+    // precedence over global filters for the same (stream, event kind).
     for (stream_key, kinds) in &by_aggregate {
         if let Some(stream) = inner.streams.get(stream_key) {
             for event in stream {
@@ -432,6 +446,8 @@ where
         }
     }
 
+    // Then apply global kind filters, skipping events already included by the
+    // aggregate-specific pass above.
     if !all_kinds.is_empty() {
         for stream in inner.streams.values() {
             for event in stream {

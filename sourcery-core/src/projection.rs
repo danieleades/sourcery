@@ -87,9 +87,14 @@ where
 }
 
 /// Internal error type for event handler closures.
+///
+/// Wraps both store-level I/O errors and event decode errors so that handler
+/// closures can return a single error type.
 #[derive(Debug)]
 pub(crate) enum HandlerError<StoreError> {
+    /// Failed to decode the raw stored event into the concrete event type.
     EventDecode(EventDecodeError<StoreError>),
+    /// Store returned an error while decoding.
     Store(StoreError),
 }
 
@@ -135,7 +140,10 @@ pub struct Filters<S, P>
 where
     S: EventStore,
 {
+    /// Position-free filter specs; positions are injected at load/subscribe
+    /// time in [`into_event_filters`](Self::into_event_filters).
     pub(crate) specs: Vec<EventFilter<S::Id, ()>>,
+    /// Map of event kind string → handler closure for that kind.
     pub(crate) handlers: HashMap<&'static str, EventHandler<P, S>>,
 }
 

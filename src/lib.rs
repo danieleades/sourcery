@@ -14,11 +14,14 @@ pub use sourcery_core::{
         OptimisticRepository, OptimisticSnapshotRepository, Repository, UncheckedRepository,
     },
     subscription,
-    subscription::{SubscribableStore, SubscriptionBuilder, SubscriptionError, SubscriptionHandle},
+    subscription::{
+        SubscribableStore, Subscription, SubscriptionBuilder, SubscriptionError, SubscriptionHandle,
+    },
 };
 // Re-export proc macro derives so consumers only depend on `sourcery`.
 pub use sourcery_macros::{Aggregate, Projection};
 
+/// Event-store interfaces and built-in store implementations.
 pub mod store {
 
     // Re-export low-level commit types for EventStore implementors only.
@@ -38,6 +41,7 @@ pub mod store {
     pub use sourcery_core::store::inmemory;
 }
 
+/// Snapshot interfaces and built-in snapshot store implementations.
 pub mod snapshot {
 
     pub use sourcery_core::snapshot::{

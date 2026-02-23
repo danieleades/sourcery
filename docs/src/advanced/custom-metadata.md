@@ -130,7 +130,7 @@ Events should be understandable without metadata. Metadata enhances observabilit
 
 ## Example: Multi-Tenant Filtering
 
-Metadata enables tenant-scoped projections. With `type Metadata = TenantMetadata` on `ProjectionFilters`, the handler can filter by tenant:
+Metadata enables tenant-scoped projections. With `type Metadata = TenantMetadata` on `Projection`, the handler can filter by tenant:
 
 ```rust,ignore
 impl ApplyProjection<OrderPlaced> for TenantDashboard {

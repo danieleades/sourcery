@@ -136,8 +136,8 @@ pub trait RepositoryTestExt: StoreAccess + Send {
     /// # Arguments
     ///
     /// * `id` - The aggregate instance identifier
-    /// * `events` - Events to append (must implement [`EventKind`] and
-    ///   [`serde::Serialize`])
+    /// * `events` - Events to append (must implement
+    ///   [`crate::event::EventKind`] and [`serde::Serialize`])
     ///
     /// # Errors
     ///

@@ -6,8 +6,9 @@
 //!
 //! - [`Snapshot`] - Point-in-time aggregate state
 //! - [`SnapshotStore`] - Trait for snapshot persistence with policy
-//! - [`NoSnapshots`] - No-op implementation (use `Repository` instead if you
-//!   want no snapshots)
+//! - [`NoSnapshots`] - No-op implementation; this is the default when
+//!   [`Repository::with_snapshots`](crate::repository::Repository::with_snapshots)
+//!   is not called
 //! - [`inmemory`] - In-memory reference implementation with configurable policy
 
 use std::convert::Infallible;

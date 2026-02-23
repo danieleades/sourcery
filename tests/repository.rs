@@ -413,4 +413,3 @@ async fn load_consults_snapshot_store() {
     assert!(counter.is_none());
     assert!(repo.snapshot_store().load_called());
 }
-

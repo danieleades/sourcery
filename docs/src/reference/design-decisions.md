@@ -126,11 +126,11 @@ struct FundsDeposited {
 
 ```rust,ignore
 // Projection consumes from multiple aggregates
-#[derive(Default, sourcery::Projection)]
-#[projection(kind = "dashboard")]
+#[derive(Default)]
 struct Dashboard { /* ... */ }
 
-impl ProjectionFilters for Dashboard {
+impl Projection for Dashboard {
+    const KIND: &'static str = "dashboard";
     type Id = String;
     type InstanceId = ();
     type Metadata = ();

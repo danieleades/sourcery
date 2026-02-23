@@ -101,7 +101,7 @@ struct LoyaltySummary {
     total_earned: u64,
 }
 
-// (ProjectionFilters impl defines filters and associated types)
+// (Projection impl defines filters and associated types)
 
 let repo = Repository::new(store).with_snapshots(inmemory::Store::every(100));
 

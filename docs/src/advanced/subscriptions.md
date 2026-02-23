@@ -4,14 +4,19 @@ While `load_projection` rebuilds a projection from scratch on each call, **subsc
 
 ## Basic Usage
 
-Use `Repository::subscribe` to create a `SubscriptionBuilder`, configure callbacks, then call `start()`:
+Use `Repository::subscribe` to create a `SubscriptionBuilder`, call `start()`, then consume updates from the returned stream:
 
 ```rust,ignore
-let subscription = repository
+use tokio_stream::StreamExt as _;
+
+let mut subscription = repository
     .subscribe::<Dashboard>(())
-    .on_update(|dashboard| println!("{dashboard:?}"))
     .start()
     .await?;
+
+while let Some(dashboard) = subscription.next().await {
+    println!("{dashboard:?}");
+}
 ```
 
 The instance ID argument matches the projection's `InstanceId` type. For singleton projections (`InstanceId = ()`), pass `()`.
@@ -23,7 +28,7 @@ A subscription:
 
 1. **Catch-up phase** — Replays all historical events matching the projection's filters
 2. **Live phase** — Transitions to processing events as they are committed
-3. **Callbacks** — Fires `on_update` after each event
+3. **Stream updates** — Yields the projection after each event
 
 ```d2
 shape: sequence_diagram
@@ -39,33 +44,29 @@ Sub -> Sub: "Replay events (catch-up)"
 Sub -> App: "start() returns (caught up)" {style.stroke-dash: 3}
 Store -> Sub: "Live event" {style.stroke-dash: 3}
 Sub -> Sub: "apply_projection()"
-Sub -> App: "on_update(&projection)" {style.stroke-dash: 3}
+Sub -> App: "stream.next() -> projection" {style.stroke-dash: 3}
 ```
 
-## Callbacks
+## Consuming Updates
 
-### `on_update`
-
-Called after every event is applied to the projection. Receives an immutable reference to the current projection state:
+Each stream item is the projection state after one event is applied:
 
 ```rust,ignore
-.on_update(|projection| {
+while let Some(projection) = subscription.next().await {
     // Update a shared cache, send to WebSocket clients, etc.
-    cache.lock().unwrap().clone_from(projection);
-})
+    cache.lock().unwrap().clone_from(&projection);
+}
 ```
-
-Callbacks must complete quickly. Long-running work should be dispatched to a separate task via a channel.
 
 ## Stopping a Subscription
 
-The `start()` method returns a `SubscriptionHandle`. Call `stop()` for graceful shutdown:
+The `start()` method returns a `Subscription` stream. Call `stop()` for graceful shutdown:
 
 ```rust,ignore
 subscription.stop().await?;
 ```
 
-The subscription processes any remaining events, offers a final snapshot, then terminates. Dropping the handle sends a best-effort stop signal, but use `stop()` when you need deterministic shutdown and error handling.
+The subscription processes any remaining events, offers a final snapshot, then terminates. Dropping the subscription sends a best-effort stop signal, but use `stop()` when you need deterministic shutdown and error handling.
 
 ## Subscription Snapshots
 
@@ -74,11 +75,14 @@ By default, subscriptions don't persist snapshots. Use `subscribe_with_snapshots
 ```rust,ignore
 let snapshot_store = inmemory::Store::every(100);
 
-let subscription = repository
+let mut subscription = repository
     .subscribe_with_snapshots::<Dashboard>((), snapshot_store)
-    .on_update(|d| println!("{d:?}"))
     .start()
     .await?;
+
+while let Some(dashboard) = subscription.next().await {
+    println!("{dashboard:?}");
+}
 ```
 
 The subscription loads the most recent snapshot on startup and periodically offers new snapshots as events are processed.
@@ -107,15 +111,16 @@ A common pattern is to share projection state between the subscription and the c
 
 ```rust,ignore
 let live_state = Arc::new(Mutex::new(Dashboard::default()));
-let state_for_callback = live_state.clone();
+let state_for_consumer = live_state.clone();
 
-let subscription = repository
+let mut subscription = repository
     .subscribe::<Dashboard>(())
-    .on_update(move |projection| {
-        *state_for_callback.lock().unwrap() = projection.clone();
-    })
     .start()
     .await?;
+
+while let Some(projection) = subscription.next().await {
+    *state_for_consumer.lock().unwrap() = projection;
+}
 
 // Read the live projection from another task — no event replay needed
 let current = live_state.lock().unwrap().clone();
@@ -135,7 +140,7 @@ let current = live_state.lock().unwrap().clone();
 
 See [`examples/subscription_billing.rs`](https://github.com/danieleades/sourcery/blob/main/examples/subscription_billing.rs) for a complete working example demonstrating:
 
-- Live subscription with `on_update`
+- Live subscription consumed via `StreamExt::next()`
 - Multi-aggregate projection (Subscription + Invoice)
 - Guard conditions from live state
 - Graceful shutdown
