@@ -42,7 +42,7 @@ use crate::{
     aggregate::{Aggregate, Handle, HandleCreate},
     concurrency::{ConcurrencyConflict, ConcurrencyStrategy, Optimistic, Unchecked},
     event::{EventKind, ProjectionEvent},
-    projection::{HandlerError, Projection, ProjectionError, ProjectionFilters},
+    projection::{HandlerError, Projection, ProjectionError},
     snapshot::{OfferSnapshotError, Snapshot, SnapshotOffer, SnapshotStore},
     store::{
         CommitError, EventFilter, EventStore, GloballyOrderedStore, OptimisticCommitError,
@@ -304,7 +304,7 @@ fn replay_projection_events<P, S>(
 where
     S: EventStore,
     S::Position: Clone,
-    P: ProjectionFilters<Id = S::Id>,
+    P: Projection<Id = S::Id>,
 {
     let mut last_position = None;
 
@@ -602,7 +602,7 @@ pub type UncheckedRepository<S> =
 ///
 /// Equivalent to:
 /// ```ignore
-/// Repository<S, Optimistic, SS>
+/// Repository<S, Optimistic, Snapshots<SS>>
 /// ```
 ///
 /// # Example
@@ -615,7 +615,7 @@ pub type UncheckedRepository<S> =
 /// let repo: OptimisticSnapshotRepository<_, _> = Repository::new(store)
 ///     .with_snapshots(snapshot_store);
 /// ```
-pub type OptimisticSnapshotRepository<S, SS> = Repository<S, Optimistic, SS>;
+pub type OptimisticSnapshotRepository<S, SS> = Repository<S, Optimistic, Snapshots<SS>>;
 
 /// Command execution and aggregate lifecycle orchestrator.
 ///
@@ -740,7 +740,7 @@ where
     /// Load a projection by replaying events (one-shot query, no snapshots).
     ///
     /// Filter configuration is defined centrally in the projection's
-    /// [`ProjectionFilters`] implementation. The `instance_id` parameterises
+    /// [`Projection`] implementation. The `instance_id` parameterises
     /// which events to load.
     ///
     /// # Errors
@@ -758,7 +758,7 @@ where
         instance_id: &P::InstanceId,
     ) -> Result<P, ProjectionError<S::Error>>
     where
-        P: ProjectionFilters<Id = S::Id, Metadata = S::Metadata>,
+        P: Projection<Id = S::Id, Metadata = S::Metadata>,
         P::InstanceId: Send + Sync,
         M: Sync,
     {
@@ -971,9 +971,11 @@ where
     where
         A: Aggregate<Id = S::Id> + HandleCreate<Cmd>,
         A::Event: EventKind + Serialize + Send + Sync,
+        Cmd: Sync,
         S::Metadata: Clone,
         C: CommitPolicy<S>,
         M: SnapshotPolicy<S, A> + Sync,
+        M::Prepared: Send,
     {
         if self
             .store
@@ -1013,11 +1015,13 @@ where
         metadata: &S::Metadata,
     ) -> Result<(), CommandError<A::Error, C::ConcurrencyError, S::Error, M::SnapshotError>>
     where
-        A: Aggregate<Id = S::Id> + Handle<Cmd>,
+        A: Aggregate<Id = S::Id> + Handle<Cmd> + Send,
         A::Event: ProjectionEvent + EventKind + Serialize + Send + Sync,
+        Cmd: Sync,
         S::Metadata: Clone,
         C: CommitPolicy<S>,
         M: SnapshotPolicy<S, A> + Sync,
+        M::Prepared: Send,
     {
         let LoadedAggregate {
             aggregate,
@@ -1068,11 +1072,13 @@ where
         metadata: &S::Metadata,
     ) -> Result<(), CommandError<A::Error, C::ConcurrencyError, S::Error, M::SnapshotError>>
     where
-        A: Aggregate<Id = S::Id> + Handle<Cmd> + HandleCreate<Cmd>,
+        A: Aggregate<Id = S::Id> + Handle<Cmd> + HandleCreate<Cmd> + Send,
         A::Event: ProjectionEvent + EventKind + Serialize + Send + Sync,
+        Cmd: Sync,
         S::Metadata: Clone,
         C: CommitPolicy<S>,
         M: SnapshotPolicy<S, A> + Sync,
+        M::Prepared: Send,
     {
         if let Some(LoadedAggregate {
             aggregate,
@@ -1138,11 +1144,7 @@ where
         instance_id: &P::InstanceId,
     ) -> Result<P, ProjectionError<S::Error>>
     where
-        P: Projection
-            + ProjectionFilters<Id = S::Id, Metadata = S::Metadata>
-            + Serialize
-            + DeserializeOwned
-            + Sync,
+        P: Projection<Id = S::Id, Metadata = S::Metadata> + Serialize + DeserializeOwned + Sync,
         P::InstanceId: Send + Sync,
         SS: SnapshotStore<P::InstanceId, Position = S::Position>,
     {
@@ -1248,8 +1250,7 @@ where
     where
         S: SubscribableStore + Clone + 'static,
         S::Position: Ord,
-        P: Projection
-            + ProjectionFilters<Id = S::Id, Metadata = S::Metadata>
+        P: Projection<Id = S::Id, Metadata = S::Metadata>
             + Serialize
             + DeserializeOwned
             + Send
@@ -1277,8 +1278,7 @@ where
     where
         S: SubscribableStore + Clone + 'static,
         S::Position: Ord,
-        P: Projection
-            + ProjectionFilters<Id = S::Id, Metadata = S::Metadata>
+        P: Projection<Id = S::Id, Metadata = S::Metadata>
             + Serialize
             + DeserializeOwned
             + Send
@@ -1317,10 +1317,12 @@ where
         CommandError<A::Error, ConcurrencyConflict<S::Position>, S::Error, M::SnapshotError>,
     >
     where
-        A: Aggregate<Id = S::Id> + Handle<Cmd>,
+        A: Aggregate<Id = S::Id> + Handle<Cmd> + Send,
         A::Event: ProjectionEvent + EventKind + serde::Serialize + Send + Sync,
+        Cmd: Sync,
         S::Metadata: Clone,
         M: SnapshotPolicy<S, A> + Sync,
+        M::Prepared: Send,
     {
         for attempt in 1..=max_retries {
             match self.update::<A, Cmd>(id, command, metadata).await {

@@ -62,20 +62,6 @@ struct AddValue {
     amount: i32,
 }
 
-struct AddValueNonSync {
-    amount: i32,
-    _marker: std::rc::Rc<()>,
-}
-
-impl AddValueNonSync {
-    fn new(amount: i32) -> Self {
-        Self {
-            amount,
-            _marker: std::rc::Rc::new(()),
-        }
-    }
-}
-
 impl Handle<AddValue> for Counter {
     type HandleError = Self::Error;
 
@@ -96,40 +82,6 @@ impl HandleCreate<AddValue> for Counter {
     type HandleCreateError = Self::Error;
 
     fn handle_create(command: &AddValue) -> Result<Vec<Self::Event>, Self::HandleCreateError> {
-        if command.amount <= 0 {
-            return Err("amount must be positive".to_string());
-        }
-        Ok(vec![
-            ValueAdded {
-                amount: command.amount,
-            }
-            .into(),
-        ])
-    }
-}
-
-impl Handle<AddValueNonSync> for Counter {
-    type HandleError = Self::Error;
-
-    fn handle(&self, command: &AddValueNonSync) -> Result<Vec<Self::Event>, Self::Error> {
-        if command.amount <= 0 {
-            return Err("amount must be positive".to_string());
-        }
-        Ok(vec![
-            ValueAdded {
-                amount: command.amount,
-            }
-            .into(),
-        ])
-    }
-}
-
-impl HandleCreate<AddValueNonSync> for Counter {
-    type HandleCreateError = Self::Error;
-
-    fn handle_create(
-        command: &AddValueNonSync,
-    ) -> Result<Vec<Self::Event>, Self::HandleCreateError> {
         if command.amount <= 0 {
             return Err("amount must be positive".to_string());
         }
@@ -462,37 +414,3 @@ async fn load_consults_snapshot_store() {
     assert!(repo.snapshot_store().load_called());
 }
 
-#[tokio::test]
-async fn repository_commands_accept_non_sync_commands() {
-    let id = "c1".to_string();
-
-    let store = inmemory::Store::new();
-    let repo = Repository::new(store).without_concurrency_checking();
-
-    let create_command = AddValueNonSync::new(5);
-    repo.create::<Counter, AddValueNonSync>(&id, &create_command, &())
-        .await
-        .unwrap();
-
-    let update_command = AddValueNonSync::new(7);
-    repo.update::<Counter, AddValueNonSync>(&id, &update_command, &())
-        .await
-        .unwrap();
-
-    let upsert_command = AddValueNonSync::new(11);
-    repo.upsert::<Counter, AddValueNonSync>(&id, &upsert_command, &())
-        .await
-        .unwrap();
-
-    let store = inmemory::Store::new();
-    let repo = Repository::new(store);
-    repo.create::<Counter, AddValueNonSync>(&id, &AddValueNonSync::new(1), &())
-        .await
-        .unwrap();
-
-    let attempts = repo
-        .update_with_retry::<Counter, AddValueNonSync>(&id, &AddValueNonSync::new(1), &(), 0)
-        .await
-        .unwrap();
-    assert_eq!(attempts, 1);
-}

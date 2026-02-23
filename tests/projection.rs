@@ -6,8 +6,9 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use sourcery::{
-    Aggregate, Apply, ApplyProjection, Create, DomainEvent, EventKind, Filters, Handle,
-    HandleCreate, Projection, ProjectionFilters, Repository,
+    Aggregate, Apply, ApplyProjection, Create, DomainEvent, Filters, Handle, HandleCreate,
+    Projection, Repository,
+    event::EventKind,
     projection::ProjectionError,
     store::{EventStore, inmemory},
     test::RepositoryTestExt,
@@ -133,15 +134,17 @@ impl ApplyProjection<ValueAdded> for TotalsProjection {
 // Filtered projection for event_for tests
 // ============================================================================
 
-#[derive(Debug, Default, Projection)]
+#[derive(Debug, Default)]
 struct FilteredTotalsProjection {
     totals: HashMap<String, i32>,
 }
 
-impl ProjectionFilters for FilteredTotalsProjection {
+impl Projection for FilteredTotalsProjection {
     type Id = String;
     type InstanceId = String;
     type Metadata = ();
+
+    const KIND: &'static str = "filtered-totals-projection";
 
     fn init(_id: &String) -> Self {
         Self::default()
@@ -322,17 +325,19 @@ impl Handle<ResetValue> for MultiEventCounter {
 }
 
 /// Projection using `events()` to load via the aggregate's event enum
-#[derive(Debug, Default, Projection)]
+#[derive(Debug, Default)]
 struct EnumProjection {
     additions: i32,
     resets: i32,
     last_value: Option<i32>,
 }
 
-impl ProjectionFilters for EnumProjection {
+impl Projection for EnumProjection {
     type Id = String;
     type InstanceId = ();
     type Metadata = ();
+
+    const KIND: &'static str = "enum-projection";
 
     fn init((): &()) -> Self {
         Self::default()
@@ -366,17 +371,19 @@ impl ApplyProjection<MultiEventCounterEvent> for EnumProjection {
 }
 
 /// Projection using `events_for()` to load from a specific aggregate instance
-#[derive(Debug, Default, Projection)]
+#[derive(Debug, Default)]
 struct EventsForProjection {
     additions: i32,
     resets: i32,
     last_value: Option<i32>,
 }
 
-impl ProjectionFilters for EventsForProjection {
+impl Projection for EventsForProjection {
     type Id = String;
     type InstanceId = String;
     type Metadata = ();
+
+    const KIND: &'static str = "events-for-projection";
 
     fn init(_id: &String) -> Self {
         Self::default()
@@ -431,7 +438,7 @@ async fn events_loads_all_events_from_aggregate_enum() {
         .await
         .unwrap();
 
-    // Use events() via the EnumProjection's ProjectionFilters impl
+    // Use events() via the EnumProjection's Projection impl
     let projection: EnumProjection = repo.load_projection(&()).await.unwrap();
 
     assert_eq!(projection.additions, 13); // 10 + 3
@@ -461,7 +468,7 @@ async fn events_for_loads_events_for_specific_aggregate_instance() {
     .await
     .unwrap();
 
-    // Use events_for() via the EventsForProjection's ProjectionFilters impl
+    // Use events_for() via the EventsForProjection's Projection impl
     let projection: EventsForProjection = repo.load_projection(&"c1".to_string()).await.unwrap();
 
     assert_eq!(projection.additions, 10); // only c1's addition

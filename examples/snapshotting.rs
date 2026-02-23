@@ -20,6 +20,7 @@ use sourcery::{
     Aggregate, Apply, ApplyProjection, Create, DomainEvent, Handle, HandleCreate, Repository,
     snapshot::inmemory::Store as InMemorySnapshotStore, store::inmemory,
 };
+use thiserror::Error;
 
 // =============================================================================
 // Domain Events
@@ -49,6 +50,36 @@ impl DomainEvent for PointsRedeemed {
 // Loyalty Account Aggregate
 // =============================================================================
 
+// =============================================================================
+// Domain Errors
+// =============================================================================
+
+/// Top-level error type for the loyalty account aggregate.
+#[derive(Debug, Error)]
+pub enum LoyaltyError {
+    #[error(transparent)]
+    ZeroPoints(#[from] ZeroPoints),
+    #[error(transparent)]
+    InsufficientPoints(#[from] InsufficientPoints),
+}
+
+/// Error returned when attempting to earn zero points.
+#[derive(Debug, Error)]
+#[error("earned amount must be non-zero")]
+pub struct ZeroPoints;
+
+/// Error returned when redeeming more points than are available.
+#[derive(Debug, Error)]
+#[error("insufficient points: have {available}, need {requested}")]
+pub struct InsufficientPoints {
+    pub available: u64,
+    pub requested: u64,
+}
+
+// =============================================================================
+// Loyalty Account Aggregate
+// =============================================================================
+
 /// A loyalty account that accumulates points over time.
 ///
 /// This is a good candidate for snapshotting because:
@@ -58,7 +89,7 @@ impl DomainEvent for PointsRedeemed {
 #[derive(Default, Serialize, Deserialize, Aggregate)]
 #[aggregate(
     id = String,
-    error = String,
+    error = LoyaltyError,
     events(PointsEarned, PointsRedeemed),
     create(PointsEarned),
     derives(Debug, PartialEq, Eq)
@@ -123,11 +154,11 @@ pub struct RedeemPoints {
 }
 
 impl Handle<EarnPoints> for LoyaltyAccount {
-    type HandleError = Self::Error;
+    type HandleError = ZeroPoints;
 
-    fn handle(&self, command: &EarnPoints) -> Result<Vec<Self::Event>, Self::Error> {
+    fn handle(&self, command: &EarnPoints) -> Result<Vec<Self::Event>, ZeroPoints> {
         if command.amount == 0 {
-            return Err("Cannot earn zero points".to_string());
+            return Err(ZeroPoints);
         }
         Ok(vec![
             PointsEarned {
@@ -140,11 +171,11 @@ impl Handle<EarnPoints> for LoyaltyAccount {
 }
 
 impl HandleCreate<EarnPoints> for LoyaltyAccount {
-    type HandleCreateError = Self::Error;
+    type HandleCreateError = ZeroPoints;
 
-    fn handle_create(command: &EarnPoints) -> Result<Vec<Self::Event>, Self::HandleCreateError> {
+    fn handle_create(command: &EarnPoints) -> Result<Vec<Self::Event>, ZeroPoints> {
         if command.amount == 0 {
-            return Err("Cannot earn zero points".to_string());
+            return Err(ZeroPoints);
         }
         Ok(vec![
             PointsEarned {
@@ -157,14 +188,14 @@ impl HandleCreate<EarnPoints> for LoyaltyAccount {
 }
 
 impl Handle<RedeemPoints> for LoyaltyAccount {
-    type HandleError = Self::Error;
+    type HandleError = InsufficientPoints;
 
-    fn handle(&self, command: &RedeemPoints) -> Result<Vec<Self::Event>, Self::Error> {
+    fn handle(&self, command: &RedeemPoints) -> Result<Vec<Self::Event>, InsufficientPoints> {
         if command.amount > self.points {
-            return Err(format!(
-                "Insufficient points: have {}, need {}",
-                self.points, command.amount
-            ));
+            return Err(InsufficientPoints {
+                available: self.points,
+                requested: command.amount,
+            });
         }
         Ok(vec![
             PointsRedeemed {

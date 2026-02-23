@@ -37,7 +37,7 @@ use tokio_stream::StreamExt as _;
 
 use crate::{
     event::EventDecodeError,
-    projection::{HandlerError, Projection, ProjectionFilters},
+    projection::{HandlerError, Projection},
     snapshot::{Snapshot, SnapshotStore},
     store::{EventFilter, EventStore, GloballyOrderedStore, StoredEvent},
 };
@@ -188,7 +188,7 @@ type UpdateCallback<P> = Box<dyn Fn(&P) + Send + Sync + 'static>;
 pub struct SubscriptionBuilder<S, P, SS>
 where
     S: EventStore,
-    P: ProjectionFilters,
+    P: Projection,
 {
     store: S,
     snapshots: SS,
@@ -202,8 +202,7 @@ where
     S::Position: Ord + Send + Sync,
     S::Data: Send,
     S::Metadata: Send + Sync,
-    P: Projection
-        + ProjectionFilters<Id = S::Id, Metadata = S::Metadata>
+    P: Projection<Id = S::Id, Metadata = S::Metadata>
         + Serialize
         + DeserializeOwned
         + Send
@@ -433,7 +432,7 @@ async fn load_snapshot<P, SS>(
     instance_id: &P::InstanceId,
 ) -> (P, Option<SS::Position>)
 where
-    P: Projection + ProjectionFilters + DeserializeOwned,
+    P: Projection + DeserializeOwned,
     P::InstanceId: Sync,
     SS: SnapshotStore<P::InstanceId>,
 {
@@ -460,7 +459,7 @@ fn apply_handler<P, S>(
     store: &S,
 ) -> Result<(), SubscriptionError<S::Error>>
 where
-    P: ProjectionFilters<Id = S::Id>,
+    P: Projection<Id = S::Id>,
     S: EventStore,
 {
     (handler)(
@@ -488,7 +487,7 @@ fn process_subscription_event<P, S>(
     events_since_snapshot: &mut u64,
 ) -> Result<(), SubscriptionError<S::Error>>
 where
-    P: ProjectionFilters<Id = S::Id>,
+    P: Projection<Id = S::Id>,
     S: EventStore,
     S::Position: Clone,
 {
@@ -514,7 +513,7 @@ async fn offer_projection_snapshot<P, SS>(
     projection: &P,
 ) -> bool
 where
-    P: Projection + ProjectionFilters + Serialize + Sync,
+    P: Projection + Serialize + Sync,
     P::InstanceId: Sync,
     SS: SnapshotStore<P::InstanceId>,
     SS::Position: Clone,

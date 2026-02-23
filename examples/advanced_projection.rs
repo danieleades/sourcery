@@ -1,8 +1,8 @@
-//! Advanced projection example using the `ProjectionFilters` trait.
+//! Advanced projection example using the `Projection` trait.
 //!
 //! This example demonstrates how to compose a projection that mixes
 //! global and scoped event subscriptions without relying on the
-//! aggregate event enums. The `ProjectionFilters` impl registers:
+//! aggregate event enums. The `Projection` impl registers:
 //!
 //! - All `ProductRestocked` events (global)
 //! - `InventoryAdjusted` events scoped to a specific product SKU
@@ -13,7 +13,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use sourcery::{
-    Aggregate, Apply, ApplyProjection, Create, DomainEvent, Filters, ProjectionFilters, Repository,
+    Aggregate, Apply, ApplyProjection, Create, DomainEvent, Filters, Projection, Repository,
     store::{EventStore, inmemory},
     test::RepositoryTestExt,
 };
@@ -123,17 +123,25 @@ struct ProductSummaryParams {
     promotion: String,
 }
 
-#[derive(Debug, Default, sourcery::Projection)]
+#[derive(Debug, Default)]
 struct ProductSummary {
     stock_levels: HashMap<String, i64>,
     sales: HashMap<String, i64>,
     promotion_totals: HashMap<String, i64>,
 }
 
-impl ProjectionFilters for ProductSummary {
+/// Manual `Projection` impl: mixes global and instance-scoped subscriptions.
+///
+/// When a projection's `filters()` method depends on instance-specific IDs
+/// (like `ProductSummaryParams`), implement `Projection` directly rather than
+/// using `#[derive(Projection)]`. The derive always generates a singleton
+/// (`InstanceId = ()`) with global-only filters.
+impl Projection for ProductSummary {
     type Id = String;
     type InstanceId = ProductSummaryParams;
     type Metadata = ();
+
+    const KIND: &'static str = "product-summary";
 
     fn init(_params: &ProductSummaryParams) -> Self {
         Self::default()
@@ -254,7 +262,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?;
 
-    // Load the projection using the centralized filter configuration.
+    // Load the projection using the centralised filter configuration.
     let params = ProductSummaryParams {
         product: product_id.clone(),
         sale: sale_id.clone(),

@@ -27,8 +27,11 @@ use crate::{
 /// `init()` constructs a fresh instance from the instance identifier.
 /// This replaces the `Default` constraint, allowing instance-aware
 /// projections to capture their identity at construction time.
-// ANCHOR: projection_filters_trait
-pub trait ProjectionFilters: Sized {
+// ANCHOR: projection_trait
+pub trait Projection: Sized {
+    /// Stable identifier for this projection type, used for snapshot storage.
+    const KIND: &'static str;
+
     /// Aggregate identifier type this subscriber is compatible with.
     type Id;
     /// Instance identifier for this subscriber.
@@ -50,21 +53,6 @@ pub trait ProjectionFilters: Sized {
     where
         S: EventStore<Id = Self::Id, Metadata = Self::Metadata>;
 }
-// ANCHOR_END: projection_filters_trait
-
-/// Trait implemented by read models that can be constructed from an event
-/// stream.
-///
-/// Contains a stable `KIND` identifier for snapshot storage.
-///
-/// `Projection` is intentionally independent from [`ProjectionFilters`], so
-/// `#[derive(Projection)]` can always be used while filter behaviour remains an
-/// explicit opt-in via `ProjectionFilters`.
-// ANCHOR: projection_trait
-pub trait Projection {
-    /// Stable identifier for this projection type.
-    const KIND: &'static str;
-}
 // ANCHOR_END: projection_trait
 
 /// Apply an event to a projection with access to envelope context.
@@ -81,7 +69,7 @@ pub trait Projection {
 /// }
 /// ```
 // ANCHOR: apply_projection_trait
-pub trait ApplyProjection<E>: ProjectionFilters {
+pub trait ApplyProjection<E>: Projection {
     fn apply_projection(&mut self, aggregate_id: &Self::Id, event: &E, metadata: &Self::Metadata);
 }
 // ANCHOR_END: apply_projection_trait
@@ -154,7 +142,7 @@ where
 impl<S, P> Default for Filters<S, P>
 where
     S: EventStore,
-    P: ProjectionFilters<Id = S::Id, Metadata = S::Metadata>,
+    P: Projection<Id = S::Id, Metadata = S::Metadata>,
 {
     fn default() -> Self {
         Self::new()
@@ -164,7 +152,7 @@ where
 impl<S, P> Filters<S, P>
 where
     S: EventStore,
-    P: ProjectionFilters<Id = S::Id, Metadata = S::Metadata>,
+    P: Projection<Id = S::Id, Metadata = S::Metadata>,
 {
     /// Create an empty filter set.
     #[must_use]

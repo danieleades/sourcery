@@ -6,9 +6,9 @@ pub use sourcery_core::{
     aggregate,
     aggregate::{Aggregate, Apply, Create, Handle, HandleCreate},
     event,
-    event::{DomainEvent, EventDecodeError, EventKind, ProjectionEvent},
+    event::{DomainEvent, EventDecodeError, ProjectionEvent},
     projection,
-    projection::{ApplyProjection, Filters, Projection, ProjectionFilters},
+    projection::{ApplyProjection, Filters, Projection},
     repository,
     repository::{
         OptimisticRepository, OptimisticSnapshotRepository, Repository, UncheckedRepository,

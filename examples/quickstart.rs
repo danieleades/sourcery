@@ -101,12 +101,37 @@ impl HandleCreate<OpenAccount> for Account {
     }
 }
 
-impl Handle<Deposit> for Account {
-    type HandleError = Self::Error;
+/// Error returned when a deposit amount is not positive.
+///
+/// Returning a narrow, concrete error type (rather than `Self::Error`) lets
+/// callers handle only the cases that can actually occur. Here, the `Deposit`
+/// handler can only fail in one specific way, so that is expressed directly in
+/// the return type.
+#[derive(Debug)]
+pub struct NonPositiveDeposit {
+    pub amount: i64,
+}
 
-    fn handle(&self, cmd: &Deposit) -> Result<Vec<Self::Event>, Self::Error> {
+impl std::fmt::Display for NonPositiveDeposit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "deposit amount must be positive, got {}", self.amount)
+    }
+}
+
+impl std::error::Error for NonPositiveDeposit {}
+
+impl From<NonPositiveDeposit> for String {
+    fn from(e: NonPositiveDeposit) -> Self {
+        e.to_string()
+    }
+}
+
+impl Handle<Deposit> for Account {
+    type HandleError = NonPositiveDeposit;
+
+    fn handle(&self, cmd: &Deposit) -> Result<Vec<Self::Event>, NonPositiveDeposit> {
         if cmd.amount <= 0 {
-            return Err("amount must be positive".into());
+            return Err(NonPositiveDeposit { amount: cmd.amount });
         }
         Ok(vec![FundsDeposited { amount: cmd.amount }.into()])
     }

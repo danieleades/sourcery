@@ -128,7 +128,8 @@ pub mod codec {
     pub use super::event::{EventDecodeError, ProjectionEvent};
 }
 
-pub trait ProjectionFilters: Sized {
+pub trait Projection: Sized {
+    const KIND: &'static str;
     type Id;
     type InstanceId;
     type Metadata;
@@ -140,10 +141,6 @@ pub trait ProjectionFilters: Sized {
         S: store::EventStore<Id = Self::Id, Metadata = Self::Metadata>;
 }
 
-pub trait Projection {
-    const KIND: &'static str;
-}
-
 /// Stub Filters type for trybuild tests.
 pub struct Filters<S, P> {
     _s: std::marker::PhantomData<S>,
@@ -153,7 +150,7 @@ pub struct Filters<S, P> {
 impl<S, P> Filters<S, P>
 where
     S: store::EventStore,
-    P: ProjectionFilters<Id = S::Id>,
+    P: Projection<Id = S::Id>,
 {
     pub fn new() -> Self {
         Self {
@@ -172,6 +169,6 @@ where
     }
 }
 
-pub trait ApplyProjection<E>: ProjectionFilters {
+pub trait ApplyProjection<E>: Projection {
     fn apply_projection(&mut self, aggregate_id: &Self::Id, event: &E, metadata: &Self::Metadata);
 }
