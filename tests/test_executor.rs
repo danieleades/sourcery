@@ -4,7 +4,9 @@
 #[cfg(feature = "test-util")]
 mod with_test_util {
     use serde::{Deserialize, Serialize};
-    use sourcery::{Aggregate, Apply, Create, DomainEvent, Handle, test::TestFramework};
+    use sourcery::{
+        Aggregate, Apply, Create, DomainEvent, Handle, HandleCreate, test::TestFramework,
+    };
 
     // ============================================================================
     // Test Domain: Bank Account
@@ -91,13 +93,12 @@ mod with_test_util {
         amount: u64,
     }
 
-    impl Handle<OpenAccount> for BankAccount {
-        type HandleError = Self::Error;
+    impl HandleCreate<OpenAccount> for BankAccount {
+        type HandleCreateError = Self::Error;
 
-        fn handle(&self, command: &OpenAccount) -> Result<Vec<Self::Event>, Self::Error> {
-            if self.is_open {
-                return Err("account already open".to_string());
-            }
+        fn handle_create(
+            command: &OpenAccount,
+        ) -> Result<Vec<Self::Event>, Self::HandleCreateError> {
             Ok(vec![
                 AccountOpened {
                     initial_balance: command.initial_balance,
@@ -154,23 +155,14 @@ mod with_test_util {
 
     #[test]
     fn open_account_produces_event() {
-        TestFramework::<BankAccount>::given(&[])
-            .when(&OpenAccount {
+        TestFramework::<BankAccount>::new()
+            .when_create(&OpenAccount {
                 initial_balance: 100,
             })
             .then_expect_events(&[AccountOpened {
                 initial_balance: 100,
             }
             .into()]);
-    }
-
-    #[test]
-    fn cannot_open_already_open_account() {
-        TestFramework::<BankAccount>::given(&[AccountOpened { initial_balance: 0 }.into()])
-            .when(&OpenAccount {
-                initial_balance: 100,
-            })
-            .then_expect_error_message("already open");
     }
 
     #[test]
@@ -181,13 +173,6 @@ mod with_test_util {
         .into()])
         .when(&Deposit { amount: 50 })
         .then_expect_events(&[MoneyDeposited { amount: 50 }.into()]);
-    }
-
-    #[test]
-    fn cannot_deposit_to_closed_account() {
-        TestFramework::<BankAccount>::given(&[])
-            .when(&Deposit { amount: 50 })
-            .then_expect_error_message("not open");
     }
 
     #[test]
@@ -208,13 +193,6 @@ mod with_test_util {
         .into()])
         .when(&Withdraw { amount: 150 })
         .then_expect_error_message("insufficient funds");
-    }
-
-    #[test]
-    fn cannot_withdraw_from_closed_account() {
-        TestFramework::<BankAccount>::given(&[])
-            .when(&Withdraw { amount: 50 })
-            .then_expect_error_message("not open");
     }
 
     #[test]

@@ -34,19 +34,29 @@ Set up initial state with `given(events)`:
 ```rust,ignore
 // With existing events
 TestFramework::<Account>::given(&[
+    AccountOpened { initial_balance: 100 }.into(),
     FundsDeposited { amount: 100 }.into(),
     FundsWithdrawn { amount: 30 }.into(),
 ])  // Balance is now 70
 
-// Fresh aggregate (pass empty slice)
-TestFramework::<Account>::given(&[])  // Balance is 0
+// No stream yet
+TestFramework::<Account>::new()
 ```
 
 ## When Methods
 
+### `when_create(command)`
+
+Execute a creation command against a stream that does not yet exist:
+
+```rust,ignore
+TestFramework::<Account>::new()
+    .when_create(&OpenAccount { initial_balance: 100 })
+```
+
 ### `when(command)`
 
-Execute a command against the aggregate:
+Execute an update command against an existing aggregate:
 
 ```rust,ignore
 .when(&Withdraw { amount: 50 })
@@ -78,23 +88,26 @@ Additional methods: `then_expect_error_message(substring)` for substring matchin
 use sourcery::test::TestFramework;
 
 #[test]
-fn deposits_positive_amount() {
-    TestFramework::<Account>::given(&[])
-        .when(&Deposit { amount: 100 })
-        .then_expect_events(&[FundsDeposited { amount: 100 }.into()]);
+fn opens_account() {
+    TestFramework::<Account>::new()
+        .when_create(&OpenAccount { initial_balance: 100 })
+        .then_expect_events(&[AccountOpened { initial_balance: 100 }.into()]);
 }
 
 #[test]
 fn rejects_overdraft() {
-    TestFramework::<Account>::given(&[FundsDeposited { amount: 100 }.into()])
+    TestFramework::<Account>::given(&[
+        AccountOpened { initial_balance: 100 }.into(),
+        FundsDeposited { amount: 100 }.into(),
+    ])
         .when(&Withdraw { amount: 150 })
         .then_expect_error_eq(&AccountError::InsufficientFunds);
 }
 
 #[test]
-fn rejects_invalid_deposit() {
-    TestFramework::<Account>::given(&[])
-        .when(&Deposit { amount: -50 })
+fn rejects_invalid_opening_balance() {
+    TestFramework::<Account>::new()
+        .when_create(&OpenAccount { initial_balance: 0 })
         .then_expect_error();
 }
 ```
