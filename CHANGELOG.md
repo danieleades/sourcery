@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/danieleades/sourcery/compare/sourcery-v0.2.0...sourcery-v0.3.0) - 2026-02-23
+
+### Added
+
+- [**breaking**] add special 'create' events and commands ([#37](https://github.com/danieleades/sourcery/pull/37))
+- add doc comments to generated structs ([#35](https://github.com/danieleades/sourcery/pull/35))
+
 ## [0.2.0](https://github.com/danieleades/sourcery/compare/sourcery-v0.1.0...sourcery-v0.2.0) - 2026-02-12
 
 ### Added

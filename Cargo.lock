@@ -2331,7 +2331,7 @@ dependencies = [
 
 [[package]]
 name = "sourcery"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde-evolve",
@@ -2347,7 +2347,7 @@ dependencies = [
 
 [[package]]
 name = "sourcery-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2364,7 +2364,7 @@ dependencies = [
 
 [[package]]
 name = "sourcery-macros"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "darling 0.23.0",
  "heck",
@@ -2378,7 +2378,7 @@ dependencies = [
 
 [[package]]
 name = "sourcery-postgres"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "criterion",
  "nonempty",
