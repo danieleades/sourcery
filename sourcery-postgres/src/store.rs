@@ -31,8 +31,7 @@ pub struct Store<M> {
     _phantom: PhantomData<M>,
 }
 
-pub(crate) type PgLoadResult<M> =
-    LoadEventsResult<uuid::Uuid, i64, serde_json::Value, M, Error>;
+pub(crate) type PgLoadResult<M> = LoadEventsResult<uuid::Uuid, i64, serde_json::Value, M, Error>;
 
 impl<M> Store<M> {
     /// Construct a `PostgreSQL` event store from a connection pool.

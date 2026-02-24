@@ -1,11 +1,9 @@
 use serde::{Serialize, de::DeserializeOwned};
-use sourcery_core::store::EventFilter;
-use sourcery_core::subscription::EventStream;
+use sourcery_core::{store::EventFilter, subscription::EventStream};
 use sqlx::postgres::PgListener;
 
-use crate::Error;
-
 use super::Store;
+use crate::Error;
 
 impl<M> Store<M>
 where

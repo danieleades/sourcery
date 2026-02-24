@@ -2,9 +2,8 @@ use nonempty::NonEmpty;
 use serde::{Serialize, de::DeserializeOwned};
 use sqlx::{Postgres, QueryBuilder};
 
-use crate::Error;
-
 use super::Store;
+use crate::Error;
 
 impl<M> Store<M>
 where
@@ -43,8 +42,8 @@ where
     ///
     /// The payload carries the *first* (minimum) position of the batch rather
     /// than the last. Subscribers use this to detect out-of-order commits
-    /// (possible because `PostgreSQL` sequences are allocated before commit) and
-    /// re-query from just before the earliest new event.
+    /// (possible because `PostgreSQL` sequences are allocated before commit)
+    /// and re-query from just before the earliest new event.
     pub(in crate::store) async fn append_prepared_events(
         tx: &mut sqlx::Transaction<'_, Postgres>,
         aggregate_kind: &str,
