@@ -2380,6 +2380,7 @@ dependencies = [
 name = "sourcery-postgres"
 version = "0.2.0"
 dependencies = [
+ "async-stream",
  "criterion",
  "nonempty",
  "serde",

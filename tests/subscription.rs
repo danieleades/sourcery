@@ -7,6 +7,7 @@ use sourcery::{
     Aggregate, Apply, ApplyProjection, Create, DomainEvent, Handle, HandleCreate, Projection,
     Repository, repository::CommandError, store::inmemory,
 };
+use tokio::time::{Duration, timeout};
 use tokio_stream::StreamExt as _;
 
 // ============================================================================
@@ -76,6 +77,57 @@ impl HandleCreate<AddItem> for Inventory {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PriceUpdated {
+    sku: String,
+    price_cents: i64,
+}
+
+impl DomainEvent for PriceUpdated {
+    const KIND: &'static str = "price-updated";
+}
+
+#[derive(Default, Clone, Serialize, Deserialize, Aggregate)]
+#[aggregate(
+    id = String,
+    error = String,
+    events(PriceUpdated),
+    create(PriceUpdated),
+    derives(Debug, PartialEq, Eq)
+)]
+struct Pricing;
+
+impl Apply<PriceUpdated> for Pricing {
+    fn apply(&mut self, _event: &PriceUpdated) {}
+}
+
+impl Create<PriceUpdated> for Pricing {
+    fn create(_event: &PriceUpdated) -> Self {
+        Self
+    }
+}
+
+struct SetPrice {
+    sku: String,
+    price_cents: i64,
+}
+
+impl HandleCreate<SetPrice> for Pricing {
+    type HandleCreateError = String;
+
+    fn handle_create(
+        command: &SetPrice,
+    ) -> Result<Vec<<Self as Aggregate>::Event>, Self::HandleCreateError> {
+        Ok(vec![
+            PriceUpdated {
+                sku: command.sku.clone(),
+                price_cents: command.price_cents,
+            }
+            .into(),
+        ])
+    }
+}
+
 // ============================================================================
 // Test Projection
 // ============================================================================
@@ -108,7 +160,7 @@ async fn add_item(repo: &Repository<inmemory::Store<String, ()>>, id: &str, name
     let id = id.to_string();
 
     match repo.create::<Inventory, AddItem>(&id, &command, &()).await {
-        Ok(()) => {}
+        Ok(_) => {}
         Err(CommandError::Lifecycle(_)) => {
             repo.update::<Inventory, AddItem>(&id, &command, &())
                 .await
@@ -238,4 +290,117 @@ async fn subscription_with_snapshot_resumes() {
     assert_eq!(sub2.next().await.unwrap().count, 3);
 
     sub2.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn subscription_wait_for_returns_after_relevant_command() {
+    let store = inmemory::Store::new();
+    let repo = Repository::new(store);
+    let mut subscription = repo.subscribe::<ItemCount>(()).start().await.unwrap();
+
+    let position = repo
+        .create::<Inventory, AddItem>(
+            &"inv1".to_string(),
+            &AddItem {
+                name: "pear".to_string(),
+            },
+            &(),
+        )
+        .await
+        .unwrap()
+        .expect("command should emit an event");
+
+    let state = subscription.wait_for(position).await.unwrap();
+    assert_eq!(state.count, 1);
+
+    let same_state = timeout(Duration::from_millis(50), subscription.wait_for(position))
+        .await
+        .expect("wait_for at an already-reached position should return quickly")
+        .unwrap();
+    assert_eq!(same_state.count, 1);
+
+    subscription.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn subscription_wait_for_handles_irrelevant_events() {
+    let store = inmemory::Store::new();
+    let repo = Repository::new(store);
+    let mut subscription = repo.subscribe::<ItemCount>(()).start().await.unwrap();
+
+    let position = repo
+        .create::<Pricing, SetPrice>(
+            &"sku-1".to_string(),
+            &SetPrice {
+                sku: "sku-1".to_string(),
+                price_cents: 1234,
+            },
+            &(),
+        )
+        .await
+        .unwrap()
+        .expect("command should emit an event");
+
+    let state = subscription.wait_for(position).await.unwrap();
+    assert_eq!(state.count, 0);
+    assert!(
+        timeout(Duration::from_millis(50), subscription.next())
+            .await
+            .is_err(),
+        "irrelevant events must not emit projection updates"
+    );
+
+    subscription.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn subscription_wait_for_does_not_drain_buffered_historical_updates() {
+    let store = inmemory::Store::new();
+    let repo = Repository::new(store);
+    let id = "inv1".to_string();
+
+    let first_position = repo
+        .create::<Inventory, AddItem>(
+            &id,
+            &AddItem {
+                name: "apple".to_string(),
+            },
+            &(),
+        )
+        .await
+        .unwrap()
+        .expect("command should emit an event");
+
+    let second_position = repo
+        .update::<Inventory, AddItem>(
+            &id,
+            &AddItem {
+                name: "banana".to_string(),
+            },
+            &(),
+        )
+        .await
+        .unwrap()
+        .expect("command should emit an event");
+
+    assert!(second_position > first_position);
+
+    let mut subscription = repo.subscribe::<ItemCount>(()).start().await.unwrap();
+
+    let current = subscription.wait_for(second_position).await.unwrap();
+    assert_eq!(current.count, 2);
+
+    let first_buffered = subscription.next().await.unwrap();
+    let second_buffered = subscription.next().await.unwrap();
+    assert_eq!(first_buffered.count, 1);
+    assert_eq!(second_buffered.count, 2);
+
+    assert!(
+        timeout(Duration::from_millis(50), subscription.next())
+            .await
+            .is_err(),
+        "no additional updates should be pending after draining catch-up buffer"
+    );
+
+    subscription.stop().await.unwrap();
 }

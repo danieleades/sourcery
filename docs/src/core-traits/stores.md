@@ -13,6 +13,8 @@ Stores own serialisation and deserialisation.
 {{#include ../../../sourcery-core/src/store.rs:event_store_trait}}
 ```
 
+`GloballyOrderedStore::latest_position()` is used by subscription waiting (`wait_for`) to confirm the global log watermark.
+
 ## Built-in: `inmemory::Store`
 
 For testing and prototyping:
@@ -28,6 +30,20 @@ let store: inmemory::Store<String, MyMetadata> = inmemory::Store::new();
 ```
 
 The in-memory store uses `serde_json` and supports globally ordered positions.
+
+## Built-in: `postgres::Store`
+
+Enable the `postgres` feature to use the PostgreSQL backend:
+
+```rust,ignore
+use sourcery::store::postgres;
+
+let pool = sqlx::PgPool::connect(&database_url).await?;
+let store: postgres::Store<MyMetadata> = postgres::Store::new(pool);
+store.migrate().await?;
+```
+
+PostgreSQL subscriptions are event-driven (`LISTEN/NOTIFY`). For read-your-writes waits, the subscription checks `latest_position()` first, then only falls back to a global event stream when needed.
 
 ## Committing Events
 

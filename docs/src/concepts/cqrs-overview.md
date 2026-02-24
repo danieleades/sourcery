@@ -49,12 +49,12 @@ The crate models CQRS through:
 
 ```rust,ignore
 // Write: create stream
-repository
+let created = repository
     .create::<Account, OpenAccount>(&id, &open, &metadata)
     .await?;
 
 // Write: execute command on existing stream
-repository
+let updated = repository
     .update::<Account, Deposit>(&id, &command, &metadata)
     .await?;
 
@@ -66,7 +66,14 @@ let summary = repository
 
 ## Eventual Consistency
 
-With CQRS, read models may not immediately reflect the latest write. This is fine for most UIs—users expect slight delays. For operations requiring strong consistency, read from the aggregate itself (via `repo.load()`).
+With CQRS, read models may not immediately reflect the latest write. This is fine for most UIs. When you need read-your-writes from a subscription, use the command result position:
+
+```rust,ignore
+if let Some(position) = updated {
+    let current = subscription.wait_for(position).await?;
+    // `current` is now at least as recent as that write
+}
+```
 
 ## Next
 

@@ -265,9 +265,11 @@ async fn saves_snapshot_and_exposes_snapshot_store() {
         .without_concurrency_checking();
 
     let id = "c1".to_string();
-    repo.create::<Counter, AddValue>(&id, &AddValue { amount: 5 }, &())
+    let position = repo
+        .create::<Counter, AddValue>(&id, &AddValue { amount: 5 }, &())
         .await
         .unwrap();
+    assert_eq!(position, Some(0));
 
     let loaded = repo
         .snapshot_store()
@@ -286,7 +288,8 @@ async fn no_events_does_not_persist_or_snapshot() {
         .without_concurrency_checking();
 
     let id = "c1".to_string();
-    repo.create::<Counter, NoOp>(&id, &NoOp, &()).await.unwrap();
+    let position = repo.create::<Counter, NoOp>(&id, &NoOp, &()).await.unwrap();
+    assert_eq!(position, None);
 
     assert!(
         repo.event_store()
@@ -343,12 +346,13 @@ async fn retry_with_zero_retries_still_attempts_once() {
         .await
         .unwrap();
 
-    let attempts = repo
+    let (attempts, position) = repo
         .update_with_retry::<Counter, AddValue>(&id, &AddValue { amount: 1 }, &(), 0)
         .await
         .unwrap();
 
     assert_eq!(attempts, 1);
+    assert_eq!(position, Some(1));
 }
 
 #[tokio::test]

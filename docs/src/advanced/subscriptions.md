@@ -22,6 +22,50 @@ while let Some(dashboard) = subscription.next().await {
 The instance ID argument matches the projection's `InstanceId` type. For singleton projections (`InstanceId = ()`), pass `()`.
 `start()` returns only after catch-up completes.
 
+## Read-Your-Writes
+
+Command methods return `Result<Option<Position>, ...>`:
+
+- `Some(position)` means events were committed, ending at `position`
+- `None` means the command was a valid no-op and emitted no events
+
+Use `wait_for(position)` only when you get `Some(position)`:
+
+```rust,ignore
+let committed = repository
+    .update::<Account, Deposit>(&account_id, &Deposit { amount: 100 }, &metadata)
+    .await?;
+
+let dashboard = if let Some(position) = committed {
+    subscription.wait_for(position).await?
+} else {
+    subscription.current().await
+};
+```
+
+`wait_for` handles events that are irrelevant to the projection:
+
+1. Fast path: return immediately if this subscription already applied a relevant event at or past `position`
+2. Confirm the store has globally committed at least `position`
+3. Find the latest relevant event at or before `position`
+4. If none exists, return current state immediately
+
+```d2
+shape: sequence_diagram
+
+App: Application
+Repo: Repository
+Sub: Subscription
+Store: Event Store
+
+App -> Repo: "update/create/upsert(...)"
+Repo -> App: "Ok(Some(position))"
+App -> Sub: "wait_for(position)"
+Sub -> Store: "latest_position()"
+Sub -> Store: "subscribe_all(from?) [only if needed]" {style.stroke-dash: 3}
+Sub -> App: "Projection state >= requested write"
+```
+
 ## How Subscriptions Work
 
 A subscription:
@@ -89,7 +133,7 @@ The subscription loads the most recent snapshot on startup and periodically offe
 
 ## The `SubscribableStore` Trait
 
-Not all stores support push notifications. The `SubscribableStore` trait extends `EventStore` with a `subscribe` method that returns a stream of events:
+Not all stores support push notifications. The `SubscribableStore` trait extends `EventStore` with filtered and global subscription streams:
 
 ```rust,ignore
 pub trait SubscribableStore: EventStore + GloballyOrderedStore {
@@ -100,10 +144,16 @@ pub trait SubscribableStore: EventStore + GloballyOrderedStore {
     ) -> EventStream<'_, Self>
     where
         Self::Position: Ord;
+
+    fn subscribe_all(&self, from_position: Option<Self::Position>) -> EventStream<'_, Self>
+    where
+        Self::Position: Ord;
 }
 ```
 
-The in-memory store implements this via `tokio::sync::broadcast`. A PostgreSQL implementation would use `LISTEN/NOTIFY`.
+`GloballyOrderedStore` provides `latest_position()`, which powers the lazy global confirmation step in `wait_for`.
+
+The in-memory store implements subscriptions with `tokio::sync::broadcast`. The PostgreSQL backend uses `LISTEN/NOTIFY` for live delivery and only subscribes to all-events when a global wait is actually required.
 
 ## Shared State Pattern
 
@@ -133,6 +183,7 @@ let current = live_state.lock().unwrap().clone();
 | One-off query | `load_projection` |
 | Real-time dashboard | `subscribe` |
 | Pre-computed read model | `subscribe` with snapshots |
+| Read-your-writes in request/response | command result position + `wait_for` |
 | Guard condition from live state | `subscribe` + `Arc<Mutex<_>>` |
 | Batch reporting | `load_projection` |
 

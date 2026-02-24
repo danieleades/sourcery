@@ -339,10 +339,17 @@ pub trait EventStore: Send + Sync {
     + 'a;
 }
 
-/// Marker trait for stores that provide globally ordered positions.
+/// Trait for stores that provide globally ordered positions.
 ///
-/// Projection snapshots require this guarantee.
-pub trait GloballyOrderedStore: EventStore {}
+/// Projection snapshots and read-your-writes waiting rely on this guarantee.
+pub trait GloballyOrderedStore: EventStore {
+    /// Return the latest committed global position in the store.
+    ///
+    /// Returns `None` when no events have been committed yet.
+    fn latest_position(
+        &self,
+    ) -> impl Future<Output = Result<Option<Self::Position>, Self::Error>> + Send + '_;
+}
 // ANCHOR_END: event_store_trait
 
 /// Internal identifier for a single aggregate stream.

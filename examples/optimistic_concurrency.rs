@@ -233,10 +233,10 @@ async fn part3_retry_pattern() -> Result<(OptimisticRepo, String), Box<dyn std::
     // Use the built-in update_with_retry method.
     // This automatically reloads and retries on ConcurrencyConflict errors.
     println!("\n6. Attempting to reserve 10 units with update_with_retry...");
-    let attempts = repo
+    let (attempts, position) = repo
         .update_with_retry::<InventoryItem, _>(&item_id, &ReserveItem { quantity: 10 }, &(), 3)
         .await?;
-    println!("   Succeeded on attempt {attempts}");
+    println!("   Succeeded on attempt {attempts} at position {position:?}");
 
     let item: InventoryItem = repo.load(&item_id).await?.expect("item exists");
     println!(
@@ -264,7 +264,7 @@ async fn part4_business_rules(repo: &OptimisticRepo, item_id: &String) {
         })) => {
             println!("   Correctly rejected: requested {requested}, available {available}");
         }
-        Ok(()) => {
+        Ok(_) => {
             println!("   Unexpectedly succeeded!");
         }
         Err(e) => {
