@@ -1,22 +1,21 @@
 use serde::{Serialize, de::DeserializeOwned};
 use sourcery_core::{store::EventFilter, subscription::EventStream};
-use sqlx::postgres::PgListener;
+use tokio::sync::broadcast;
 
-use super::Store;
-use crate::Error;
+use super::{Store, live::LiveMessage};
 
 impl<M> Store<M>
 where
     M: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
-    /// Build a live [`EventStream`] backed by a `LISTEN`/`NOTIFY` channel.
+    /// Build a live [`EventStream`] backed by the shared internal live pump.
     ///
     /// The stream first replays any historical events since `from_position`,
     /// then switches to live delivery as new events are committed.
     ///
     /// When `filters` is `Some`, only matching event kinds are returned;
     /// `None` subscribes to all events.
-    pub(in crate::store) fn subscribe_with_listener(
+    pub(in crate::store) fn subscribe_with_live_pump(
         &self,
         from_position: Option<i64>,
         filters: Option<Vec<EventFilter<uuid::Uuid, i64>>>,
@@ -25,18 +24,7 @@ where
 
         Box::pin(async_stream::stream! {
             let mut last_position = from_position;
-            let mut listener = match PgListener::connect_with(&store.pool).await {
-                Ok(listener) => listener,
-                Err(error) => {
-                    yield Err(Error::Database(error));
-                    return;
-                }
-            };
-
-            if let Err(error) = listener.listen(Self::EVENTS_NOTIFY_CHANNEL).await {
-                yield Err(Error::Database(error));
-                return;
-            }
+            let mut live = store.live.subscribe(from_position).await;
 
             // Historical catch-up.
             let historical = if let Some(filters) = filters.as_deref() {
@@ -62,51 +50,92 @@ where
                 }
             }
 
-            // Live notifications.
+            // Shared live stream.
             loop {
-                let notif = match listener.recv().await {
-                    Ok(notif) => notif,
-                    Err(error) => {
-                        yield Err(Error::Database(error));
-                        return;
-                    }
-                };
+                let next = match live.recv().await {
+                    Ok(next) => next,
+                    Err(broadcast::error::RecvError::Closed) => return,
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        let recovered = if let Some(filters) = filters.as_deref() {
+                            store.load_events_since_filtered(filters, last_position).await
+                        } else {
+                            store.load_all_events_since(last_position).await
+                        };
 
-                // The notification payload is the first (minimum) position of
-                // the just-committed batch. If that position is below our
-                // current watermark, a lower-positioned transaction committed
-                // after a higher-positioned one (possible because PostgreSQL
-                // sequences are allocated before commit). Re-querying from
-                // just before it ensures we don't permanently miss the event.
-                let notif_first_pos: i64 = notif.payload().parse().unwrap_or(i64::MAX);
-                let query_from =
-                    last_position.map(|lp| lp.min(notif_first_pos.saturating_sub(1)));
-
-                let loaded = if let Some(filters) = filters.as_deref() {
-                    store.load_events_since_filtered(filters, query_from).await
-                } else {
-                    store.load_all_events_since(query_from).await
-                };
-                match loaded {
-                    Ok(events) => {
-                        for event in events {
-                            // Skip events already yielded in a previous batch
-                            // (possible when re-querying from a lower position).
-                            if let Some(lp) = last_position
-                                && event.position <= lp
-                            {
+                        match recovered {
+                            Ok(events) => {
+                                for event in events {
+                                    if let Some(lp) = last_position
+                                        && event.position <= lp
+                                    {
+                                        continue;
+                                    }
+                                    last_position = Some(event.position);
+                                    yield Ok(event);
+                                }
                                 continue;
                             }
-                            last_position = Some(event.position);
-                            yield Ok(event);
+                            Err(error) => {
+                                yield Err(error);
+                                return;
+                            }
                         }
                     }
-                    Err(error) => {
-                        yield Err(error);
-                        return;
-                    }
+                };
+
+                let LiveMessage::Event(event) = next;
+
+                if let Some(filters) = filters.as_deref()
+                    && !event_matches_filters(&event, filters, from_position)
+                {
+                    continue;
                 }
+
+                if let Some(lp) = last_position
+                    && event.position <= lp
+                {
+                    continue;
+                }
+                last_position = Some(event.position);
+                yield Ok((*event).clone());
             }
         })
     }
+}
+
+fn event_matches_filters<M>(
+    event: &sourcery_core::store::StoredEvent<uuid::Uuid, i64, serde_json::Value, M>,
+    filters: &[EventFilter<uuid::Uuid, i64>],
+    from_position: Option<i64>,
+) -> bool {
+    filters.iter().any(|filter| {
+        if filter.event_kind != event.kind {
+            return false;
+        }
+
+        if filter
+            .aggregate_kind
+            .as_ref()
+            .is_some_and(|kind| kind != &event.aggregate_kind)
+        {
+            return false;
+        }
+
+        if filter
+            .aggregate_id
+            .as_ref()
+            .is_some_and(|id| id != &event.aggregate_id)
+        {
+            return false;
+        }
+
+        let effective_after = match (from_position, filter.after_position) {
+            (Some(from), Some(filter_after)) => Some(from.max(filter_after)),
+            (Some(from), None) => Some(from),
+            (None, Some(filter_after)) => Some(filter_after),
+            (None, None) => None,
+        };
+
+        effective_after.is_none_or(|after| event.position > after)
+    })
 }

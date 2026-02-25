@@ -8,11 +8,13 @@ use serde::{Deserialize, Serialize};
 use sourcery_core::{
     event::DomainEvent,
     store::{EventFilter, EventStore},
+    subscription::SubscribableStore,
 };
 use sourcery_postgres::Store;
 use sqlx::PgPool;
 use testcontainers::{ContainerAsync, runners::AsyncRunner};
 use testcontainers_modules::postgres::Postgres;
+use tokio_stream::StreamExt as _;
 use uuid::Uuid;
 
 /// Simple metadata type for tests.
@@ -565,4 +567,104 @@ async fn decode_event_deserializes_stored_event() {
 
     let decoded: TestEvent = store.decode_event(&stored[0]).unwrap();
     assert_eq!(decoded, original_event);
+}
+
+#[tokio::test]
+async fn subscribe_all_handles_out_of_order_commits_without_dropping_events() {
+    let db = TestDb::new().await;
+    let store: Store<TestMetadata> = Store::new(db.pool.clone());
+    store.migrate().await.unwrap();
+
+    let mut stream = store.subscribe_all(Some(0));
+
+    let id_a = Uuid::new_v4();
+    let id_b = Uuid::new_v4();
+    let metadata = sqlx::types::Json(serde_json::json!({ "user_id": "user1" }));
+
+    // Transaction A allocates lower positions first, but commits second.
+    let mut tx_a = db.pool.begin().await.unwrap();
+    let a_first: i64 = sqlx::query_scalar(
+        r"
+        INSERT INTO es_events (aggregate_kind, aggregate_id, event_kind, data, metadata)
+        VALUES ($1, $2, $3, $4, $5)
+        RETURNING position
+        ",
+    )
+    .bind("test.aggregate")
+    .bind(id_a)
+    .bind("test-event")
+    .bind(sqlx::types::Json(serde_json::json!({ "data": "a-first" })))
+    .bind(metadata.clone())
+    .fetch_one(&mut *tx_a)
+    .await
+    .unwrap();
+    let a_second: i64 = sqlx::query_scalar(
+        r"
+        INSERT INTO es_events (aggregate_kind, aggregate_id, event_kind, data, metadata)
+        VALUES ($1, $2, $3, $4, $5)
+        RETURNING position
+        ",
+    )
+    .bind("test.aggregate")
+    .bind(id_a)
+    .bind("test-event")
+    .bind(sqlx::types::Json(serde_json::json!({ "data": "a-second" })))
+    .bind(metadata.clone())
+    .fetch_one(&mut *tx_a)
+    .await
+    .unwrap();
+
+    // Transaction B allocates a higher position and commits first.
+    let mut tx_b = db.pool.begin().await.unwrap();
+    let b_position: i64 = sqlx::query_scalar(
+        r"
+        INSERT INTO es_events (aggregate_kind, aggregate_id, event_kind, data, metadata)
+        VALUES ($1, $2, $3, $4, $5)
+        RETURNING position
+        ",
+    )
+    .bind("test.aggregate")
+    .bind(id_b)
+    .bind("test-event")
+    .bind(sqlx::types::Json(serde_json::json!({ "data": "b-only" })))
+    .bind(metadata.clone())
+    .fetch_one(&mut *tx_b)
+    .await
+    .unwrap();
+
+    sqlx::query("SELECT pg_notify($1, $2)")
+        .bind("sourcery_es_events")
+        .bind(b_position.to_string())
+        .execute(&mut *tx_b)
+        .await
+        .unwrap();
+    tx_b.commit().await.unwrap();
+
+    sqlx::query("SELECT pg_notify($1, $2)")
+        .bind("sourcery_es_events")
+        .bind(a_first.to_string())
+        .execute(&mut *tx_a)
+        .await
+        .unwrap();
+    tx_a.commit().await.unwrap();
+
+    let first = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let second = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let third = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(first.position(), a_first);
+    assert_eq!(second.position(), a_second);
+    assert_eq!(third.position(), b_position);
 }

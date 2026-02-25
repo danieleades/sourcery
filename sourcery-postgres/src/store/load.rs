@@ -8,10 +8,8 @@ impl<M> Store<M>
 where
     M: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
-    /// Load all events with positions strictly greater than `from_position`,
-    /// ordered ascending. Passing `None` loads from the beginning.
-    pub(in crate::store) async fn load_all_events_since(
-        &self,
+    pub(in crate::store) async fn load_all_events_since_with_pool(
+        pool: &sqlx::PgPool,
         from_position: Option<i64>,
     ) -> PgLoadResult<M> {
         let mut qb = QueryBuilder::<Postgres>::new(
@@ -24,9 +22,17 @@ where
         }
 
         qb.push(" ORDER BY position ASC");
-        let rows = qb.build().fetch_all(&self.pool).await?;
-
+        let rows = qb.build().fetch_all(pool).await?;
         Self::decode_rows(rows)
+    }
+
+    /// Load all events with positions strictly greater than `from_position`,
+    /// ordered ascending. Passing `None` loads from the beginning.
+    pub(in crate::store) async fn load_all_events_since(
+        &self,
+        from_position: Option<i64>,
+    ) -> PgLoadResult<M> {
+        Self::load_all_events_since_with_pool(&self.pool, from_position).await
     }
 
     /// Deserialise a batch of raw Postgres rows into [`StoredEvent`]s.

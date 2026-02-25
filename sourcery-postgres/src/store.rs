@@ -1,8 +1,7 @@
 mod commit;
+mod live;
 mod load;
 mod subscribe;
-
-use std::marker::PhantomData;
 
 use nonempty::NonEmpty;
 use serde::{Serialize, de::DeserializeOwned};
@@ -28,18 +27,19 @@ use crate::Error;
 #[derive(Clone)]
 pub struct Store<M> {
     pub(crate) pool: PgPool,
-    _phantom: PhantomData<M>,
+    live: live::LivePump<M>,
 }
 
 pub(crate) type PgLoadResult<M> = LoadEventsResult<uuid::Uuid, i64, serde_json::Value, M, Error>;
+pub(crate) type PgStoredEvent<M> = StoredEvent<uuid::Uuid, i64, serde_json::Value, M>;
 
 impl<M> Store<M> {
     /// Construct a `PostgreSQL` event store from a connection pool.
     #[must_use]
-    pub const fn new(pool: PgPool) -> Self {
+    pub fn new(pool: PgPool) -> Self {
         Self {
+            live: live::LivePump::new(pool.clone()),
             pool,
-            _phantom: PhantomData,
         }
     }
 }
@@ -351,14 +351,14 @@ where
     where
         Self::Position: Ord,
     {
-        self.subscribe_with_listener(from_position, Some(filters.to_vec()))
+        self.subscribe_with_live_pump(from_position, Some(filters.to_vec()))
     }
 
     fn subscribe_all(&self, from_position: Option<Self::Position>) -> EventStream<'_, Self>
     where
         Self::Position: Ord,
     {
-        self.subscribe_with_listener(from_position, None)
+        self.subscribe_with_live_pump(from_position, None)
     }
 }
 
