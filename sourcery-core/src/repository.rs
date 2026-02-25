@@ -896,7 +896,7 @@ where
         events: NonEmpty<A::Event>,
         prepared_snapshot: M::Prepared,
         metadata: &S::Metadata,
-    ) -> Result<(), CommandError<A::Error, C::ConcurrencyError, S::Error, M::SnapshotError>>
+    ) -> Result<S::Position, CommandError<A::Error, C::ConcurrencyError, S::Error, M::SnapshotError>>
     where
         A: Aggregate<Id = S::Id>,
         A::Event: EventKind + Serialize + Send + Sync,
@@ -917,11 +917,13 @@ where
                 A::KIND,
                 id,
                 events_since_snapshot,
-                new_position,
+                new_position.clone(),
                 prepared_snapshot,
             )
             .await
-            .map_err(CommandError::Snapshot)
+            .map_err(CommandError::Snapshot)?;
+
+        Ok(new_position)
     }
 
     /// Persist new events produced from a creation command.
@@ -933,7 +935,7 @@ where
         id: &S::Id,
         events: NonEmpty<A::Event>,
         metadata: &S::Metadata,
-    ) -> Result<(), CommandError<A::Error, C::ConcurrencyError, S::Error, M::SnapshotError>>
+    ) -> Result<S::Position, CommandError<A::Error, C::ConcurrencyError, S::Error, M::SnapshotError>>
     where
         A: Aggregate<Id = S::Id>,
         A::Event: EventKind + Serialize + Send + Sync,
@@ -967,7 +969,7 @@ where
         events_since_snapshot: u64,
         events: NonEmpty<A::Event>,
         metadata: &S::Metadata,
-    ) -> Result<(), CommandError<A::Error, C::ConcurrencyError, S::Error, M::SnapshotError>>
+    ) -> Result<S::Position, CommandError<A::Error, C::ConcurrencyError, S::Error, M::SnapshotError>>
     where
         A: Aggregate<Id = S::Id>,
         A::Event: EventKind + Serialize + Send + Sync,
@@ -992,6 +994,10 @@ where
 
     /// Execute a creation command, initialising a new aggregate stream.
     ///
+    /// Returns `Ok(Some(position))` when the command emits events, with
+    /// `position` set to the last committed event position. Returns `Ok(None)`
+    /// when the command emits no events.
+    ///
     /// # Errors
     ///
     /// Returns [`CommandError`] when the aggregate rejects the command, events
@@ -1003,7 +1009,10 @@ where
         id: &S::Id,
         command: &Cmd,
         metadata: &S::Metadata,
-    ) -> Result<(), CommandError<A::Error, C::ConcurrencyError, S::Error, M::SnapshotError>>
+    ) -> Result<
+        Option<S::Position>,
+        CommandError<A::Error, C::ConcurrencyError, S::Error, M::SnapshotError>,
+    >
     where
         A: Aggregate<Id = S::Id> + HandleCreate<Cmd>,
         A::Event: EventKind + Serialize + Send + Sync,
@@ -1029,13 +1038,19 @@ where
             .map_err(|error| CommandError::Aggregate(error.into()))?;
 
         let Some(events) = NonEmpty::from_vec(new_events) else {
-            return Ok(());
+            return Ok(None);
         };
 
-        self.finalize_create::<A>(id, events, metadata).await
+        self.finalize_create::<A>(id, events, metadata)
+            .await
+            .map(Some)
     }
 
     /// Execute a command against an existing aggregate stream.
+    ///
+    /// Returns `Ok(Some(position))` when the command emits events, with
+    /// `position` set to the last committed event position. Returns `Ok(None)`
+    /// when the command emits no events.
     ///
     /// # Errors
     ///
@@ -1049,7 +1064,10 @@ where
         id: &S::Id,
         command: &Cmd,
         metadata: &S::Metadata,
-    ) -> Result<(), CommandError<A::Error, C::ConcurrencyError, S::Error, M::SnapshotError>>
+    ) -> Result<
+        Option<S::Position>,
+        CommandError<A::Error, C::ConcurrencyError, S::Error, M::SnapshotError>,
+    >
     where
         A: Aggregate<Id = S::Id> + Handle<Cmd> + Send,
         A::Event: ProjectionEvent + EventKind + Serialize + Send + Sync,
@@ -1073,7 +1091,7 @@ where
             .map_err(|error| CommandError::Aggregate(error.into()))?;
 
         let Some(events) = NonEmpty::from_vec(new_events) else {
-            return Ok(());
+            return Ok(None);
         };
 
         self.finalize_update::<A>(
@@ -1085,6 +1103,7 @@ where
             metadata,
         )
         .await
+        .map(Some)
     }
 
     /// Execute a command that may create or update an aggregate stream.
@@ -1094,6 +1113,10 @@ where
     ///
     /// Use this method when a command is valid for both new and existing
     /// aggregates and no lifecycle enforcement is required.
+    ///
+    /// Returns `Ok(Some(position))` when the command emits events, with
+    /// `position` set to the last committed event position. Returns `Ok(None)`
+    /// when the command emits no events.
     ///
     /// # Errors
     ///
@@ -1106,7 +1129,10 @@ where
         id: &S::Id,
         command: &Cmd,
         metadata: &S::Metadata,
-    ) -> Result<(), CommandError<A::Error, C::ConcurrencyError, S::Error, M::SnapshotError>>
+    ) -> Result<
+        Option<S::Position>,
+        CommandError<A::Error, C::ConcurrencyError, S::Error, M::SnapshotError>,
+    >
     where
         A: Aggregate<Id = S::Id> + Handle<Cmd> + HandleCreate<Cmd> + Send,
         A::Event: ProjectionEvent + EventKind + Serialize + Send + Sync,
@@ -1129,7 +1155,7 @@ where
                 .map_err(|error| CommandError::Aggregate(error.into()))?;
 
             let Some(events) = NonEmpty::from_vec(new_events) else {
-                return Ok(());
+                return Ok(None);
             };
 
             self.finalize_update::<A>(
@@ -1141,15 +1167,18 @@ where
                 metadata,
             )
             .await
+            .map(Some)
         } else {
             let new_events = <A as HandleCreate<Cmd>>::handle_create(command)
                 .map_err(|error| CommandError::Aggregate(error.into()))?;
 
             let Some(events) = NonEmpty::from_vec(new_events) else {
-                return Ok(());
+                return Ok(None);
             };
 
-            self.finalize_create::<A>(id, events, metadata).await
+            self.finalize_create::<A>(id, events, metadata)
+                .await
+                .map(Some)
         }
     }
 }
@@ -1341,8 +1370,9 @@ where
     /// Execute a command against an existing aggregate stream, retrying
     /// automatically on concurrency conflicts.
     ///
-    /// Returns the number of attempts made (1-based). Immediately surfaces any
-    /// non-concurrency error.
+    /// Returns `(attempts, position)` where `attempts` is the number of
+    /// attempts made (1-based), and `position` is the last committed event
+    /// position when the command emitted events.
     ///
     /// # Errors
     ///
@@ -1355,7 +1385,7 @@ where
         metadata: &S::Metadata,
         max_retries: usize,
     ) -> Result<
-        usize,
+        (usize, Option<S::Position>),
         CommandError<A::Error, ConcurrencyConflict<S::Position>, S::Error, M::SnapshotError>,
     >
     where
@@ -1368,7 +1398,7 @@ where
     {
         for attempt in 1..=max_retries {
             match self.update::<A, Cmd>(id, command, metadata).await {
-                Ok(()) => return Ok(attempt),
+                Ok(position) => return Ok((attempt, position)),
                 Err(CommandError::Concurrency(_)) => {}
                 Err(e) => return Err(e),
             }
@@ -1376,7 +1406,7 @@ where
 
         self.update::<A, Cmd>(id, command, metadata)
             .await
-            .map(|()| max_retries + 1)
+            .map(|position| (max_retries + 1, position))
     }
 }
 

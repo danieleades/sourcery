@@ -6,6 +6,25 @@ The `inmemory::Store` is useful for testing, but production systems need durable
 
 See [Stores](../core-traits/stores.md) for the full trait definition.
 
+## Supporting Subscriptions and Read-Your-Writes
+
+`EventStore` alone is enough for command handling and `load_projection`.
+
+To support `Repository::subscribe()` and `Subscription::wait_for(position)`, implement:
+
+- `GloballyOrderedStore::latest_position()` for global log tip checks
+- `SubscribableStore::subscribe(...)` for filtered projection streams
+- `SubscribableStore::subscribe_all(...)` for global catch-up waits
+
+`wait_for` uses these in a lazy flow:
+
+1. Return immediately if already caught up locally
+2. Confirm global commit position via `latest_position()`
+3. If needed, wait on `subscribe_all(...)` until the target position exists
+4. Wait for the projection to apply the required relevant event (or short-circuit if none)
+
+For SQL backends, prefer event-driven notifications over polling (for example `LISTEN/NOTIFY` in PostgreSQL).
+
 ## Design Decisions
 
 ### Position Type

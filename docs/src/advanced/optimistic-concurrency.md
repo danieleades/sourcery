@@ -51,7 +51,8 @@ match repo
     .update::<MyAggregate, MyCommand>(&id, &command, &metadata)
     .await
 {
-    Ok(()) => println!("Success!"),
+    Ok(Some(position)) => println!("Success at position {position}"),
+    Ok(None) => println!("Command succeeded but emitted no events"),
     Err(CommandError::Concurrency(conflict)) => {
         println!(
             "Conflict: expected version {:?}, actual {:?}",
@@ -70,11 +71,10 @@ The most common pattern for handling conflicts is to **retry** the operation.
 The repository provides a helper for this: `update_with_retry`.
 
 ```rust,ignore
-use sourcery::repository::RetryResult;
-
-let attempts: RetryResult<MyAggregate, MyStore> =
-    repo.update_with_retry::<MyAggregate, MyCommand>(&id, &command, &metadata, 3).await?;
-println!("Succeeded after {attempts} attempt(s)");
+let (attempts, position) = repo
+    .update_with_retry::<MyAggregate, MyCommand>(&id, &command, &metadata, 3)
+    .await?;
+println!("Succeeded after {attempts} attempt(s); last position: {position:?}");
 ```
 
 `update_with_retry` retries existing-stream commands. Use `create` for

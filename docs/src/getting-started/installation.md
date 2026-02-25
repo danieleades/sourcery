@@ -15,7 +15,7 @@ The crate re-exports the derive macro, so you don't need a separate dependency f
 | Feature | Description |
 |---------|-------------|
 | `test-util` | Enables `TestFramework` for given-when-then aggregate testing |
-| `postgres` | PostgreSQL event store via `sqlx` |
+| `postgres` | PostgreSQL event/snapshot stores via `sqlx`, including event-driven subscriptions |
 
 To enable test utilities:
 

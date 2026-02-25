@@ -2380,6 +2380,7 @@ dependencies = [
 name = "sourcery-postgres"
 version = "0.2.0"
 dependencies = [
+ "async-stream",
  "criterion",
  "nonempty",
  "serde",
@@ -2390,6 +2391,7 @@ dependencies = [
  "testcontainers-modules",
  "thiserror",
  "tokio",
+ "tokio-stream",
  "tracing",
  "uuid",
 ]

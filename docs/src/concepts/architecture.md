@@ -62,7 +62,7 @@ Repo -> Agg: "handle(command)"
 Agg -> Repo: "Vec<Event>" {style.stroke-dash: 3}
 Repo -> Store: "commit_events()"
 Repo -> Snap: "offer_snapshot()?"
-Repo -> App: "Ok(())" {style.stroke-dash: 3}
+Repo -> App: "Ok(Some(last_position)) | Ok(None)" {style.stroke-dash: 3}
 ```
 
 ## Projection Loading Flow

@@ -18,12 +18,14 @@ default = []
 
 [dependencies]
 sourcery-core = { path = "../sourcery-core", version = "0.2" }
+async-stream = "0.3"
 nonempty = "0.12"
 serde = { version = "1", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
 sqlx = { version = "0.8.3", default-features = false, features = ["json", "postgres", "runtime-tokio-rustls", "uuid"] }
 thiserror = { version = "2", default-features = false, features = ["std"] }
 tracing = { version = "0.1", default-features = false, features = ["attributes", "std"] }
+tokio = { version = "1", default-features = false, features = ["rt", "sync", "time"] }
 uuid = { version = "1", default-features = false, features = ["std"] }
 
 [dev-dependencies]
@@ -32,6 +34,7 @@ serde_json = { version = "1", default-features = false, features = ["std"] }
 testcontainers = { version = "0.27", default-features = false }
 testcontainers-modules = { version = "0.15", default-features = false, features = ["postgres"] }
 tokio = { version = "1", default-features = false, features = ["macros", "rt-multi-thread"] }
+tokio-stream = "0.1"
 uuid = { version = "1", default-features = false, features = ["std", "v4"] }
 
 [[bench]]

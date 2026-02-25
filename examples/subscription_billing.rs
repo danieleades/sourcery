@@ -663,6 +663,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn consume_updates(
     subscription: &mut sourcery::subscription::Subscription<
         CustomerBillingProjection,
+        u64,
         sourcery::store::inmemory::InMemoryError,
     >,
     live_projection: &Arc<Mutex<CustomerBillingProjection>>,

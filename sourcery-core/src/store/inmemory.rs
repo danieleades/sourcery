@@ -31,6 +31,9 @@ use crate::{
 
 /// Event stream stored in memory with fixed position and data types.
 type InMemoryStream<Id, M> = Vec<StoredEvent<Id, u64, serde_json::Value, M>>;
+type InMemoryStreamItem<Id, M> = Result<StoredEvent<Id, u64, serde_json::Value, M>, InMemoryError>;
+type InMemoryEventStream<Id, M> =
+    Pin<Box<dyn futures_core::Stream<Item = InMemoryStreamItem<Id, M>> + Send>>;
 
 /// In-memory event store that keeps streams in a hash map.
 ///
@@ -145,15 +148,11 @@ where
         Self::Metadata: Clone,
     {
         let result = (|| {
-            // Serialize all events first
-            let mut staged = Vec::with_capacity(events.len());
-            for (index, event) in events.iter().enumerate() {
-                let data = serde_json::to_value(event).map_err(|e| CommitError::Serialization {
+            let staged =
+                prepare_events(&events).map_err(|(index, error)| CommitError::Serialization {
                     index,
-                    source: InMemoryError::Serialization(Box::new(e)),
+                    source: InMemoryError::Serialization(Box::new(error)),
                 })?;
-                staged.push((event.kind().to_string(), data));
-            }
 
             let mut inner = self.inner.write().expect("in-memory store lock poisoned");
             let (last_position, notify_tx) =
@@ -183,17 +182,12 @@ where
         Self::Metadata: Clone,
     {
         let result = (|| {
-            // Serialize all events first
-            let mut staged = Vec::with_capacity(events.len());
-            for (index, event) in events.iter().enumerate() {
-                let data = serde_json::to_value(event).map_err(|e| {
-                    OptimisticCommitError::Serialization {
-                        index,
-                        source: InMemoryError::Serialization(Box::new(e)),
-                    }
-                })?;
-                staged.push((event.kind().to_string(), data));
-            }
+            let staged = prepare_events(&events).map_err(|(index, error)| {
+                OptimisticCommitError::Serialization {
+                    index,
+                    source: InMemoryError::Serialization(Box::new(error)),
+                }
+            })?;
 
             let mut inner = self.inner.write().expect("in-memory store lock poisoned");
             let stream_key = StreamKey::new(aggregate_kind, aggregate_id.clone());
@@ -275,6 +269,20 @@ where
     Id: Clone + Eq + std::hash::Hash + Send + Sync + 'static,
     M: Clone + Send + Sync + 'static,
 {
+    fn latest_position(
+        &self,
+    ) -> impl std::future::Future<Output = Result<Option<Self::Position>, Self::Error>> + Send + '_
+    {
+        let latest = self
+            .inner
+            .read()
+            .expect("in-memory store lock poisoned")
+            // `next_position` is one ahead of the last assigned position.
+            // `checked_sub(1)` therefore yields `None` for an empty store.
+            .next_position
+            .checked_sub(1);
+        std::future::ready(Ok(latest))
+    }
 }
 
 impl<Id, M> SubscribableStore for Store<Id, M>
@@ -301,54 +309,83 @@ where
         Self::Position: Ord,
     {
         let filters = filters.to_vec();
-        let inner = self.inner.clone();
+        subscribe_with_loader(self.inner.clone(), from_position, move |inner, from| {
+            load_matching_events_after(inner, &filters, from)
+        })
+    }
 
-        // Subscribe to broadcast FIRST to avoid missing events committed
-        // between the historical load and live listening.
-        let mut rx = {
+    fn subscribe_all(
+        &self,
+        from_position: Option<Self::Position>,
+    ) -> Pin<
+        Box<
+            dyn futures_core::Stream<
+                    Item = Result<
+                        StoredEvent<Self::Id, Self::Position, Self::Data, Self::Metadata>,
+                        Self::Error,
+                    >,
+                > + Send
+                + '_,
+        >,
+    >
+    where
+        Self::Position: Ord,
+    {
+        subscribe_with_loader(self.inner.clone(), from_position, load_all_events_since)
+    }
+}
+
+fn subscribe_with_loader<Id, M, Load>(
+    inner: Arc<RwLock<Inner<Id, M>>>,
+    from_position: Option<u64>,
+    mut load_since: Load,
+) -> InMemoryEventStream<Id, M>
+where
+    Id: Clone + Eq + std::hash::Hash + Send + Sync + 'static,
+    M: Clone + Send + Sync + 'static,
+    Load: FnMut(&Inner<Id, M>, Option<u64>) -> Vec<StoredEvent<Id, u64, serde_json::Value, M>>
+        + Send
+        + 'static,
+{
+    // Subscribe to broadcast FIRST to avoid missing events committed
+    // between the historical load and live listening.
+    let mut rx = {
+        let guard = inner.read().expect("in-memory store lock poisoned");
+        guard.notify_tx.subscribe()
+    };
+
+    Box::pin(async_stream::stream! {
+        // 1. Load and yield historical events.
+        let historical = {
             let guard = inner.read().expect("in-memory store lock poisoned");
-            guard.notify_tx.subscribe()
+            load_since(&guard, from_position)
         };
 
-        Box::pin(async_stream::stream! {
-            // 1. Load and yield historical events
-            let historical = {
+        let mut last_position = from_position;
+
+        for event in historical {
+            if let Some(ref lp) = last_position
+                && event.position <= *lp
+            {
+                continue;
+            }
+            last_position = Some(event.position);
+            yield Ok(event);
+        }
+
+        // 2. Process live events from broadcast; stop when the store is dropped.
+        while let Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) = rx.recv().await {
+            let events = {
                 let guard = inner.read().expect("in-memory store lock poisoned");
-                load_matching_events(&guard, &filters)
+                load_since(&guard, last_position)
             };
 
-            let mut last_position = from_position;
-
-            for event in historical {
-                // Skip events at or before our starting position
-                if let Some(ref lp) = last_position
-                    && event.position <= *lp
-                {
-                    continue;
-                }
+            for event in events {
                 last_position = Some(event.position);
                 yield Ok(event);
             }
-
-            // 2. Process live events from broadcast; stop when the store is dropped.
-            while let Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) = rx.recv().await {
-                let events = {
-                    let guard = inner.read().expect("in-memory store lock poisoned");
-                    load_matching_events(&guard, &filters)
-                };
-
-                for event in events {
-                    if let Some(ref lp) = last_position
-                        && event.position <= *lp
-                    {
-                        continue;
-                    }
-                    last_position = Some(event.position);
-                    yield Ok(event);
-                }
-            }
-        })
-    }
+        }
+    })
 }
 
 /// Append a batch of pre-serialised events to the store, assigning positions.
@@ -388,6 +425,45 @@ where
     inner.streams.entry(stream_key).or_default().extend(stored);
     let notify_tx = inner.notify_tx.clone();
     (last_position, notify_tx)
+}
+
+fn prepare_events<E>(
+    events: &NonEmpty<E>,
+) -> Result<Vec<(String, serde_json::Value)>, (usize, serde_json::Error)>
+where
+    E: crate::event::EventKind + serde::Serialize,
+{
+    let mut staged = Vec::with_capacity(events.len());
+    for (index, event) in events.iter().enumerate() {
+        let data = serde_json::to_value(event).map_err(|error| (index, error))?;
+        staged.push((event.kind().to_string(), data));
+    }
+    Ok(staged)
+}
+
+/// Load all events matching the given filters, sorted by position.
+fn load_matching_events_after<Id, M>(
+    inner: &Inner<Id, M>,
+    filters: &[EventFilter<Id, u64>],
+    from_position: Option<u64>,
+) -> Vec<StoredEvent<Id, u64, serde_json::Value, M>>
+where
+    Id: Clone + Eq + std::hash::Hash,
+    M: Clone,
+{
+    let positioned_filters = filters
+        .iter()
+        .cloned()
+        .map(|mut filter| {
+            if let Some(from) = from_position {
+                filter.after_position =
+                    Some(filter.after_position.map_or(from, |after| after.max(from)));
+            }
+            filter
+        })
+        .collect::<Vec<_>>();
+
+    load_matching_events(inner, &positioned_filters)
 }
 
 /// Load all events matching the given filters, sorted by position.
@@ -462,6 +538,29 @@ where
                         result.push(event.clone());
                     }
                 }
+            }
+        }
+    }
+
+    result.sort_by_key(|event| event.position);
+    result
+}
+
+/// Load all events after `from_position` (exclusive), sorted by position.
+fn load_all_events_since<Id, M>(
+    inner: &Inner<Id, M>,
+    from_position: Option<u64>,
+) -> Vec<StoredEvent<Id, u64, serde_json::Value, M>>
+where
+    Id: Clone + Eq + std::hash::Hash,
+    M: Clone,
+{
+    let mut result = Vec::new();
+
+    for stream in inner.streams.values() {
+        for event in stream {
+            if from_position.is_none_or(|from| event.position > from) {
+                result.push(event.clone());
             }
         }
     }

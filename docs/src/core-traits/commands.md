@@ -31,15 +31,24 @@ impl Handle<Deposit> for Account {
 
 ```rust,ignore
 // First command for a new stream
-repository
+let created_position = repository
     .create::<Account, OpenAccount>(&account_id, &OpenAccount { initial_balance: 0 }, &metadata)
     .await?;
 
 // Subsequent commands for an existing stream
-repository
+let updated_position = repository
     .update::<Account, Deposit>(&account_id, &Deposit { amount: 100 }, &metadata)
     .await?;
 ```
+
+`create`, `update`, and `upsert` return `Result<Option<Position>, ...>`:
+
+- `Some(position)` when events were committed
+- `None` when the command emitted no events
+
+This is useful for read-your-writes flows with subscriptions: if you get
+`Some(position)`, call `subscription.wait_for(position).await?` before reading
+the projection.
 
 ## Validation Patterns
 
