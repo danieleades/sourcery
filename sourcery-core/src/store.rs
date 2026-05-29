@@ -55,12 +55,6 @@ pub struct StoredEvent<Id, Pos, Data, M> {
 }
 
 impl<Id, Pos, Data, M> StoredEvent<Id, Pos, Data, M> {
-    /// Returns the aggregate type identifier.
-    #[inline]
-    pub fn aggregate_kind(&self) -> &str {
-        &self.aggregate_kind
-    }
-
     /// Returns a reference to the aggregate instance identifier.
     #[inline]
     pub const fn aggregate_id(&self) -> &Id {

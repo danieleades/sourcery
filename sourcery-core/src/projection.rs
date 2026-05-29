@@ -14,7 +14,7 @@ use crate::{
     store::{EventFilter, EventStore, StoredEvent},
 };
 
-/// Base trait for types that subscribe to events.
+/// A read model built by applying a filtered stream of events.
 ///
 /// The `filters()` method returns both the event filters AND the handlers
 /// needed to process those events. It is generic over the store type `S`,
@@ -24,9 +24,9 @@ use crate::{
 /// `filters()` must be **pure and deterministic**: given the same
 /// `instance_id`, it must always return the same filter set.
 ///
-/// `init()` constructs a fresh instance from the instance identifier.
-/// This replaces the `Default` constraint, allowing instance-aware
-/// projections to capture their identity at construction time.
+/// `init()` constructs a fresh instance from the instance identifier,
+/// allowing instance-aware projections to capture their identity at
+/// construction time rather than inferring it from the first event.
 // ANCHOR: projection_trait
 pub trait Projection: Sized {
     /// Stable identifier for this projection type, used for snapshot storage.
@@ -140,9 +140,9 @@ pub struct Filters<S, P>
 where
     S: EventStore,
 {
-    /// Position-free filter specs; positions are injected at load/subscribe
-    /// time in [`into_event_filters`](Self::into_event_filters).
-    pub(crate) specs: Vec<EventFilter<S::Id, ()>>,
+    /// Filter specs. `after_position` is left unset here and injected at
+    /// load/subscribe time in [`into_event_filters`](Self::into_event_filters).
+    pub(crate) specs: Vec<EventFilter<S::Id, S::Position>>,
     /// Map of event kind string → handler closure for that kind.
     pub(crate) handlers: HashMap<&'static str, EventHandler<P, S>>,
 }
@@ -263,16 +263,14 @@ where
         self
     }
 
-    /// Convert positionless filter specs into positioned [`EventFilter`]s.
+    /// Apply the load/subscribe position to every filter spec.
     pub(crate) fn into_event_filters(self, after: Option<&S::Position>) -> PositionedFilters<S, P> {
         let filters = self
             .specs
             .into_iter()
-            .map(|spec| EventFilter {
-                event_kind: spec.event_kind,
-                aggregate_kind: spec.aggregate_kind,
-                aggregate_id: spec.aggregate_id,
-                after_position: after.cloned(),
+            .map(|mut spec| {
+                spec.after_position = after.cloned();
+                spec
             })
             .collect();
         (filters, self.handlers)

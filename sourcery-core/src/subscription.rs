@@ -34,6 +34,7 @@
 
 use std::{
     collections::HashMap,
+    future::Future,
     pin::Pin,
     task::{Context, Poll},
 };
@@ -48,27 +49,30 @@ use crate::{
     event::EventDecodeError,
     projection::{HandlerError, Projection},
     snapshot::{Snapshot, SnapshotStore},
-    store::{EventFilter, EventStore, GloballyOrderedStore, StoredEvent},
+    store::{EventFilter, EventStore, StoredEvent},
 };
 
-/// Type alias for the boxed event stream returned by
-/// [`SubscribableStore::subscribe`].
-pub type EventStream<'a, S> = Pin<
-    Box<
-        dyn Stream<
-                Item = Result<
-                    StoredEvent<
-                        <S as EventStore>::Id,
-                        <S as EventStore>::Position,
-                        <S as EventStore>::Data,
-                        <S as EventStore>::Metadata,
-                    >,
-                    <S as EventStore>::Error,
-                >,
-            > + Send
-            + 'a,
+/// A stored event paired with the [`Checkpoint`](SubscribableStore::Checkpoint)
+/// that marks its place in the commit-ordered delivery stream.
+///
+/// The `event` is the ordinary [`StoredEvent`]; the `checkpoint` is the opaque,
+/// ordered cursor a subscriber persists to resume later.
+pub struct Checkpointed<S: SubscribableStore + ?Sized> {
+    /// Cursor marking this event's position in the delivery stream.
+    pub checkpoint: S::Checkpoint,
+    /// The delivered event.
+    pub event: StoredEvent<
+        <S as EventStore>::Id,
+        <S as EventStore>::Position,
+        <S as EventStore>::Data,
+        <S as EventStore>::Metadata,
     >,
->;
+}
+
+/// Type alias for the boxed, checkpoint-tagged event stream returned by
+/// [`SubscribableStore::subscribe`].
+pub type CheckpointStream<'a, S> =
+    Pin<Box<dyn Stream<Item = Result<Checkpointed<S>, <S as EventStore>::Error>> + Send + 'a>>;
 
 /// A store that supports push-based event subscriptions.
 ///
@@ -78,29 +82,65 @@ pub type EventStream<'a, S> = Pin<
 ///
 /// This is a separate trait (not on [`EventStore`] directly) because not all
 /// stores support push notifications. The in-memory store uses
-/// `tokio::sync::broadcast`; a `PostgreSQL` implementation would use
-/// `LISTEN/NOTIFY`.
-pub trait SubscribableStore: EventStore + GloballyOrderedStore {
+/// `tokio::sync::broadcast`; a `PostgreSQL` implementation uses `LISTEN/NOTIFY`
+/// plus transaction-id stability gating.
+///
+/// Subscription delivery order comes from [`Checkpoint`](Self::Checkpoint), not
+/// from [`EventStore::Position`], so a store with per-stream (or `()`)
+/// positions can still be subscribable.
+///
+/// # Checkpoints versus positions
+///
+/// A subscription cursor is **not** an [`EventStore::Position`]. `Position` is
+/// the per-stream version assigned at write time; it is dense per stream but
+/// not a safe global subscription cursor on stores where positions become
+/// visible out of assignment order (e.g. `BIGSERIAL` under concurrent commits).
+/// [`Checkpoint`](Self::Checkpoint) is a store-defined, opaque, ordered cursor
+/// that advances in *delivery* order and is gap-free for resumption.
+// ANCHOR: subscribable_store_trait
+pub trait SubscribableStore: EventStore {
+    /// Opaque, ordered cursor into the commit-ordered delivery stream.
+    ///
+    /// The store guarantees that checkpoints emitted by [`subscribe`] are
+    /// strictly increasing in delivery order, so a subscriber can deduplicate
+    /// and resume using a single `Checkpoint` value.
+    ///
+    /// [`subscribe`]: Self::subscribe
+    type Checkpoint: Clone + Ord + Send + Sync + Serialize + DeserializeOwned + 'static;
+
     /// Subscribe to events matching the given filters.
     ///
     /// Returns a stream that:
-    /// 1. Yields all historical events after `from_position` (catch-up phase)
+    /// 1. Yields all historical events after `from` (catch-up phase)
     /// 2. Yields live events as they are committed (live phase)
     ///
-    /// `from_position` is **exclusive**: the stream yields events strictly
-    /// *after* the given position.
+    /// `from` is **exclusive**: the stream yields events strictly *after* the
+    /// given checkpoint. Pass `None` to start from the beginning.
     ///
-    /// **Delivery guarantee**: at-least-once. The stream may yield duplicate
-    /// events during the catch-up-to-live transition. The subscription loop
-    /// deduplicates by position.
+    /// **Delivery guarantee**: at-least-once, in strictly increasing
+    /// [`Checkpoint`](Self::Checkpoint) order. The stream may yield duplicate
+    /// events during the catch-up-to-live transition; the subscription loop
+    /// deduplicates by checkpoint.
     fn subscribe(
         &self,
         filters: &[EventFilter<Self::Id, Self::Position>],
-        from_position: Option<Self::Position>,
-    ) -> EventStream<'_, Self>
-    where
-        Self::Position: Ord;
+        from: Option<Self::Checkpoint>,
+    ) -> CheckpointStream<'_, Self>;
+
+    /// The largest checkpoint currently reachable by catch-up for `filters`.
+    ///
+    /// Used to decide when a freshly started subscription has finished
+    /// replaying history. Returns `None` when no matching events exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store-specific error when the query fails.
+    fn current_checkpoint(
+        &self,
+        filters: &[EventFilter<Self::Id, Self::Position>],
+    ) -> impl Future<Output = Result<Option<Self::Checkpoint>, Self::Error>> + Send;
 }
+// ANCHOR_END: subscribable_store_trait
 
 /// Errors that can occur during subscription lifecycle.
 #[derive(Debug, Error)]
@@ -249,7 +289,6 @@ where
 impl<S, P, SS> SubscriptionBuilder<S, P, SS>
 where
     S: SubscribableStore + Clone + Send + Sync + 'static,
-    S::Position: Ord + Send + Sync,
     S::Data: Send,
     S::Metadata: Send + Sync,
     P: Projection<Id = S::Id, Metadata = S::Metadata>
@@ -260,7 +299,7 @@ where
         + 'static,
     P::InstanceId: Clone + Send + Sync + 'static,
     P::Metadata: Send,
-    SS: SnapshotStore<P::InstanceId, Position = S::Position> + Send + Sync + 'static,
+    SS: SnapshotStore<P::InstanceId, Position = S::Checkpoint> + Send + Sync + 'static,
 {
     /// Create a builder. Called internally by [`Repository::subscribe`] and
     /// [`Repository::subscribe_with_snapshots`].
@@ -277,8 +316,8 @@ where
     /// This method returns only after catch-up completes.
     ///
     /// Spawns a background task that:
-    /// 1. Loads the most recent snapshot (if available)
-    /// 2. Subscribes to the event stream from the snapshot position
+    /// 1. Loads the most recent snapshot and its checkpoint (if available)
+    /// 2. Subscribes to the event stream from that checkpoint
     /// 3. Replays historical events (catch-up phase)
     /// 4. Waits until catch-up is complete
     /// 5. Continues processing live events and yielding projection updates
@@ -304,54 +343,26 @@ where
 
         let (update_tx, update_rx) = tokio::sync::mpsc::unbounded_channel();
 
-        let (mut projection, snapshot_position) =
+        // Resume from the persisted checkpoint, if any.
+        let (mut projection, from_checkpoint) =
             load_snapshot::<P, SS>(&snapshots, &instance_id).await;
 
-        // Build filters and load historical events
+        // Filters are position-free: the subscription cursor is the checkpoint,
+        // passed to `subscribe` directly rather than baked into the filters.
         let filters = P::filters::<S>(&instance_id);
-        let (event_filters, handlers) = filters.into_event_filters(snapshot_position.as_ref());
+        let (event_filters, handlers) = filters.into_event_filters(None);
 
-        let current_events = store
-            .load_events(&event_filters)
+        // Snapshot the catch-up target before subscribing.
+        let catchup_target = store
+            .current_checkpoint(&event_filters)
             .await
             .map_err(SubscriptionError::Store)?;
 
-        let catchup_target_position = current_events.last().map(|e| e.position.clone());
-
-        // Apply all historical events
-        let mut last_position = snapshot_position;
-        let mut events_since_snapshot: u64 = 0;
-
-        for stored in &current_events {
-            process_subscription_event(
-                &mut projection,
-                stored,
-                &handlers,
-                &store,
-                &update_tx,
-                &mut last_position,
-                &mut events_since_snapshot,
-            )?;
-        }
-
-        // Offer snapshot after catch-up (preserve counter if declined)
-        if events_since_snapshot > 0
-            && let Some(ref pos) = last_position
-            && offer_projection_snapshot(
-                &snapshots,
-                &instance_id,
-                events_since_snapshot,
-                pos,
-                &projection,
-            )
-            .await
-        {
-            events_since_snapshot = 0;
-        }
-
-        // Spawn live subscription task
         let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+
+        let mut last_checkpoint = from_checkpoint.clone();
+        let mut events_since_snapshot: u64 = 0;
 
         let task = tokio::spawn(async move {
             let mut ready_tx = Some(ready_tx);
@@ -362,29 +373,14 @@ where
                 }
             };
 
-            // Build filters for live stream from our current position
-            let filters = P::filters::<S>(&instance_id);
-            let (live_filters, handlers) = filters.into_event_filters(last_position.as_ref());
-
-            let mut stream = store.subscribe(&live_filters, last_position.clone());
-
-            // Determine the effective catch-up target by querying the store
-            // after the live stream is attached. This captures any events
-            // committed during the gap between the initial load_events and
-            // subscribe — those events are buffered in the stream and must
-            // be applied before the projection is truly current.
-            let catchup_target = store
-                .load_events(&live_filters)
-                .await
-                .map_err(SubscriptionError::Store)?
-                .last()
-                .map(|e| e.position.clone())
-                .or(catchup_target_position);
-
-            // If already caught up (no pending gap events), signal immediately.
-            if catchup_target.is_none() || last_position >= catchup_target {
+            // `caught_up` flips once we've replayed up to the target captured
+            // above; the catch-up and live phases share this single loop.
+            let mut caught_up = catchup_target.is_none() || last_checkpoint >= catchup_target;
+            if caught_up {
                 signal_ready(&mut ready_tx);
             }
+
+            let mut stream = store.subscribe(&event_filters, from_checkpoint);
 
             loop {
                 tokio::select! {
@@ -393,45 +389,59 @@ where
                         tracing::debug!("subscription stopped");
                         break;
                     }
-                    event = stream.next() => {
-                        let Some(result) = event else {
+                    item = stream.next() => {
+                        let Some(result) = item else {
                             tracing::debug!("subscription stream ended");
                             break;
                         };
 
-                        let stored = result.map_err(SubscriptionError::Store)?;
+                        let delivery = result.map_err(SubscriptionError::Store)?;
 
-                        // Position-based deduplication
-                        if let Some(ref lp) = last_position
-                            && stored.position <= *lp
+                        // Checkpoint-based deduplication (delivery order is
+                        // strictly increasing in checkpoint).
+                        if let Some(ref lc) = last_checkpoint
+                            && delivery.checkpoint <= *lc
                         {
                             continue;
                         }
 
                         process_subscription_event(
                             &mut projection,
-                            &stored,
+                            delivery,
                             &handlers,
                             &store,
                             &update_tx,
-                            &mut last_position,
+                            &mut last_checkpoint,
                             &mut events_since_snapshot,
                         )?;
 
-                        // Signal catch-up completion once we've processed
-                        // past the effective target (includes gap events).
-                        if catchup_target.is_none() || last_position >= catchup_target {
+                        if !caught_up
+                            && (catchup_target.is_none() || last_checkpoint >= catchup_target)
+                        {
+                            // Catch-up complete: signal readiness and persist
+                            // the checkpoint we replayed to.
+                            caught_up = true;
                             signal_ready(&mut ready_tx);
-                        }
-
-                        // Periodically offer snapshots
-                        if events_since_snapshot.is_multiple_of(100)
-                            && let Some(ref pos) = last_position
+                            if events_since_snapshot > 0
+                                && let Some(ref cp) = last_checkpoint
+                                && offer_projection_snapshot(
+                                    &snapshots,
+                                    &instance_id,
+                                    events_since_snapshot,
+                                    cp,
+                                    &projection,
+                                )
+                                .await
+                            {
+                                events_since_snapshot = 0;
+                            }
+                        } else if events_since_snapshot.is_multiple_of(100)
+                            && let Some(ref cp) = last_checkpoint
                             && offer_projection_snapshot(
                                 &snapshots,
                                 &instance_id,
                                 events_since_snapshot,
-                                pos,
+                                cp,
                                 &projection,
                             )
                             .await
@@ -444,13 +454,13 @@ where
 
             // Final snapshot on shutdown
             if events_since_snapshot > 0
-                && let Some(ref pos) = last_position
+                && let Some(ref cp) = last_checkpoint
             {
                 let _ = offer_projection_snapshot(
                     &snapshots,
                     &instance_id,
                     events_since_snapshot,
-                    pos,
+                    cp,
                     &projection,
                 )
                 .await;
@@ -532,29 +542,30 @@ where
     })
 }
 
-/// Process one event through handler dispatch, position tracking, and update
+/// Process one event through handler dispatch, checkpoint tracking, and update
 /// emission.
 fn process_subscription_event<P, S>(
     projection: &mut P,
-    stored: &StoredEvent<S::Id, S::Position, S::Data, S::Metadata>,
+    delivery: Checkpointed<S>,
     handlers: &HashMap<&'static str, crate::projection::EventHandler<P, S>>,
     store: &S,
     updates_tx: &tokio::sync::mpsc::UnboundedSender<P>,
-    last_position: &mut Option<S::Position>,
+    last_checkpoint: &mut Option<S::Checkpoint>,
     events_since_snapshot: &mut u64,
 ) -> Result<(), SubscriptionError<S::Error>>
 where
     P: Projection<Id = S::Id> + Clone,
-    S: EventStore,
-    S::Position: Clone,
+    S: SubscribableStore,
 {
+    let Checkpointed { checkpoint, event } = delivery;
+
     // Unknown kinds are ignored: filters can intentionally include wider sets
     // than this projection currently handles.
-    if let Some(handler) = handlers.get(stored.kind()) {
-        apply_handler(handler, projection, stored, store)?;
+    if let Some(handler) = handlers.get(event.kind()) {
+        apply_handler(handler, projection, &event, store)?;
     }
 
-    *last_position = Some(stored.position());
+    *last_checkpoint = Some(checkpoint);
     *events_since_snapshot += 1;
 
     let _ = updates_tx.send(projection.clone());

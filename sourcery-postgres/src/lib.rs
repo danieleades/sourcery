@@ -10,6 +10,7 @@
 //! Both use the same database and can share a connection pool.
 
 pub mod snapshot;
+pub mod subscription;
 
 use std::marker::PhantomData;
 
@@ -105,6 +106,7 @@ where
                 event_kind     TEXT NOT NULL,
                 data           JSONB NOT NULL,
                 metadata       JSONB NOT NULL,
+                xid            BIGINT NOT NULL DEFAULT pg_current_xact_id()::text::bigint,
                 created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
             )
             ",
@@ -124,8 +126,70 @@ where
         .execute(&self.pool)
         .await?;
 
+        // Drives the subscription cursor: events are delivered in (xid, position)
+        // order, gated by the transaction-id high-water-mark.
+        sqlx::query(
+            r"CREATE INDEX IF NOT EXISTS es_events_by_xid_and_position ON es_events(xid, position)",
+        )
+        .execute(&self.pool)
+        .await?;
+
         Ok(())
     }
+}
+
+/// Shared tail of both commit paths: insert the prepared events, advance the
+/// stream's `last_position`, notify subscribers, and commit the transaction.
+///
+/// Takes ownership of `tx` and commits it. Returns the position of the last
+/// event written.
+async fn append_events_and_commit<M>(
+    mut tx: sqlx::Transaction<'_, Postgres>,
+    aggregate_kind: &str,
+    aggregate_id: &uuid::Uuid,
+    prepared: Vec<(String, serde_json::Value)>,
+    metadata: &M,
+) -> Result<i64, Error>
+where
+    M: Serialize + Sync,
+{
+    let mut qb = QueryBuilder::<Postgres>::new(
+        "INSERT INTO es_events (aggregate_kind, aggregate_id, event_kind, data, metadata) ",
+    );
+    qb.push_values(prepared, |mut b, (kind, data)| {
+        b.push_bind(aggregate_kind);
+        b.push_bind(aggregate_id);
+        b.push_bind(kind);
+        b.push_bind(sqlx::types::Json(data));
+        b.push_bind(sqlx::types::Json(metadata));
+    });
+    qb.push(" RETURNING position");
+
+    let rows: Vec<i64> = qb.build_query_scalar().fetch_all(&mut *tx).await?;
+    let last_position = *rows.last().ok_or(Error::MissingReturnedPosition)?;
+
+    sqlx::query(
+        r"
+            UPDATE es_streams
+            SET last_position = $1
+            WHERE aggregate_kind = $2 AND aggregate_id = $3
+            ",
+    )
+    .bind(last_position)
+    .bind(aggregate_kind)
+    .bind(aggregate_id)
+    .execute(&mut *tx)
+    .await?;
+
+    // Wake live subscribers on commit (best-effort low-latency signal; the
+    // subscriber's poll fallback covers any missed notification).
+    sqlx::query("SELECT pg_notify($1, '')")
+        .bind(subscription::NOTIFY_CHANNEL)
+        .execute(&mut *tx)
+        .await?;
+
+    tx.commit().await?;
+    Ok(last_position)
 }
 
 impl<M> EventStore for Store<M>
@@ -213,49 +277,12 @@ where
         .await
         .map_err(|e| CommitError::Store(Error::Database(e)))?;
 
-        let mut qb = QueryBuilder::<Postgres>::new(
-            "INSERT INTO es_events (aggregate_kind, aggregate_id, event_kind, data, metadata) ",
-        );
-        qb.push_values(prepared, |mut b, (kind, data)| {
-            b.push_bind(aggregate_kind);
-            b.push_bind(aggregate_id);
-            b.push_bind(kind);
-            b.push_bind(sqlx::types::Json(data));
-            b.push_bind(sqlx::types::Json(metadata.clone()));
-        });
-        qb.push(" RETURNING position");
+        let last_position =
+            append_events_and_commit(tx, aggregate_kind, aggregate_id, prepared, metadata)
+                .await
+                .map_err(CommitError::Store)?;
 
-        let rows: Vec<i64> = qb
-            .build_query_scalar()
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(|e| CommitError::Store(Error::Database(e)))?;
-
-        let last_position = rows
-            .last()
-            .ok_or_else(|| CommitError::Store(Error::MissingReturnedPosition))?;
-
-        sqlx::query(
-            r"
-                UPDATE es_streams
-                SET last_position = $1
-                WHERE aggregate_kind = $2 AND aggregate_id = $3
-                ",
-        )
-        .bind(last_position)
-        .bind(aggregate_kind)
-        .bind(aggregate_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| CommitError::Store(Error::Database(e)))?;
-
-        tx.commit()
-            .await
-            .map_err(|e| CommitError::Store(Error::Database(e)))?;
-
-        Ok(Committed {
-            last_position: *last_position,
-        })
+        Ok(Committed { last_position })
     }
 
     #[tracing::instrument(
@@ -344,49 +371,12 @@ where
             }
         }
 
-        let mut qb = QueryBuilder::<Postgres>::new(
-            "INSERT INTO es_events (aggregate_kind, aggregate_id, event_kind, data, metadata) ",
-        );
-        qb.push_values(prepared, |mut b, (kind, data)| {
-            b.push_bind(aggregate_kind);
-            b.push_bind(aggregate_id);
-            b.push_bind(kind);
-            b.push_bind(sqlx::types::Json(data));
-            b.push_bind(sqlx::types::Json(metadata.clone()));
-        });
-        qb.push(" RETURNING position");
+        let last_position =
+            append_events_and_commit(tx, aggregate_kind, aggregate_id, prepared, metadata)
+                .await
+                .map_err(OptimisticCommitError::Store)?;
 
-        let rows: Vec<i64> = qb
-            .build_query_scalar()
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(|e| OptimisticCommitError::Store(Error::Database(e)))?;
-
-        let last_position = rows
-            .last()
-            .ok_or_else(|| OptimisticCommitError::Store(Error::MissingReturnedPosition))?;
-
-        sqlx::query(
-            r"
-                UPDATE es_streams
-                SET last_position = $1
-                WHERE aggregate_kind = $2 AND aggregate_id = $3
-                ",
-        )
-        .bind(last_position)
-        .bind(aggregate_kind)
-        .bind(aggregate_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| OptimisticCommitError::Store(Error::Database(e)))?;
-
-        tx.commit()
-            .await
-            .map_err(|e| OptimisticCommitError::Store(Error::Database(e)))?;
-
-        Ok(Committed {
-            last_position: *last_position,
-        })
+        Ok(Committed { last_position })
     }
 
     #[allow(clippy::type_complexity)]

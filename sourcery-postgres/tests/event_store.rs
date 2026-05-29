@@ -11,7 +11,7 @@ use sourcery_core::{
 };
 use sourcery_postgres::Store;
 use sqlx::PgPool;
-use testcontainers::{ContainerAsync, runners::AsyncRunner};
+use testcontainers::{ContainerAsync, ImageExt as _, runners::AsyncRunner};
 use testcontainers_modules::postgres::Postgres;
 use uuid::Uuid;
 
@@ -39,7 +39,8 @@ struct TestDb {
 
 impl TestDb {
     async fn new() -> Self {
-        let container = Postgres::default().start().await.unwrap();
+        // PostgreSQL 13+ is required for `pg_current_xact_id()` / `xid8`.
+        let container = Postgres::default().with_tag("17").start().await.unwrap();
         let host = container.get_host().await.unwrap();
         let port = container.get_host_port_ipv4(5432).await.unwrap();
 

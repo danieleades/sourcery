@@ -15,7 +15,8 @@ pub use sourcery_core::{
     },
     subscription,
     subscription::{
-        SubscribableStore, Subscription, SubscriptionBuilder, SubscriptionError, SubscriptionHandle,
+        CheckpointStream, Checkpointed, SubscribableStore, Subscription, SubscriptionBuilder,
+        SubscriptionError, SubscriptionHandle,
     },
 };
 // Re-export proc macro derives so consumers only depend on `sourcery`.
@@ -35,7 +36,10 @@ pub mod store {
     #[cfg(feature = "postgres")]
     #[cfg_attr(docsrs, doc(cfg(feature = "postgres")))]
     pub mod postgres {
-        pub use sourcery_postgres::{Error, Store};
+        pub use sourcery_postgres::{
+            Error, Store,
+            subscription::{CheckpointStore, Watermark},
+        };
     }
 
     pub use sourcery_core::store::inmemory;
