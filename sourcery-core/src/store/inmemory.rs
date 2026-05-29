@@ -109,7 +109,7 @@ where
     where
         E: crate::event::DomainEvent + serde::de::DeserializeOwned,
     {
-        serde_json::from_value(stored.data.clone())
+        serde::Deserialize::deserialize(&stored.data)
             .map_err(|e| InMemoryError::Deserialization(Box::new(e)))
     }
 

@@ -47,7 +47,7 @@ use tokio_stream::StreamExt as _;
 
 use crate::{
     event::EventDecodeError,
-    projection::{HandlerError, Projection},
+    projection::Projection,
     snapshot::{Snapshot, SnapshotStore},
     store::{EventFilter, EventStore, StoredEvent},
 };
@@ -330,7 +330,6 @@ where
     ///
     /// `P` must implement [`Clone`] because each stream item yields an owned
     /// snapshot of the projection state.
-    #[allow(clippy::too_many_lines)]
     pub async fn start(self) -> Result<Subscription<P, S::Error>, SubscriptionError<S::Error>>
     where
         P: Clone,
@@ -415,56 +414,37 @@ where
                             &mut events_since_snapshot,
                         )?;
 
+                        // Signal readiness once we've replayed up to the target.
                         if !caught_up
                             && (catchup_target.is_none() || last_checkpoint >= catchup_target)
                         {
-                            // Catch-up complete: signal readiness and persist
-                            // the checkpoint we replayed to.
                             caught_up = true;
                             signal_ready(&mut ready_tx);
-                            if events_since_snapshot > 0
-                                && let Some(ref cp) = last_checkpoint
-                                && offer_projection_snapshot(
-                                    &snapshots,
-                                    &instance_id,
-                                    events_since_snapshot,
-                                    cp,
-                                    &projection,
-                                )
-                                .await
-                            {
-                                events_since_snapshot = 0;
-                            }
-                        } else if events_since_snapshot.is_multiple_of(100)
-                            && let Some(ref cp) = last_checkpoint
-                            && offer_projection_snapshot(
-                                &snapshots,
-                                &instance_id,
-                                events_since_snapshot,
-                                cp,
-                                &projection,
-                            )
-                            .await
-                        {
-                            events_since_snapshot = 0;
                         }
+
+                        // Offer a snapshot after every event; the snapshot
+                        // store's own policy decides whether to persist.
+                        maintain_snapshot(
+                            &snapshots,
+                            &instance_id,
+                            last_checkpoint.as_ref(),
+                            &mut events_since_snapshot,
+                            &projection,
+                        )
+                        .await;
                     }
                 }
             }
 
-            // Final snapshot on shutdown
-            if events_since_snapshot > 0
-                && let Some(ref cp) = last_checkpoint
-            {
-                let _ = offer_projection_snapshot(
-                    &snapshots,
-                    &instance_id,
-                    events_since_snapshot,
-                    cp,
-                    &projection,
-                )
-                .await;
-            }
+            // Final snapshot on shutdown.
+            maintain_snapshot(
+                &snapshots,
+                &instance_id,
+                last_checkpoint.as_ref(),
+                &mut events_since_snapshot,
+                &projection,
+            )
+            .await;
 
             Ok(())
         });
@@ -488,9 +468,9 @@ where
 
 /// Load the latest projection snapshot, falling back to `P::init`.
 ///
-/// Snapshot load failures are logged and treated as cache misses so the
-/// subscription can still start from event replay.
-async fn load_snapshot<P, SS>(
+/// Snapshot load failures are logged and treated as cache misses so the caller
+/// can still start from event replay.
+pub(crate) async fn load_snapshot<P, SS>(
     snapshots: &SS,
     instance_id: &P::InstanceId,
 ) -> (P, Option<SS::Position>)
@@ -534,12 +514,7 @@ where
         stored.metadata(),
         store,
     )
-    .map_err(|error| match error {
-        HandlerError::EventDecode(error) => SubscriptionError::EventDecode(error),
-        HandlerError::Store(error) => {
-            SubscriptionError::EventDecode(EventDecodeError::Store(error))
-        }
-    })
+    .map_err(|error| SubscriptionError::EventDecode(error.into_decode_error()))
 }
 
 /// Process one event through handler dispatch, checkpoint tracking, and update
@@ -573,10 +548,39 @@ where
     Ok(())
 }
 
+/// Offer a snapshot for the current projection state, resetting the pending
+/// counter when the store accepts it. No-op when no events are pending.
+async fn maintain_snapshot<P, SS>(
+    snapshots: &SS,
+    instance_id: &P::InstanceId,
+    last_checkpoint: Option<&SS::Position>,
+    events_since_snapshot: &mut u64,
+    projection: &P,
+) where
+    P: Projection + Serialize + Sync,
+    P::InstanceId: Sync,
+    SS: SnapshotStore<P::InstanceId>,
+    SS::Position: Clone,
+{
+    if *events_since_snapshot > 0
+        && let Some(cp) = last_checkpoint
+        && offer_projection_snapshot(
+            snapshots,
+            instance_id,
+            *events_since_snapshot,
+            cp,
+            projection,
+        )
+        .await
+    {
+        *events_since_snapshot = 0;
+    }
+}
+
 /// Offer a projection snapshot and report whether it was stored.
 ///
-/// Errors are logged and treated as "not stored" so subscriptions remain live.
-async fn offer_projection_snapshot<P, SS>(
+/// Errors are logged and treated as "not stored" so the caller remains live.
+pub(crate) async fn offer_projection_snapshot<P, SS>(
     snapshots: &SS,
     instance_id: &P::InstanceId,
     events_since_snapshot: u64,
@@ -608,7 +612,7 @@ where
         Ok(crate::snapshot::SnapshotOffer::Stored) => true,
         Ok(crate::snapshot::SnapshotOffer::Declined) => false,
         Err(e) => {
-            tracing::warn!(error = %e, "failed to store subscription snapshot");
+            tracing::warn!(error = %e, "failed to store projection snapshot");
             false
         }
     }

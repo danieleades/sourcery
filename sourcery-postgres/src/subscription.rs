@@ -103,25 +103,8 @@ fn row_to_event<M>(row: &sqlx::postgres::PgRow) -> Result<EventRow<M>, Error>
 where
     M: serde::de::DeserializeOwned,
 {
-    let aggregate_kind: String = row.try_get("aggregate_kind")?;
-    let aggregate_id: uuid::Uuid = row.try_get("aggregate_id")?;
-    let event_kind: String = row.try_get("event_kind")?;
-    let position: i64 = row.try_get("position")?;
     let xid: i64 = row.try_get("xid")?;
-    let data: sqlx::types::Json<serde_json::Value> = row.try_get("data")?;
-    let metadata: sqlx::types::Json<M> = row.try_get("metadata")?;
-
-    Ok((
-        xid,
-        StoredEvent {
-            aggregate_kind,
-            aggregate_id,
-            kind: event_kind,
-            position,
-            data: data.0,
-            metadata: metadata.0,
-        },
-    ))
+    Ok((xid, crate::row_to_stored_event::<M>(row)?))
 }
 
 /// Load the next stable batch after `cursor`, ordered by `(xid, position)`.
@@ -174,10 +157,7 @@ where
         Box::pin(async_stream::stream! {
             // Best-effort live notifications; fall back to poll-only on failure.
             let mut listener = match PgListener::connect_with(&pool).await {
-                Ok(mut l) => match l.listen(NOTIFY_CHANNEL).await {
-                    Ok(()) => Some(l),
-                    Err(_) => None,
-                },
+                Ok(mut l) => l.listen(NOTIFY_CHANNEL).await.ok().map(|()| l),
                 Err(_) => None,
             };
 

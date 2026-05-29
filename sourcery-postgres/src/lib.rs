@@ -138,6 +138,70 @@ where
     }
 }
 
+/// Map a result row into a [`StoredEvent`]. The query must select the standard
+/// event columns: `aggregate_kind, aggregate_id, event_kind, position, data,
+/// metadata`.
+pub(crate) fn row_to_stored_event<M>(
+    row: &sqlx::postgres::PgRow,
+) -> Result<StoredEvent<uuid::Uuid, i64, serde_json::Value, M>, Error>
+where
+    M: DeserializeOwned,
+{
+    let aggregate_kind: String = row.try_get("aggregate_kind")?;
+    let aggregate_id: uuid::Uuid = row.try_get("aggregate_id")?;
+    let event_kind: String = row.try_get("event_kind")?;
+    let position: i64 = row.try_get("position")?;
+    let data: sqlx::types::Json<serde_json::Value> = row.try_get("data")?;
+    let metadata: sqlx::types::Json<M> = row.try_get("metadata")?;
+
+    Ok(StoredEvent {
+        aggregate_kind,
+        aggregate_id,
+        kind: event_kind,
+        position,
+        data: data.0,
+        metadata: metadata.0,
+    })
+}
+
+/// Serialise events to `(kind, json)` pairs, reporting the offending index on
+/// failure so callers can build their commit-specific `Serialization` variant.
+fn serialize_events<E>(
+    events: &NonEmpty<E>,
+) -> Result<Vec<(String, serde_json::Value)>, (usize, Error)>
+where
+    E: sourcery_core::event::EventKind + serde::Serialize,
+{
+    let mut prepared = Vec::with_capacity(events.len());
+    for (index, event) in events.iter().enumerate() {
+        let data =
+            serde_json::to_value(event).map_err(|e| (index, Error::Serialization(Box::new(e))))?;
+        prepared.push((event.kind().to_string(), data));
+    }
+    Ok(prepared)
+}
+
+/// Insert the stream row if absent (idempotent), so version checks and
+/// `last_position` updates have a row to target.
+async fn ensure_stream(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    aggregate_kind: &str,
+    aggregate_id: &uuid::Uuid,
+) -> Result<(), Error> {
+    sqlx::query(
+        r"
+        INSERT INTO es_streams (aggregate_kind, aggregate_id, last_position)
+        VALUES ($1, $2, NULL)
+        ON CONFLICT (aggregate_kind, aggregate_id) DO NOTHING
+        ",
+    )
+    .bind(aggregate_kind)
+    .bind(aggregate_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 /// Shared tail of both commit paths: insert the prepared events, advance the
 /// stream's `last_position`, notify subscribers, and commit the transaction.
 ///
@@ -209,7 +273,7 @@ where
     where
         E: DomainEvent + serde::de::DeserializeOwned,
     {
-        serde_json::from_value(stored.data.clone()).map_err(|e| Error::Deserialization(Box::new(e)))
+        E::deserialize(&stored.data).map_err(|e| Error::Deserialization(Box::new(e)))
     }
 
     async fn stream_version<'a>(
@@ -248,15 +312,8 @@ where
         E: sourcery_core::event::EventKind + serde::Serialize + Send + Sync + 'a,
         Self::Metadata: Clone,
     {
-        // Serialize all events first
-        let mut prepared: Vec<(String, serde_json::Value)> = Vec::with_capacity(events.len());
-        for (index, event) in events.iter().enumerate() {
-            let data = serde_json::to_value(event).map_err(|e| CommitError::Serialization {
-                index,
-                source: Error::Serialization(Box::new(e)),
-            })?;
-            prepared.push((event.kind().to_string(), data));
-        }
+        let prepared = serialize_events(&events)
+            .map_err(|(index, source)| CommitError::Serialization { index, source })?;
 
         let mut tx = self
             .pool
@@ -264,18 +321,9 @@ where
             .await
             .map_err(|e| CommitError::Store(Error::Database(e)))?;
 
-        sqlx::query(
-            r"
-                INSERT INTO es_streams (aggregate_kind, aggregate_id, last_position)
-                VALUES ($1, $2, NULL)
-                ON CONFLICT (aggregate_kind, aggregate_id) DO NOTHING
-                ",
-        )
-        .bind(aggregate_kind)
-        .bind(aggregate_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| CommitError::Store(Error::Database(e)))?;
+        ensure_stream(&mut tx, aggregate_kind, aggregate_id)
+            .await
+            .map_err(CommitError::Store)?;
 
         let last_position =
             append_events_and_commit(tx, aggregate_kind, aggregate_id, prepared, metadata)
@@ -306,16 +354,8 @@ where
         E: sourcery_core::event::EventKind + serde::Serialize + Send + Sync + 'a,
         Self::Metadata: Clone,
     {
-        // Serialize all events first
-        let mut prepared: Vec<(String, serde_json::Value)> = Vec::with_capacity(events.len());
-        for (index, event) in events.iter().enumerate() {
-            let data =
-                serde_json::to_value(event).map_err(|e| OptimisticCommitError::Serialization {
-                    index,
-                    source: Error::Serialization(Box::new(e)),
-                })?;
-            prepared.push((event.kind().to_string(), data));
-        }
+        let prepared = serialize_events(&events)
+            .map_err(|(index, source)| OptimisticCommitError::Serialization { index, source })?;
 
         let mut tx = self
             .pool
@@ -323,18 +363,9 @@ where
             .await
             .map_err(|e| OptimisticCommitError::Store(Error::Database(e)))?;
 
-        sqlx::query(
-            r"
-                INSERT INTO es_streams (aggregate_kind, aggregate_id, last_position)
-                VALUES ($1, $2, NULL)
-                ON CONFLICT (aggregate_kind, aggregate_id) DO NOTHING
-                ",
-        )
-        .bind(aggregate_kind)
-        .bind(aggregate_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| OptimisticCommitError::Store(Error::Database(e)))?;
+        ensure_stream(&mut tx, aggregate_kind, aggregate_id)
+            .await
+            .map_err(OptimisticCommitError::Store)?;
 
         let current: Option<i64> = sqlx::query_scalar::<_, Option<i64>>(
             r"
@@ -423,27 +454,7 @@ where
         qb.push(") t ORDER BY position ASC");
 
         let rows = qb.build().fetch_all(&self.pool).await?;
-
-        let mut out = Vec::with_capacity(rows.len());
-        for row in rows {
-            let aggregate_kind: String = row.try_get("aggregate_kind")?;
-            let aggregate_id: uuid::Uuid = row.try_get("aggregate_id")?;
-            let event_kind: String = row.try_get("event_kind")?;
-            let position: i64 = row.try_get("position")?;
-            let data: sqlx::types::Json<serde_json::Value> = row.try_get("data")?;
-            let metadata: sqlx::types::Json<M> = row.try_get("metadata")?;
-
-            out.push(StoredEvent {
-                aggregate_kind,
-                aggregate_id,
-                kind: event_kind,
-                position,
-                data: data.0,
-                metadata: metadata.0,
-            });
-        }
-
-        Ok(out)
+        rows.iter().map(row_to_stored_event::<M>).collect()
     }
 }
 

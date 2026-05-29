@@ -42,7 +42,7 @@ use crate::{
     aggregate::{Aggregate, Handle, HandleCreate},
     concurrency::{ConcurrencyConflict, ConcurrencyStrategy, Optimistic, Unchecked},
     event::{EventKind, ProjectionEvent},
-    projection::{HandlerError, Projection, ProjectionError},
+    projection::{Projection, ProjectionError},
     snapshot::{OfferSnapshotError, Snapshot, SnapshotOffer, SnapshotStore},
     store::{
         CommitError, EventFilter, EventStore, GloballyOrderedStore, OptimisticCommitError,
@@ -278,14 +278,8 @@ where
         let metadata = stored.metadata();
 
         if let Some(handler) = handlers.get(kind) {
-            (handler)(projection, aggregate_id, stored, metadata, store).map_err(|error| {
-                match error {
-                    HandlerError::Store(error) => {
-                        ProjectionError::EventDecode(crate::event::EventDecodeError::Store(error))
-                    }
-                    HandlerError::EventDecode(error) => ProjectionError::EventDecode(error),
-                }
-            })?;
+            (handler)(projection, aggregate_id, stored, metadata, store)
+                .map_err(|error| ProjectionError::EventDecode(error.into_decode_error()))?;
         }
         last_position = Some(stored.position());
     }
@@ -1125,22 +1119,8 @@ where
     {
         tracing::debug!("loading projection with snapshot");
 
-        let snapshot_result = self
-            .snapshots
-            .0
-            .load::<P>(P::KIND, instance_id)
-            .await
-            .inspect_err(|e| {
-                tracing::error!(error = %e, "failed to load projection snapshot");
-            })
-            .ok()
-            .flatten();
-
-        let (mut projection, snapshot_position) = if let Some(snapshot) = snapshot_result {
-            (snapshot.data, Some(snapshot.position))
-        } else {
-            (P::init(instance_id), None)
-        };
+        let (mut projection, snapshot_position) =
+            crate::subscription::load_snapshot::<P, SS>(&self.snapshots.0, instance_id).await;
 
         let filters = P::filters::<S>(instance_id);
         let (event_filters, handlers) = filters.into_event_filters(snapshot_position.as_ref());
@@ -1158,22 +1138,14 @@ where
         if event_count > 0
             && let Some(position) = last_position
         {
-            let projection_ref = &projection;
-            let offer = self.snapshots.0.offer_snapshot(
-                P::KIND,
+            crate::subscription::offer_projection_snapshot::<P, SS>(
+                &self.snapshots.0,
                 instance_id,
                 event_count as u64,
-                move || -> Result<Snapshot<S::Position, &P>, std::convert::Infallible> {
-                    Ok(Snapshot {
-                        position,
-                        data: projection_ref,
-                    })
-                },
-            );
-
-            if let Err(e) = offer.await {
-                tracing::error!(error = %e, "failed to store projection snapshot");
-            }
+                &position,
+                &projection,
+            )
+            .await;
         }
 
         tracing::info!(events_applied = event_count, "projection loaded");
