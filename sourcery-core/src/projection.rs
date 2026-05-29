@@ -14,7 +14,7 @@ use crate::{
     store::{EventFilter, EventStore, StoredEvent},
 };
 
-/// Base trait for types that subscribe to events.
+/// A read model built by applying a filtered stream of events.
 ///
 /// The `filters()` method returns both the event filters AND the handlers
 /// needed to process those events. It is generic over the store type `S`,
@@ -24,9 +24,9 @@ use crate::{
 /// `filters()` must be **pure and deterministic**: given the same
 /// `instance_id`, it must always return the same filter set.
 ///
-/// `init()` constructs a fresh instance from the instance identifier.
-/// This replaces the `Default` constraint, allowing instance-aware
-/// projections to capture their identity at construction time.
+/// `init()` constructs a fresh instance from the instance identifier,
+/// allowing instance-aware projections to capture their identity at
+/// construction time rather than inferring it from the first event.
 // ANCHOR: projection_trait
 pub trait Projection: Sized {
     /// Stable identifier for this projection type, used for snapshot storage.
@@ -104,6 +104,17 @@ impl<StoreError> From<StoreError> for HandlerError<StoreError> {
     }
 }
 
+impl<StoreError> HandlerError<StoreError> {
+    /// Collapse into an [`EventDecodeError`]; a store-level failure here is a
+    /// decode failure (the store errored while decoding the stored event).
+    pub(crate) fn into_decode_error(self) -> EventDecodeError<StoreError> {
+        match self {
+            Self::EventDecode(error) => error,
+            Self::Store(error) => EventDecodeError::Store(error),
+        }
+    }
+}
+
 /// Type alias for event handler closures used by [`Filters`].
 pub(crate) type EventHandler<P, S> = Box<
     dyn Fn(
@@ -140,9 +151,9 @@ pub struct Filters<S, P>
 where
     S: EventStore,
 {
-    /// Position-free filter specs; positions are injected at load/subscribe
-    /// time in [`into_event_filters`](Self::into_event_filters).
-    pub(crate) specs: Vec<EventFilter<S::Id, ()>>,
+    /// Filter specs. `after_position` is left unset here and injected at
+    /// load/subscribe time in [`into_event_filters`](Self::into_event_filters).
+    pub(crate) specs: Vec<EventFilter<S::Id, S::Position>>,
     /// Map of event kind string → handler closure for that kind.
     pub(crate) handlers: HashMap<&'static str, EventHandler<P, S>>,
 }
@@ -171,14 +182,13 @@ where
         }
     }
 
-    /// Subscribe to a specific event type globally (all aggregates).
-    #[must_use]
-    pub fn event<E>(mut self) -> Self
+    /// Register a handler for a single domain event type under `spec`.
+    fn push_domain_event<E>(&mut self, spec: EventFilter<S::Id, S::Position>)
     where
         E: DomainEvent + serde::de::DeserializeOwned,
         P: ApplyProjection<E>,
     {
-        self.specs.push(EventFilter::for_event(E::KIND));
+        self.specs.push(spec);
         self.handlers.insert(
             E::KIND,
             Box::new(|proj, agg_id, stored, metadata, store| {
@@ -187,6 +197,38 @@ where
                 Ok(())
             }),
         );
+    }
+
+    /// Register handlers for every kind in a [`ProjectionEvent`] sum type,
+    /// building each filter spec from the event kind via `spec`.
+    fn push_projection_event<E>(
+        &mut self,
+        spec: impl Fn(&'static str) -> EventFilter<S::Id, S::Position>,
+    ) where
+        E: ProjectionEvent,
+        P: ApplyProjection<E>,
+    {
+        for &kind in E::EVENT_KINDS {
+            self.specs.push(spec(kind));
+            self.handlers.insert(
+                kind,
+                Box::new(|proj, agg_id, stored, metadata, store| {
+                    let event = E::from_stored(stored, store).map_err(HandlerError::EventDecode)?;
+                    ApplyProjection::apply_projection(proj, agg_id, &event, metadata);
+                    Ok(())
+                }),
+            );
+        }
+    }
+
+    /// Subscribe to a specific event type globally (all aggregates).
+    #[must_use]
+    pub fn event<E>(mut self) -> Self
+    where
+        E: DomainEvent + serde::de::DeserializeOwned,
+        P: ApplyProjection<E>,
+    {
+        self.push_domain_event::<E>(EventFilter::for_event(E::KIND));
         self
     }
 
@@ -198,17 +240,7 @@ where
         E: ProjectionEvent,
         P: ApplyProjection<E>,
     {
-        for &kind in E::EVENT_KINDS {
-            self.specs.push(EventFilter::for_event(kind));
-            self.handlers.insert(
-                kind,
-                Box::new(move |proj, agg_id, stored, metadata, store| {
-                    let event = E::from_stored(stored, store).map_err(HandlerError::EventDecode)?;
-                    ApplyProjection::apply_projection(proj, agg_id, &event, metadata);
-                    Ok(())
-                }),
-            );
-        }
+        self.push_projection_event::<E>(EventFilter::for_event);
         self
     }
 
@@ -220,19 +252,11 @@ where
         E: DomainEvent + serde::de::DeserializeOwned,
         P: ApplyProjection<E>,
     {
-        self.specs.push(EventFilter::for_aggregate(
+        self.push_domain_event::<E>(EventFilter::for_aggregate(
             E::KIND,
             A::KIND,
             aggregate_id.clone(),
         ));
-        self.handlers.insert(
-            E::KIND,
-            Box::new(|proj, agg_id, stored, metadata, store| {
-                let event: E = store.decode_event(stored)?;
-                ApplyProjection::apply_projection(proj, agg_id, &event, metadata);
-                Ok(())
-            }),
-        );
         self
     }
 
@@ -244,35 +268,21 @@ where
         A::Event: ProjectionEvent,
         P: ApplyProjection<A::Event>,
     {
-        for &kind in <A::Event as ProjectionEvent>::EVENT_KINDS {
-            self.specs.push(EventFilter::for_aggregate(
-                kind,
-                A::KIND,
-                aggregate_id.clone(),
-            ));
-            self.handlers.insert(
-                kind,
-                Box::new(move |proj, agg_id, stored, metadata, store| {
-                    let event = <A::Event as ProjectionEvent>::from_stored(stored, store)
-                        .map_err(HandlerError::EventDecode)?;
-                    ApplyProjection::apply_projection(proj, agg_id, &event, metadata);
-                    Ok(())
-                }),
-            );
-        }
+        let aggregate_id = aggregate_id.clone();
+        self.push_projection_event::<A::Event>(move |kind| {
+            EventFilter::for_aggregate(kind, A::KIND, aggregate_id.clone())
+        });
         self
     }
 
-    /// Convert positionless filter specs into positioned [`EventFilter`]s.
+    /// Apply the load/subscribe position to every filter spec.
     pub(crate) fn into_event_filters(self, after: Option<&S::Position>) -> PositionedFilters<S, P> {
         let filters = self
             .specs
             .into_iter()
-            .map(|spec| EventFilter {
-                event_kind: spec.event_kind,
-                aggregate_kind: spec.aggregate_kind,
-                aggregate_id: spec.aggregate_id,
-                after_position: after.cloned(),
+            .map(|mut spec| {
+                spec.after_position = after.cloned();
+                spec
             })
             .collect();
         (filters, self.handlers)

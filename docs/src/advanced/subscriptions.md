@@ -38,7 +38,7 @@ Sub: Subscription
 Store: EventStore
 
 App -> Sub: "subscribe::<P>(instance_id)"
-Sub -> Store: "load_events(filters)"
+Sub -> Store: "subscribe(filters, from_checkpoint)"
 Store -> Sub: "Historical events" {style.stroke-dash: 3}
 Sub -> Sub: "Replay events (catch-up)"
 Sub -> App: "start() returns (caught up)" {style.stroke-dash: 3}
@@ -85,25 +85,22 @@ while let Some(dashboard) = subscription.next().await {
 }
 ```
 
-The subscription loads the most recent snapshot on startup and periodically offers new snapshots as events are processed.
+The subscription loads the most recent snapshot on startup and periodically offers new snapshots as events are processed. The snapshot's stored checkpoint becomes the resume point. For PostgreSQL, use `store::postgres::CheckpointStore` to persist the cursor and projection state across restarts.
 
 ## The `SubscribableStore` Trait
 
-Not all stores support push notifications. The `SubscribableStore` trait extends `EventStore` with a `subscribe` method that returns a stream of events:
+Not all stores support push notifications. The `SubscribableStore` trait extends `EventStore` with a `subscribe` method that returns a checkpoint-tagged stream of events:
 
 ```rust,ignore
-pub trait SubscribableStore: EventStore + GloballyOrderedStore {
-    fn subscribe(
-        &self,
-        filters: &[EventFilter<Self::Id, Self::Position>],
-        from_position: Option<Self::Position>,
-    ) -> EventStream<'_, Self>
-    where
-        Self::Position: Ord;
-}
+{{#include ../../../sourcery-core/src/subscription.rs:subscribable_store_trait}}
 ```
 
-The in-memory store implements this via `tokio::sync::broadcast`. A PostgreSQL implementation would use `LISTEN/NOTIFY`.
+The cursor is a store-defined `Checkpoint`, not an `EventStore::Position`. `Position` is the per-stream version used for optimistic concurrency; `Checkpoint` orders events for *delivery* and is gap-free for resumption. Delivery is at-least-once and strictly increasing in checkpoint — the subscription loop deduplicates by checkpoint, so handlers must be idempotent.
+
+Both built-in stores implement the trait:
+
+- The in-memory store uses `tokio::sync::broadcast`, with the global position as its checkpoint.
+- The PostgreSQL store uses `LISTEN/NOTIFY` for low-latency wake-ups plus a polling fallback, and a transaction-id high-water-mark for its checkpoint, so events are never skipped when positions become visible out of order under concurrent commits.
 
 ## Shared State Pattern
 

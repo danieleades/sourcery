@@ -71,10 +71,7 @@ Key points:
 ### The `HandleCreate<C>` Trait
 
 ```rust,ignore
-pub trait HandleCreate<C>: Aggregate {
-    type HandleCreateError: Into<<Self as Aggregate>::Error>;
-    fn handle_create(command: &C) -> Result<Vec<Self::Event>, Self::HandleCreateError>;
-}
+{{#include ../../../sourcery-core/src/aggregate.rs:handle_create_trait}}
 ```
 
 ## Command Naming

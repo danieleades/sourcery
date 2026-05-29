@@ -13,7 +13,6 @@
 
 use std::{
     collections::HashMap,
-    pin::Pin,
     sync::{Arc, RwLock},
 };
 
@@ -26,7 +25,7 @@ use crate::{
         CommitError, Committed, EventFilter, EventStore, GloballyOrderedStore, LoadEventsResult,
         OptimisticCommitError, StoredEvent, StreamKey,
     },
-    subscription::SubscribableStore,
+    subscription::{CheckpointStream, Checkpointed, SubscribableStore},
 };
 
 /// Event stream stored in memory with fixed position and data types.
@@ -110,7 +109,7 @@ where
     where
         E: crate::event::DomainEvent + serde::de::DeserializeOwned,
     {
-        serde_json::from_value(stored.data.clone())
+        serde::Deserialize::deserialize(&stored.data)
             .map_err(|e| InMemoryError::Deserialization(Box::new(e)))
     }
 
@@ -282,24 +281,16 @@ where
     Id: Clone + Eq + std::hash::Hash + Send + Sync + 'static,
     M: Clone + Send + Sync + 'static,
 {
+    // The in-memory store assigns positions under a write lock from a single
+    // global counter, so positions are already gap-free in commit order. The
+    // checkpoint is therefore just the position.
+    type Checkpoint = u64;
+
     fn subscribe(
         &self,
         filters: &[EventFilter<Self::Id, Self::Position>],
-        from_position: Option<Self::Position>,
-    ) -> Pin<
-        Box<
-            dyn futures_core::Stream<
-                    Item = Result<
-                        StoredEvent<Self::Id, Self::Position, Self::Data, Self::Metadata>,
-                        Self::Error,
-                    >,
-                > + Send
-                + '_,
-        >,
-    >
-    where
-        Self::Position: Ord,
-    {
+        from: Option<Self::Checkpoint>,
+    ) -> CheckpointStream<'_, Self> {
         let filters = filters.to_vec();
         let inner = self.inner.clone();
 
@@ -317,7 +308,7 @@ where
                 load_matching_events(&guard, &filters)
             };
 
-            let mut last_position = from_position;
+            let mut last_position = from;
 
             for event in historical {
                 // Skip events at or before our starting position
@@ -327,7 +318,8 @@ where
                     continue;
                 }
                 last_position = Some(event.position);
-                yield Ok(event);
+                let checkpoint = event.position;
+                yield Ok(Checkpointed { checkpoint, event });
             }
 
             // 2. Process live events from broadcast; stop when the store is dropped.
@@ -344,10 +336,26 @@ where
                         continue;
                     }
                     last_position = Some(event.position);
-                    yield Ok(event);
+                    let checkpoint = event.position;
+                    yield Ok(Checkpointed { checkpoint, event });
                 }
             }
         })
+    }
+
+    fn current_checkpoint(
+        &self,
+        filters: &[EventFilter<Self::Id, Self::Position>],
+    ) -> impl Future<Output = Result<Option<Self::Checkpoint>, Self::Error>> + Send {
+        // `load_matching_events` returns events sorted by position, so the last
+        // one carries the highest currently-committed position.
+        let latest = {
+            let guard = self.inner.read().expect("in-memory store lock poisoned");
+            load_matching_events(&guard, filters)
+                .last()
+                .map(|event| event.position)
+        };
+        std::future::ready(Ok(latest))
     }
 }
 

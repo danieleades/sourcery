@@ -42,7 +42,7 @@ use crate::{
     aggregate::{Aggregate, Handle, HandleCreate},
     concurrency::{ConcurrencyConflict, ConcurrencyStrategy, Optimistic, Unchecked},
     event::{EventKind, ProjectionEvent},
-    projection::{HandlerError, Projection, ProjectionError},
+    projection::{Projection, ProjectionError},
     snapshot::{OfferSnapshotError, Snapshot, SnapshotOffer, SnapshotStore},
     store::{
         CommitError, EventFilter, EventStore, GloballyOrderedStore, OptimisticCommitError,
@@ -92,67 +92,6 @@ where
     #[error("snapshot operation failed: {0}")]
     Snapshot(#[source] SnapshotError),
 }
-
-/// Result type alias for unchecked command execution.
-pub type UncheckedCommandResult<A, S> = Result<
-    (),
-    CommandError<<A as Aggregate>::Error, Infallible, <S as EventStore>::Error, Infallible>,
->;
-
-/// Result type alias for snapshot-enabled unchecked command execution.
-pub type UncheckedSnapshotCommandResult<A, S, SS> = Result<
-    (),
-    CommandError<
-        <A as Aggregate>::Error,
-        Infallible,
-        <S as EventStore>::Error,
-        <SS as SnapshotStore<<S as EventStore>::Id>>::Error,
-    >,
->;
-
-/// Result type alias for optimistic command execution.
-pub type OptimisticCommandResult<A, S> = Result<
-    (),
-    CommandError<
-        <A as Aggregate>::Error,
-        ConcurrencyConflict<<S as EventStore>::Position>,
-        <S as EventStore>::Error,
-        Infallible,
-    >,
->;
-
-/// Result type alias for snapshot-enabled optimistic command execution.
-pub type OptimisticSnapshotCommandResult<A, S, SS> = Result<
-    (),
-    CommandError<
-        <A as Aggregate>::Error,
-        ConcurrencyConflict<<S as EventStore>::Position>,
-        <S as EventStore>::Error,
-        <SS as SnapshotStore<<S as EventStore>::Id>>::Error,
-    >,
->;
-
-/// Result type alias for retry operations (optimistic, no snapshots).
-pub type RetryResult<A, S> = Result<
-    usize,
-    CommandError<
-        <A as Aggregate>::Error,
-        ConcurrencyConflict<<S as EventStore>::Position>,
-        <S as EventStore>::Error,
-        Infallible,
-    >,
->;
-
-/// Result type alias for retry operations (optimistic, snapshots enabled).
-pub type SnapshotRetryResult<A, S, SS> = Result<
-    usize,
-    CommandError<
-        <A as Aggregate>::Error,
-        ConcurrencyConflict<<S as EventStore>::Position>,
-        <S as EventStore>::Error,
-        <SS as SnapshotStore<<S as EventStore>::Id>>::Error,
-    >,
->;
 
 #[doc(hidden)]
 pub enum CommitPolicyError<C, S> {
@@ -339,14 +278,8 @@ where
         let metadata = stored.metadata();
 
         if let Some(handler) = handlers.get(kind) {
-            (handler)(projection, aggregate_id, stored, metadata, store).map_err(|error| {
-                match error {
-                    HandlerError::Store(error) => {
-                        ProjectionError::EventDecode(crate::event::EventDecodeError::Store(error))
-                    }
-                    HandlerError::EventDecode(error) => ProjectionError::EventDecode(error),
-                }
-            })?;
+            (handler)(projection, aggregate_id, stored, metadata, store)
+                .map_err(|error| ProjectionError::EventDecode(error.into_decode_error()))?;
         }
         last_position = Some(stored.position());
     }
@@ -1186,22 +1119,8 @@ where
     {
         tracing::debug!("loading projection with snapshot");
 
-        let snapshot_result = self
-            .snapshots
-            .0
-            .load::<P>(P::KIND, instance_id)
-            .await
-            .inspect_err(|e| {
-                tracing::error!(error = %e, "failed to load projection snapshot");
-            })
-            .ok()
-            .flatten();
-
-        let (mut projection, snapshot_position) = if let Some(snapshot) = snapshot_result {
-            (snapshot.data, Some(snapshot.position))
-        } else {
-            (P::init(instance_id), None)
-        };
+        let (mut projection, snapshot_position) =
+            crate::subscription::load_snapshot::<P, SS>(&self.snapshots.0, instance_id).await;
 
         let filters = P::filters::<S>(instance_id);
         let (event_filters, handlers) = filters.into_event_filters(snapshot_position.as_ref());
@@ -1219,22 +1138,14 @@ where
         if event_count > 0
             && let Some(position) = last_position
         {
-            let projection_ref = &projection;
-            let offer = self.snapshots.0.offer_snapshot(
-                P::KIND,
+            crate::subscription::offer_projection_snapshot::<P, SS>(
+                &self.snapshots.0,
                 instance_id,
                 event_count as u64,
-                move || -> Result<Snapshot<S::Position, &P>, std::convert::Infallible> {
-                    Ok(Snapshot {
-                        position,
-                        data: projection_ref,
-                    })
-                },
-            );
-
-            if let Err(e) = offer.await {
-                tracing::error!(error = %e, "failed to store projection snapshot");
-            }
+                &position,
+                &projection,
+            )
+            .await;
         }
 
         tracing::info!(events_applied = event_count, "projection loaded");
@@ -1288,10 +1199,9 @@ where
     pub fn subscribe<P>(
         &self,
         instance_id: P::InstanceId,
-    ) -> SubscriptionBuilder<S, P, crate::snapshot::NoSnapshots<S::Position>>
+    ) -> SubscriptionBuilder<S, P, crate::snapshot::NoSnapshots<S::Checkpoint>>
     where
         S: SubscribableStore + Clone + 'static,
-        S::Position: Ord,
         P: Projection<Id = S::Id, Metadata = S::Metadata>
             + Serialize
             + DeserializeOwned
@@ -1311,7 +1221,7 @@ where
     /// Start a continuous subscription with an explicit snapshot store.
     ///
     /// The snapshot store is keyed by `P::InstanceId` and tracks the
-    /// subscription's position for faster restart.
+    /// subscription's checkpoint for faster restart.
     pub fn subscribe_with_snapshots<P, SS>(
         &self,
         instance_id: P::InstanceId,
@@ -1319,7 +1229,6 @@ where
     ) -> SubscriptionBuilder<S, P, SS>
     where
         S: SubscribableStore + Clone + 'static,
-        S::Position: Ord,
         P: Projection<Id = S::Id, Metadata = S::Metadata>
             + Serialize
             + DeserializeOwned
@@ -1328,7 +1237,7 @@ where
             + 'static,
         P::InstanceId: Clone + Send + Sync + 'static,
         P::Metadata: Send,
-        SS: SnapshotStore<P::InstanceId, Position = S::Position> + Send + Sync + 'static,
+        SS: SnapshotStore<P::InstanceId, Position = S::Checkpoint> + Send + Sync + 'static,
     {
         SubscriptionBuilder::new(self.store.clone(), snapshots, instance_id)
     }
@@ -1366,17 +1275,15 @@ where
         M: SnapshotPolicy<S, A> + Sync,
         M::Prepared: Send,
     {
-        for attempt in 1..=max_retries {
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
             match self.update::<A, Cmd>(id, command, metadata).await {
                 Ok(()) => return Ok(attempt),
-                Err(CommandError::Concurrency(_)) => {}
+                Err(CommandError::Concurrency(_)) if attempt <= max_retries => {}
                 Err(e) => return Err(e),
             }
         }
-
-        self.update::<A, Cmd>(id, command, metadata)
-            .await
-            .map(|()| max_retries + 1)
     }
 }
 

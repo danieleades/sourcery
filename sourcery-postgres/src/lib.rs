@@ -10,6 +10,7 @@
 //! Both use the same database and can share a connection pool.
 
 pub mod snapshot;
+pub mod subscription;
 
 use std::marker::PhantomData;
 
@@ -105,6 +106,7 @@ where
                 event_kind     TEXT NOT NULL,
                 data           JSONB NOT NULL,
                 metadata       JSONB NOT NULL,
+                xid            BIGINT NOT NULL DEFAULT pg_current_xact_id()::text::bigint,
                 created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
             )
             ",
@@ -124,8 +126,134 @@ where
         .execute(&self.pool)
         .await?;
 
+        // Drives the subscription cursor: events are delivered in (xid, position)
+        // order, gated by the transaction-id high-water-mark.
+        sqlx::query(
+            r"CREATE INDEX IF NOT EXISTS es_events_by_xid_and_position ON es_events(xid, position)",
+        )
+        .execute(&self.pool)
+        .await?;
+
         Ok(())
     }
+}
+
+/// Map a result row into a [`StoredEvent`]. The query must select the standard
+/// event columns: `aggregate_kind, aggregate_id, event_kind, position, data,
+/// metadata`.
+pub(crate) fn row_to_stored_event<M>(
+    row: &sqlx::postgres::PgRow,
+) -> Result<StoredEvent<uuid::Uuid, i64, serde_json::Value, M>, Error>
+where
+    M: DeserializeOwned,
+{
+    let aggregate_kind: String = row.try_get("aggregate_kind")?;
+    let aggregate_id: uuid::Uuid = row.try_get("aggregate_id")?;
+    let event_kind: String = row.try_get("event_kind")?;
+    let position: i64 = row.try_get("position")?;
+    let data: sqlx::types::Json<serde_json::Value> = row.try_get("data")?;
+    let metadata: sqlx::types::Json<M> = row.try_get("metadata")?;
+
+    Ok(StoredEvent {
+        aggregate_kind,
+        aggregate_id,
+        kind: event_kind,
+        position,
+        data: data.0,
+        metadata: metadata.0,
+    })
+}
+
+/// Serialise events to `(kind, json)` pairs, reporting the offending index on
+/// failure so callers can build their commit-specific `Serialization` variant.
+fn serialize_events<E>(
+    events: &NonEmpty<E>,
+) -> Result<Vec<(String, serde_json::Value)>, (usize, Error)>
+where
+    E: sourcery_core::event::EventKind + serde::Serialize,
+{
+    let mut prepared = Vec::with_capacity(events.len());
+    for (index, event) in events.iter().enumerate() {
+        let data =
+            serde_json::to_value(event).map_err(|e| (index, Error::Serialization(Box::new(e))))?;
+        prepared.push((event.kind().to_string(), data));
+    }
+    Ok(prepared)
+}
+
+/// Insert the stream row if absent (idempotent), so version checks and
+/// `last_position` updates have a row to target.
+async fn ensure_stream(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    aggregate_kind: &str,
+    aggregate_id: &uuid::Uuid,
+) -> Result<(), Error> {
+    sqlx::query(
+        r"
+        INSERT INTO es_streams (aggregate_kind, aggregate_id, last_position)
+        VALUES ($1, $2, NULL)
+        ON CONFLICT (aggregate_kind, aggregate_id) DO NOTHING
+        ",
+    )
+    .bind(aggregate_kind)
+    .bind(aggregate_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Shared tail of both commit paths: insert the prepared events, advance the
+/// stream's `last_position`, notify subscribers, and commit the transaction.
+///
+/// Takes ownership of `tx` and commits it. Returns the position of the last
+/// event written.
+async fn append_events_and_commit<M>(
+    mut tx: sqlx::Transaction<'_, Postgres>,
+    aggregate_kind: &str,
+    aggregate_id: &uuid::Uuid,
+    prepared: Vec<(String, serde_json::Value)>,
+    metadata: &M,
+) -> Result<i64, Error>
+where
+    M: Serialize + Sync,
+{
+    let mut qb = QueryBuilder::<Postgres>::new(
+        "INSERT INTO es_events (aggregate_kind, aggregate_id, event_kind, data, metadata) ",
+    );
+    qb.push_values(prepared, |mut b, (kind, data)| {
+        b.push_bind(aggregate_kind);
+        b.push_bind(aggregate_id);
+        b.push_bind(kind);
+        b.push_bind(sqlx::types::Json(data));
+        b.push_bind(sqlx::types::Json(metadata));
+    });
+    qb.push(" RETURNING position");
+
+    let rows: Vec<i64> = qb.build_query_scalar().fetch_all(&mut *tx).await?;
+    let last_position = *rows.last().ok_or(Error::MissingReturnedPosition)?;
+
+    sqlx::query(
+        r"
+            UPDATE es_streams
+            SET last_position = $1
+            WHERE aggregate_kind = $2 AND aggregate_id = $3
+            ",
+    )
+    .bind(last_position)
+    .bind(aggregate_kind)
+    .bind(aggregate_id)
+    .execute(&mut *tx)
+    .await?;
+
+    // Wake live subscribers on commit (best-effort low-latency signal; the
+    // subscriber's poll fallback covers any missed notification).
+    sqlx::query("SELECT pg_notify($1, '')")
+        .bind(subscription::NOTIFY_CHANNEL)
+        .execute(&mut *tx)
+        .await?;
+
+    tx.commit().await?;
+    Ok(last_position)
 }
 
 impl<M> EventStore for Store<M>
@@ -145,7 +273,7 @@ where
     where
         E: DomainEvent + serde::de::DeserializeOwned,
     {
-        serde_json::from_value(stored.data.clone()).map_err(|e| Error::Deserialization(Box::new(e)))
+        E::deserialize(&stored.data).map_err(|e| Error::Deserialization(Box::new(e)))
     }
 
     async fn stream_version<'a>(
@@ -184,15 +312,8 @@ where
         E: sourcery_core::event::EventKind + serde::Serialize + Send + Sync + 'a,
         Self::Metadata: Clone,
     {
-        // Serialize all events first
-        let mut prepared: Vec<(String, serde_json::Value)> = Vec::with_capacity(events.len());
-        for (index, event) in events.iter().enumerate() {
-            let data = serde_json::to_value(event).map_err(|e| CommitError::Serialization {
-                index,
-                source: Error::Serialization(Box::new(e)),
-            })?;
-            prepared.push((event.kind().to_string(), data));
-        }
+        let prepared = serialize_events(&events)
+            .map_err(|(index, source)| CommitError::Serialization { index, source })?;
 
         let mut tx = self
             .pool
@@ -200,62 +321,16 @@ where
             .await
             .map_err(|e| CommitError::Store(Error::Database(e)))?;
 
-        sqlx::query(
-            r"
-                INSERT INTO es_streams (aggregate_kind, aggregate_id, last_position)
-                VALUES ($1, $2, NULL)
-                ON CONFLICT (aggregate_kind, aggregate_id) DO NOTHING
-                ",
-        )
-        .bind(aggregate_kind)
-        .bind(aggregate_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| CommitError::Store(Error::Database(e)))?;
-
-        let mut qb = QueryBuilder::<Postgres>::new(
-            "INSERT INTO es_events (aggregate_kind, aggregate_id, event_kind, data, metadata) ",
-        );
-        qb.push_values(prepared, |mut b, (kind, data)| {
-            b.push_bind(aggregate_kind);
-            b.push_bind(aggregate_id);
-            b.push_bind(kind);
-            b.push_bind(sqlx::types::Json(data));
-            b.push_bind(sqlx::types::Json(metadata.clone()));
-        });
-        qb.push(" RETURNING position");
-
-        let rows: Vec<i64> = qb
-            .build_query_scalar()
-            .fetch_all(&mut *tx)
+        ensure_stream(&mut tx, aggregate_kind, aggregate_id)
             .await
-            .map_err(|e| CommitError::Store(Error::Database(e)))?;
+            .map_err(CommitError::Store)?;
 
-        let last_position = rows
-            .last()
-            .ok_or_else(|| CommitError::Store(Error::MissingReturnedPosition))?;
+        let last_position =
+            append_events_and_commit(tx, aggregate_kind, aggregate_id, prepared, metadata)
+                .await
+                .map_err(CommitError::Store)?;
 
-        sqlx::query(
-            r"
-                UPDATE es_streams
-                SET last_position = $1
-                WHERE aggregate_kind = $2 AND aggregate_id = $3
-                ",
-        )
-        .bind(last_position)
-        .bind(aggregate_kind)
-        .bind(aggregate_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| CommitError::Store(Error::Database(e)))?;
-
-        tx.commit()
-            .await
-            .map_err(|e| CommitError::Store(Error::Database(e)))?;
-
-        Ok(Committed {
-            last_position: *last_position,
-        })
+        Ok(Committed { last_position })
     }
 
     #[tracing::instrument(
@@ -279,16 +354,8 @@ where
         E: sourcery_core::event::EventKind + serde::Serialize + Send + Sync + 'a,
         Self::Metadata: Clone,
     {
-        // Serialize all events first
-        let mut prepared: Vec<(String, serde_json::Value)> = Vec::with_capacity(events.len());
-        for (index, event) in events.iter().enumerate() {
-            let data =
-                serde_json::to_value(event).map_err(|e| OptimisticCommitError::Serialization {
-                    index,
-                    source: Error::Serialization(Box::new(e)),
-                })?;
-            prepared.push((event.kind().to_string(), data));
-        }
+        let prepared = serialize_events(&events)
+            .map_err(|(index, source)| OptimisticCommitError::Serialization { index, source })?;
 
         let mut tx = self
             .pool
@@ -296,18 +363,9 @@ where
             .await
             .map_err(|e| OptimisticCommitError::Store(Error::Database(e)))?;
 
-        sqlx::query(
-            r"
-                INSERT INTO es_streams (aggregate_kind, aggregate_id, last_position)
-                VALUES ($1, $2, NULL)
-                ON CONFLICT (aggregate_kind, aggregate_id) DO NOTHING
-                ",
-        )
-        .bind(aggregate_kind)
-        .bind(aggregate_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| OptimisticCommitError::Store(Error::Database(e)))?;
+        ensure_stream(&mut tx, aggregate_kind, aggregate_id)
+            .await
+            .map_err(OptimisticCommitError::Store)?;
 
         let current: Option<i64> = sqlx::query_scalar::<_, Option<i64>>(
             r"
@@ -344,49 +402,12 @@ where
             }
         }
 
-        let mut qb = QueryBuilder::<Postgres>::new(
-            "INSERT INTO es_events (aggregate_kind, aggregate_id, event_kind, data, metadata) ",
-        );
-        qb.push_values(prepared, |mut b, (kind, data)| {
-            b.push_bind(aggregate_kind);
-            b.push_bind(aggregate_id);
-            b.push_bind(kind);
-            b.push_bind(sqlx::types::Json(data));
-            b.push_bind(sqlx::types::Json(metadata.clone()));
-        });
-        qb.push(" RETURNING position");
+        let last_position =
+            append_events_and_commit(tx, aggregate_kind, aggregate_id, prepared, metadata)
+                .await
+                .map_err(OptimisticCommitError::Store)?;
 
-        let rows: Vec<i64> = qb
-            .build_query_scalar()
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(|e| OptimisticCommitError::Store(Error::Database(e)))?;
-
-        let last_position = rows
-            .last()
-            .ok_or_else(|| OptimisticCommitError::Store(Error::MissingReturnedPosition))?;
-
-        sqlx::query(
-            r"
-                UPDATE es_streams
-                SET last_position = $1
-                WHERE aggregate_kind = $2 AND aggregate_id = $3
-                ",
-        )
-        .bind(last_position)
-        .bind(aggregate_kind)
-        .bind(aggregate_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| OptimisticCommitError::Store(Error::Database(e)))?;
-
-        tx.commit()
-            .await
-            .map_err(|e| OptimisticCommitError::Store(Error::Database(e)))?;
-
-        Ok(Committed {
-            last_position: *last_position,
-        })
+        Ok(Committed { last_position })
     }
 
     #[allow(clippy::type_complexity)]
@@ -433,27 +454,7 @@ where
         qb.push(") t ORDER BY position ASC");
 
         let rows = qb.build().fetch_all(&self.pool).await?;
-
-        let mut out = Vec::with_capacity(rows.len());
-        for row in rows {
-            let aggregate_kind: String = row.try_get("aggregate_kind")?;
-            let aggregate_id: uuid::Uuid = row.try_get("aggregate_id")?;
-            let event_kind: String = row.try_get("event_kind")?;
-            let position: i64 = row.try_get("position")?;
-            let data: sqlx::types::Json<serde_json::Value> = row.try_get("data")?;
-            let metadata: sqlx::types::Json<M> = row.try_get("metadata")?;
-
-            out.push(StoredEvent {
-                aggregate_kind,
-                aggregate_id,
-                kind: event_kind,
-                position,
-                data: data.0,
-                metadata: metadata.0,
-            });
-        }
-
-        Ok(out)
+        rows.iter().map(row_to_stored_event::<M>).collect()
     }
 }
 

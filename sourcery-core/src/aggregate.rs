@@ -157,6 +157,7 @@ pub trait Handle<C>: Aggregate {
 /// `HandleCreate<C>` is used when the aggregate stream does not yet exist.
 /// It allows create commands to have their own validation logic and error
 /// type, which is converted into the aggregate's top-level error type.
+// ANCHOR: handle_create_trait
 pub trait HandleCreate<C>: Aggregate {
     /// Narrower error type for this specific creation command.
     ///
@@ -172,3 +173,4 @@ pub trait HandleCreate<C>: Aggregate {
     /// command is invalid for a missing aggregate.
     fn handle_create(command: &C) -> Result<Vec<Self::Event>, Self::HandleCreateError>;
 }
+// ANCHOR_END: handle_create_trait
