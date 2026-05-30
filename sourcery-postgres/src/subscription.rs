@@ -38,7 +38,7 @@ use sourcery_core::{
         OfferSnapshotError, Snapshot, SnapshotOffer, SnapshotStore, inmemory::SnapshotPolicy,
     },
     store::{EventFilter, StoredEvent},
-    subscription::{CheckpointStream, Checkpointed, SubscribableStore},
+    subscription::{Checkpointed, SubscribableStore},
 };
 use sqlx::{PgPool, Postgres, QueryBuilder, Row, postgres::PgListener};
 
@@ -146,7 +146,7 @@ where
         &self,
         filters: &[EventFilter<Self::Id, Self::Position>],
         from: Option<Self::Checkpoint>,
-    ) -> CheckpointStream<'_, Self> {
+    ) -> impl futures_core::Stream<Item = Result<Checkpointed<Self>, Self::Error>> + Send + '_ {
         let pool = self.pool.clone();
         let filters = filters.to_vec();
         let mut cursor = from.unwrap_or(Watermark {
@@ -154,7 +154,7 @@ where
             position: 0,
         });
 
-        Box::pin(async_stream::stream! {
+        async_stream::stream! {
             // Best-effort live notifications; fall back to poll-only on failure.
             let mut listener = match PgListener::connect_with(&pool).await {
                 Ok(mut l) => l.listen(NOTIFY_CHANNEL).await.ok().map(|()| l),
@@ -199,7 +199,7 @@ where
                     }
                 }
             }
-        })
+        }
     }
 
     async fn current_checkpoint(

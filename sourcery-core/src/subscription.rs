@@ -69,11 +69,6 @@ pub struct Checkpointed<S: SubscribableStore + ?Sized> {
     >,
 }
 
-/// Type alias for the boxed, checkpoint-tagged event stream returned by
-/// [`SubscribableStore::subscribe`].
-pub type CheckpointStream<'a, S> =
-    Pin<Box<dyn Stream<Item = Result<Checkpointed<S>, <S as EventStore>::Error>> + Send + 'a>>;
-
 /// A store that supports push-based event subscriptions.
 ///
 /// Extends [`EventStore`] with a `subscribe` method that returns a stream of
@@ -125,7 +120,7 @@ pub trait SubscribableStore: EventStore {
         &self,
         filters: &[EventFilter<Self::Id, Self::Position>],
         from: Option<Self::Checkpoint>,
-    ) -> CheckpointStream<'_, Self>;
+    ) -> impl Stream<Item = Result<Checkpointed<Self>, Self::Error>> + Send + '_;
 
     /// The largest checkpoint currently reachable by catch-up for `filters`.
     ///
@@ -379,7 +374,8 @@ where
                 signal_ready(&mut ready_tx);
             }
 
-            let mut stream = store.subscribe(&event_filters, from_checkpoint);
+            let stream = store.subscribe(&event_filters, from_checkpoint);
+            tokio::pin!(stream);
 
             loop {
                 tokio::select! {
