@@ -142,7 +142,6 @@ impl SnapshotStore<String> for FailingLoadSnapshotStore {
     type Error = SnapshotLoadError;
     type Position = u64;
 
-    #[allow(clippy::unused_async_trait_impl)]
     async fn load<T>(
         &self,
         _: &str,
@@ -151,10 +150,10 @@ impl SnapshotStore<String> for FailingLoadSnapshotStore {
     where
         T: DeserializeOwned,
     {
+        std::future::ready(()).await;
         Err(SnapshotLoadError)
     }
 
-    #[allow(clippy::unused_async_trait_impl)]
     async fn offer_snapshot<CE, T, Create>(
         &self,
         _: &str,
@@ -167,6 +166,7 @@ impl SnapshotStore<String> for FailingLoadSnapshotStore {
         T: Serialize,
         Create: FnOnce() -> Result<Snapshot<Self::Position, T>, CE>,
     {
+        std::future::ready(()).await;
         Ok(SnapshotOffer::Declined)
     }
 }
@@ -178,7 +178,6 @@ impl SnapshotStore<String> for CorruptSnapshotStore {
     type Error = SnapshotLoadError;
     type Position = u64;
 
-    #[allow(clippy::unused_async_trait_impl)]
     async fn load<T>(
         &self,
         _: &str,
@@ -187,10 +186,10 @@ impl SnapshotStore<String> for CorruptSnapshotStore {
     where
         T: DeserializeOwned,
     {
+        std::future::ready(()).await;
         Err(SnapshotLoadError)
     }
 
-    #[allow(clippy::unused_async_trait_impl)]
     async fn offer_snapshot<CE, T, Create>(
         &self,
         _: &str,
@@ -203,6 +202,7 @@ impl SnapshotStore<String> for CorruptSnapshotStore {
         T: Serialize,
         Create: FnOnce() -> Result<Snapshot<Self::Position, T>, CE>,
     {
+        std::future::ready(()).await;
         Ok(SnapshotOffer::Declined)
     }
 }
@@ -228,7 +228,6 @@ impl SnapshotStore<String> for TrackingSnapshotStore {
     type Error = Infallible;
     type Position = u64;
 
-    #[allow(clippy::unused_async_trait_impl)]
     async fn load<T>(
         &self,
         _: &str,
@@ -238,10 +237,10 @@ impl SnapshotStore<String> for TrackingSnapshotStore {
         T: DeserializeOwned,
     {
         self.load_called.store(true, Ordering::Relaxed);
+        std::future::ready(()).await;
         Ok(None)
     }
 
-    #[allow(clippy::unused_async_trait_impl)]
     async fn offer_snapshot<CE, T, Create>(
         &self,
         _: &str,
@@ -254,6 +253,7 @@ impl SnapshotStore<String> for TrackingSnapshotStore {
         T: Serialize,
         Create: FnOnce() -> Result<Snapshot<Self::Position, T>, CE>,
     {
+        std::future::ready(()).await;
         Ok(SnapshotOffer::Declined)
     }
 }

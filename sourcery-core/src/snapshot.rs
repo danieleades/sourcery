@@ -159,15 +159,14 @@ where
     type Error = Infallible;
     type Position = Pos;
 
-    #[allow(clippy::unused_async_trait_impl)]
     async fn load<T>(&self, _kind: &str, _id: &Id) -> Result<Option<Snapshot<Pos, T>>, Self::Error>
     where
         T: DeserializeOwned,
     {
+        std::future::ready(()).await;
         Ok(None)
     }
 
-    #[allow(clippy::unused_async_trait_impl)]
     async fn offer_snapshot<CE, T, Create>(
         &self,
         _kind: &str,
@@ -180,6 +179,7 @@ where
         T: Serialize,
         Create: FnOnce() -> Result<Snapshot<Pos, T>, CE>,
     {
+        std::future::ready(()).await;
         Ok(SnapshotOffer::Declined)
     }
 }
