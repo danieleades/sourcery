@@ -142,6 +142,7 @@ impl SnapshotStore<String> for FailingLoadSnapshotStore {
     type Error = SnapshotLoadError;
     type Position = u64;
 
+    #[allow(clippy::unused_async_trait_impl)]
     async fn load<T>(
         &self,
         _: &str,
@@ -153,6 +154,7 @@ impl SnapshotStore<String> for FailingLoadSnapshotStore {
         Err(SnapshotLoadError)
     }
 
+    #[allow(clippy::unused_async_trait_impl)]
     async fn offer_snapshot<CE, T, Create>(
         &self,
         _: &str,
@@ -176,6 +178,7 @@ impl SnapshotStore<String> for CorruptSnapshotStore {
     type Error = SnapshotLoadError;
     type Position = u64;
 
+    #[allow(clippy::unused_async_trait_impl)]
     async fn load<T>(
         &self,
         _: &str,
@@ -187,6 +190,7 @@ impl SnapshotStore<String> for CorruptSnapshotStore {
         Err(SnapshotLoadError)
     }
 
+    #[allow(clippy::unused_async_trait_impl)]
     async fn offer_snapshot<CE, T, Create>(
         &self,
         _: &str,
@@ -224,6 +228,7 @@ impl SnapshotStore<String> for TrackingSnapshotStore {
     type Error = Infallible;
     type Position = u64;
 
+    #[allow(clippy::unused_async_trait_impl)]
     async fn load<T>(
         &self,
         _: &str,
@@ -236,6 +241,7 @@ impl SnapshotStore<String> for TrackingSnapshotStore {
         Ok(None)
     }
 
+    #[allow(clippy::unused_async_trait_impl)]
     async fn offer_snapshot<CE, T, Create>(
         &self,
         _: &str,

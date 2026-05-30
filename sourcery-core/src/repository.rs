@@ -430,6 +430,7 @@ where
     type Prepared = ();
     type SnapshotError = Infallible;
 
+    #[allow(clippy::unused_async_trait_impl)]
     async fn load_base(&self, _kind: &str, _id: &S::Id) -> Option<(A, S::Position)> {
         None
     }
@@ -443,6 +444,7 @@ where
 
     fn prepare_snapshot_from_new(&self, _events: &NonEmpty<A::Event>) -> Self::Prepared {}
 
+    #[allow(clippy::unused_async_trait_impl)]
     async fn offer_snapshot(
         &self,
         _kind: &str,
