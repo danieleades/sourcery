@@ -430,8 +430,12 @@ where
     type Prepared = ();
     type SnapshotError = Infallible;
 
-    async fn load_base(&self, _kind: &str, _id: &S::Id) -> Option<(A, S::Position)> {
-        None
+    fn load_base(
+        &self,
+        _kind: &str,
+        _id: &S::Id,
+    ) -> impl std::future::Future<Output = Option<(A, S::Position)>> + Send {
+        std::future::poll_fn(|_| std::task::Poll::Ready(None))
     }
 
     fn prepare_snapshot_from_existing(
@@ -443,15 +447,15 @@ where
 
     fn prepare_snapshot_from_new(&self, _events: &NonEmpty<A::Event>) -> Self::Prepared {}
 
-    async fn offer_snapshot(
+    fn offer_snapshot(
         &self,
         _kind: &str,
         _id: &S::Id,
         _events_since_snapshot: u64,
         _new_position: S::Position,
         _prepared: Self::Prepared,
-    ) -> Result<(), Self::SnapshotError> {
-        Ok(())
+    ) -> impl std::future::Future<Output = Result<(), Self::SnapshotError>> + Send {
+        std::future::poll_fn(|_| std::task::Poll::Ready(Ok(())))
     }
 }
 

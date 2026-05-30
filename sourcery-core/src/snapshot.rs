@@ -159,26 +159,32 @@ where
     type Error = Infallible;
     type Position = Pos;
 
-    async fn load<T>(&self, _kind: &str, _id: &Id) -> Result<Option<Snapshot<Pos, T>>, Self::Error>
+    fn load<T>(
+        &self,
+        _kind: &str,
+        _id: &Id,
+    ) -> impl std::future::Future<Output = Result<Option<Snapshot<Pos, T>>, Self::Error>> + Send
     where
         T: DeserializeOwned,
     {
-        Ok(None)
+        std::future::poll_fn(|_| std::task::Poll::Ready(Ok(None)))
     }
 
-    async fn offer_snapshot<CE, T, Create>(
+    fn offer_snapshot<CE, T, Create>(
         &self,
         _kind: &str,
         _id: &Id,
         _events_since_last_snapshot: u64,
         _create_snapshot: Create,
-    ) -> Result<SnapshotOffer, OfferSnapshotError<Self::Error, CE>>
+    ) -> impl std::future::Future<
+        Output = Result<SnapshotOffer, OfferSnapshotError<Self::Error, CE>>,
+    > + Send
     where
         CE: std::error::Error + Send + Sync + 'static,
         T: Serialize,
-        Create: FnOnce() -> Result<Snapshot<Pos, T>, CE>,
+        Create: FnOnce() -> Result<Snapshot<Pos, T>, CE> + Send,
     {
-        Ok(SnapshotOffer::Declined)
+        std::future::poll_fn(|_| std::task::Poll::Ready(Ok(SnapshotOffer::Declined)))
     }
 }
 

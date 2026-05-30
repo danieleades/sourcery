@@ -142,30 +142,32 @@ impl SnapshotStore<String> for FailingLoadSnapshotStore {
     type Error = SnapshotLoadError;
     type Position = u64;
 
-    async fn load<T>(
+    fn load<T>(
         &self,
         _: &str,
         _: &String,
-    ) -> Result<Option<Snapshot<Self::Position, T>>, Self::Error>
+    ) -> impl std::future::Future<Output = Result<Option<Snapshot<Self::Position, T>>, Self::Error>> + Send
     where
         T: DeserializeOwned,
     {
-        Err(SnapshotLoadError)
+        std::future::poll_fn(|_| std::task::Poll::Ready(Err(SnapshotLoadError)))
     }
 
-    async fn offer_snapshot<CE, T, Create>(
+    fn offer_snapshot<CE, T, Create>(
         &self,
         _: &str,
         _: &String,
         _: u64,
         _: Create,
-    ) -> Result<SnapshotOffer, OfferSnapshotError<Self::Error, CE>>
+    ) -> impl std::future::Future<
+        Output = Result<SnapshotOffer, OfferSnapshotError<Self::Error, CE>>,
+    > + Send
     where
         CE: std::error::Error + Send + Sync + 'static,
         T: Serialize,
-        Create: FnOnce() -> Result<Snapshot<Self::Position, T>, CE>,
+        Create: FnOnce() -> Result<Snapshot<Self::Position, T>, CE> + Send,
     {
-        Ok(SnapshotOffer::Declined)
+        std::future::poll_fn(|_| std::task::Poll::Ready(Ok(SnapshotOffer::Declined)))
     }
 }
 
@@ -176,30 +178,32 @@ impl SnapshotStore<String> for CorruptSnapshotStore {
     type Error = SnapshotLoadError;
     type Position = u64;
 
-    async fn load<T>(
+    fn load<T>(
         &self,
         _: &str,
         _: &String,
-    ) -> Result<Option<Snapshot<Self::Position, T>>, Self::Error>
+    ) -> impl std::future::Future<Output = Result<Option<Snapshot<Self::Position, T>>, Self::Error>> + Send
     where
         T: DeserializeOwned,
     {
-        Err(SnapshotLoadError)
+        std::future::poll_fn(|_| std::task::Poll::Ready(Err(SnapshotLoadError)))
     }
 
-    async fn offer_snapshot<CE, T, Create>(
+    fn offer_snapshot<CE, T, Create>(
         &self,
         _: &str,
         _: &String,
         _: u64,
         _: Create,
-    ) -> Result<SnapshotOffer, OfferSnapshotError<Self::Error, CE>>
+    ) -> impl std::future::Future<
+        Output = Result<SnapshotOffer, OfferSnapshotError<Self::Error, CE>>,
+    > + Send
     where
         CE: std::error::Error + Send + Sync + 'static,
         T: Serialize,
-        Create: FnOnce() -> Result<Snapshot<Self::Position, T>, CE>,
+        Create: FnOnce() -> Result<Snapshot<Self::Position, T>, CE> + Send,
     {
-        Ok(SnapshotOffer::Declined)
+        std::future::poll_fn(|_| std::task::Poll::Ready(Ok(SnapshotOffer::Declined)))
     }
 }
 
@@ -224,31 +228,35 @@ impl SnapshotStore<String> for TrackingSnapshotStore {
     type Error = Infallible;
     type Position = u64;
 
-    async fn load<T>(
+    fn load<T>(
         &self,
         _: &str,
         _: &String,
-    ) -> Result<Option<Snapshot<Self::Position, T>>, Self::Error>
+    ) -> impl std::future::Future<Output = Result<Option<Snapshot<Self::Position, T>>, Self::Error>> + Send
     where
         T: DeserializeOwned,
     {
-        self.load_called.store(true, Ordering::Relaxed);
-        Ok(None)
+        std::future::poll_fn(|_| {
+            self.load_called.store(true, Ordering::Relaxed);
+            std::task::Poll::Ready(Ok(None))
+        })
     }
 
-    async fn offer_snapshot<CE, T, Create>(
+    fn offer_snapshot<CE, T, Create>(
         &self,
         _: &str,
         _: &String,
         _: u64,
         _: Create,
-    ) -> Result<SnapshotOffer, OfferSnapshotError<Self::Error, CE>>
+    ) -> impl std::future::Future<
+        Output = Result<SnapshotOffer, OfferSnapshotError<Self::Error, CE>>,
+    > + Send
     where
         CE: std::error::Error + Send + Sync + 'static,
         T: Serialize,
-        Create: FnOnce() -> Result<Snapshot<Self::Position, T>, CE>,
+        Create: FnOnce() -> Result<Snapshot<Self::Position, T>, CE> + Send,
     {
-        Ok(SnapshotOffer::Declined)
+        std::future::poll_fn(|_| std::task::Poll::Ready(Ok(SnapshotOffer::Declined)))
     }
 }
 
