@@ -30,7 +30,7 @@
 //! correctness safety-net, because a rolled-back oldest transaction advances
 //! `xmin` without emitting a notification.
 
-use std::time::Duration;
+use std::{pin::Pin, time::Duration};
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sourcery_core::{
@@ -146,7 +146,7 @@ where
         &self,
         filters: &[EventFilter<Self::Id, Self::Position>],
         from: Option<Self::Checkpoint>,
-    ) -> impl futures_core::Stream<Item = Result<Checkpointed<Self>, Self::Error>> + Send + '_ {
+    ) -> Pin<Box<impl futures_core::Stream<Item = Result<Checkpointed<Self>, Self::Error>> + Send + '_>> {
         let pool = self.pool.clone();
         let filters = filters.to_vec();
         let mut cursor = from.unwrap_or(Watermark {
@@ -154,7 +154,7 @@ where
             position: 0,
         });
 
-        async_stream::stream! {
+        Box::pin(async_stream::stream! {
             // Best-effort live notifications; fall back to poll-only on failure.
             let mut listener = match PgListener::connect_with(&pool).await {
                 Ok(mut l) => l.listen(NOTIFY_CHANNEL).await.ok().map(|()| l),
@@ -199,7 +199,7 @@ where
                     }
                 }
             }
-        }
+        })
     }
 
     async fn current_checkpoint(

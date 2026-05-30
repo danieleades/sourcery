@@ -13,6 +13,7 @@
 
 use std::{
     collections::HashMap,
+    pin::Pin,
     sync::{Arc, RwLock},
 };
 
@@ -290,7 +291,7 @@ where
         &self,
         filters: &[EventFilter<Self::Id, Self::Position>],
         from: Option<Self::Checkpoint>,
-    ) -> impl futures_core::Stream<Item = Result<Checkpointed<Self>, Self::Error>> + Send + '_ {
+    ) -> Pin<Box<impl futures_core::Stream<Item = Result<Checkpointed<Self>, Self::Error>> + Send + '_>> {
         let filters = filters.to_vec();
         let inner = self.inner.clone();
 
@@ -301,7 +302,7 @@ where
             guard.notify_tx.subscribe()
         };
 
-        async_stream::stream! {
+        Box::pin(async_stream::stream! {
             // 1. Load and yield historical events
             let historical = {
                 let guard = inner.read().expect("in-memory store lock poisoned");
@@ -340,7 +341,7 @@ where
                     yield Ok(Checkpointed { checkpoint, event });
                 }
             }
-        }
+        })
     }
 
     fn current_checkpoint(

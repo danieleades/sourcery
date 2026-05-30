@@ -120,7 +120,7 @@ pub trait SubscribableStore: EventStore {
         &self,
         filters: &[EventFilter<Self::Id, Self::Position>],
         from: Option<Self::Checkpoint>,
-    ) -> impl Stream<Item = Result<Checkpointed<Self>, Self::Error>> + Send + '_;
+    ) -> Pin<Box<impl Stream<Item = Result<Checkpointed<Self>, Self::Error>> + Send + '_>>;
 
     /// The largest checkpoint currently reachable by catch-up for `filters`.
     ///
@@ -374,8 +374,7 @@ where
                 signal_ready(&mut ready_tx);
             }
 
-            let stream = store.subscribe(&event_filters, from_checkpoint);
-            tokio::pin!(stream);
+            let mut stream = store.subscribe(&event_filters, from_checkpoint);
 
             loop {
                 tokio::select! {

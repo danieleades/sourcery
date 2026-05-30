@@ -114,8 +114,7 @@ async fn subscription_catches_up_then_streams_live() {
     }
 
     let filters = event_filters();
-    let stream = store.subscribe(&filters, None);
-    tokio::pin!(stream);
+    let mut stream = store.subscribe(&filters, None);
 
     let first = timeout(Duration::from_secs(5), stream.next())
         .await
@@ -177,8 +176,7 @@ async fn in_flight_transaction_gap_is_not_skipped() {
     assert!(pos_a < pos_b, "A must have the lower position");
 
     let filters = event_filters();
-    let stream = store.subscribe(&filters, None);
-    tokio::pin!(stream);
+    let mut stream = store.subscribe(&filters, None);
 
     // While A is in-flight, B is withheld (its xid is at/above xmin) even though
     // it is committed — nothing is delivered.
@@ -235,8 +233,7 @@ async fn subscription_resumes_from_checkpoint() {
 
     // Consume the first event, remember its checkpoint, drop the stream.
     let checkpoint = {
-        let stream = store.subscribe(&filters, None);
-        tokio::pin!(stream);
+        let mut stream = store.subscribe(&filters, None);
         let first = timeout(Duration::from_secs(5), stream.next())
             .await
             .unwrap()
@@ -246,8 +243,7 @@ async fn subscription_resumes_from_checkpoint() {
     };
 
     // Resuming from that checkpoint must skip the already-seen event.
-    let resumed = store.subscribe(&filters, Some(checkpoint));
-    tokio::pin!(resumed);
+    let mut resumed = store.subscribe(&filters, Some(checkpoint));
     let next = timeout(Duration::from_secs(5), resumed.next())
         .await
         .unwrap()
