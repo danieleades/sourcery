@@ -146,7 +146,9 @@ where
         &self,
         filters: &[EventFilter<Self::Id, Self::Position>],
         from: Option<Self::Checkpoint>,
-    ) -> Pin<Box<impl futures_core::Stream<Item = Result<Checkpointed<Self>, Self::Error>> + Send + '_>> {
+    ) -> Pin<
+        Box<impl futures_core::Stream<Item = Result<Checkpointed<Self>, Self::Error>> + Send + '_>,
+    > {
         let pool = self.pool.clone();
         let filters = filters.to_vec();
         let mut cursor = from.unwrap_or(Watermark {
