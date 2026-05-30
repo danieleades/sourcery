@@ -163,6 +163,7 @@ where
     where
         T: DeserializeOwned,
     {
+        std::future::ready(()).await;
         Ok(None)
     }
 
@@ -178,6 +179,7 @@ where
         T: Serialize,
         Create: FnOnce() -> Result<Snapshot<Pos, T>, CE>,
     {
+        std::future::ready(()).await;
         Ok(SnapshotOffer::Declined)
     }
 }

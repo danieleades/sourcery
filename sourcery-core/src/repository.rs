@@ -431,6 +431,7 @@ where
     type SnapshotError = Infallible;
 
     async fn load_base(&self, _kind: &str, _id: &S::Id) -> Option<(A, S::Position)> {
+        std::future::ready(()).await;
         None
     }
 
@@ -451,6 +452,7 @@ where
         _new_position: S::Position,
         _prepared: Self::Prepared,
     ) -> Result<(), Self::SnapshotError> {
+        std::future::ready(()).await;
         Ok(())
     }
 }

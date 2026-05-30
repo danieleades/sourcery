@@ -150,6 +150,7 @@ impl SnapshotStore<String> for FailingLoadSnapshotStore {
     where
         T: DeserializeOwned,
     {
+        std::future::ready(()).await;
         Err(SnapshotLoadError)
     }
 
@@ -165,6 +166,7 @@ impl SnapshotStore<String> for FailingLoadSnapshotStore {
         T: Serialize,
         Create: FnOnce() -> Result<Snapshot<Self::Position, T>, CE>,
     {
+        std::future::ready(()).await;
         Ok(SnapshotOffer::Declined)
     }
 }
@@ -184,6 +186,7 @@ impl SnapshotStore<String> for CorruptSnapshotStore {
     where
         T: DeserializeOwned,
     {
+        std::future::ready(()).await;
         Err(SnapshotLoadError)
     }
 
@@ -199,6 +202,7 @@ impl SnapshotStore<String> for CorruptSnapshotStore {
         T: Serialize,
         Create: FnOnce() -> Result<Snapshot<Self::Position, T>, CE>,
     {
+        std::future::ready(()).await;
         Ok(SnapshotOffer::Declined)
     }
 }
@@ -233,6 +237,7 @@ impl SnapshotStore<String> for TrackingSnapshotStore {
         T: DeserializeOwned,
     {
         self.load_called.store(true, Ordering::Relaxed);
+        std::future::ready(()).await;
         Ok(None)
     }
 
@@ -248,6 +253,7 @@ impl SnapshotStore<String> for TrackingSnapshotStore {
         T: Serialize,
         Create: FnOnce() -> Result<Snapshot<Self::Position, T>, CE>,
     {
+        std::future::ready(()).await;
         Ok(SnapshotOffer::Declined)
     }
 }

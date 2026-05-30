@@ -145,15 +145,10 @@ where
         Self::Metadata: Clone,
     {
         let result = (|| {
-            // Serialize all events first
-            let mut staged = Vec::with_capacity(events.len());
-            for (index, event) in events.iter().enumerate() {
-                let data = serde_json::to_value(event).map_err(|e| CommitError::Serialization {
-                    index,
-                    source: InMemoryError::Serialization(Box::new(e)),
-                })?;
-                staged.push((event.kind().to_string(), data));
-            }
+            let staged = serialize_events(&events, |index, source| CommitError::Serialization {
+                index,
+                source,
+            })?;
 
             let mut inner = self.inner.write().expect("in-memory store lock poisoned");
             let (last_position, notify_tx) =
@@ -183,53 +178,28 @@ where
         Self::Metadata: Clone,
     {
         let result = (|| {
-            // Serialize all events first
-            let mut staged = Vec::with_capacity(events.len());
-            for (index, event) in events.iter().enumerate() {
-                let data = serde_json::to_value(event).map_err(|e| {
-                    OptimisticCommitError::Serialization {
-                        index,
-                        source: InMemoryError::Serialization(Box::new(e)),
-                    }
-                })?;
-                staged.push((event.kind().to_string(), data));
-            }
+            let staged = serialize_events(&events, |index, source| {
+                OptimisticCommitError::Serialization { index, source }
+            })?;
 
             let mut inner = self.inner.write().expect("in-memory store lock poisoned");
             let stream_key = StreamKey::new(aggregate_kind, aggregate_id.clone());
-
-            // Check version
             let current = inner
                 .streams
                 .get(&stream_key)
                 .and_then(|s| s.last().map(|e| e.position));
 
-            match expected_version {
-                Some(expected) => {
-                    // Expected specific version
-                    if current != Some(expected) {
-                        tracing::debug!(?expected, ?current, "version mismatch, rejecting commit");
-                        return Err(ConcurrencyConflict {
-                            expected: Some(expected),
-                            actual: current,
-                        }
-                        .into());
-                    }
+            if current != expected_version {
+                tracing::debug!(
+                    ?expected_version,
+                    ?current,
+                    "version mismatch, rejecting commit"
+                );
+                return Err(ConcurrencyConflict {
+                    expected: expected_version,
+                    actual: current,
                 }
-                None => {
-                    // Expected new stream (no events)
-                    if let Some(actual) = current {
-                        tracing::debug!(
-                            ?actual,
-                            "stream already exists, rejecting new aggregate commit"
-                        );
-                        return Err(ConcurrencyConflict {
-                            expected: None,
-                            actual: Some(actual),
-                        }
-                        .into());
-                    }
-                }
+                .into());
             }
 
             let (last_position, notify_tx) =
@@ -360,6 +330,25 @@ where
         };
         std::future::ready(Ok(latest))
     }
+}
+
+/// Serialise a batch of domain events before acquiring the write lock.
+fn serialize_events<E, Err>(
+    events: &NonEmpty<E>,
+    map_error: impl Fn(usize, InMemoryError) -> Err,
+) -> Result<Vec<(String, serde_json::Value)>, Err>
+where
+    E: crate::event::EventKind + serde::Serialize,
+{
+    events
+        .iter()
+        .enumerate()
+        .map(|(index, event)| {
+            serde_json::to_value(event)
+                .map(|data| (event.kind().to_string(), data))
+                .map_err(|e| map_error(index, InMemoryError::Serialization(Box::new(e))))
+        })
+        .collect()
 }
 
 /// Append a batch of pre-serialised events to the store, assigning positions.
