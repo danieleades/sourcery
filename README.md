@@ -90,7 +90,7 @@ Pre-1.0. APIs will evolve as real-world usage grows. Feedback and contributions 
 
 ## Licensing
 
-This project is publicly available under the **GNU General Public License v3.0**. It may optionally be distributed under the **MIT licence** by commercial arrangement.
+Sourcery is open source under the **GNU Affero General Public License v3.0** by default. Non-AGPL commercial production licences are free below USD $10M annual revenue, USD $1,000/year for USD $10M-$100M, and 0.001% of annual revenue above USD $100M, capped at USD $50,000/year. See [LICENSING.md](LICENSING.md) for details.
 
 ---
 
