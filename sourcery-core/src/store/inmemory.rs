@@ -13,6 +13,7 @@
 
 use std::{
     collections::HashMap,
+    pin::Pin,
     sync::{Arc, RwLock},
 };
 
@@ -25,7 +26,7 @@ use crate::{
         CommitError, Committed, EventFilter, EventStore, GloballyOrderedStore, LoadEventsResult,
         OptimisticCommitError, StoredEvent, StreamKey,
     },
-    subscription::{CheckpointStream, Checkpointed, SubscribableStore},
+    subscription::{Checkpointed, SubscribableStore},
 };
 
 /// Event stream stored in memory with fixed position and data types.
@@ -290,7 +291,9 @@ where
         &self,
         filters: &[EventFilter<Self::Id, Self::Position>],
         from: Option<Self::Checkpoint>,
-    ) -> CheckpointStream<'_, Self> {
+    ) -> Pin<
+        Box<impl futures_core::Stream<Item = Result<Checkpointed<Self>, Self::Error>> + Send + '_>,
+    > {
         let filters = filters.to_vec();
         let inner = self.inner.clone();
 

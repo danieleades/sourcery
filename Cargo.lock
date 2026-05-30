@@ -2422,6 +2422,7 @@ version = "0.2.0"
 dependencies = [
  "async-stream",
  "criterion",
+ "futures-core",
  "nonempty",
  "serde",
  "serde_json",

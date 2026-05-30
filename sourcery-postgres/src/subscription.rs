@@ -30,7 +30,7 @@
 //! correctness safety-net, because a rolled-back oldest transaction advances
 //! `xmin` without emitting a notification.
 
-use std::time::Duration;
+use std::{pin::Pin, time::Duration};
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sourcery_core::{
@@ -38,7 +38,7 @@ use sourcery_core::{
         OfferSnapshotError, Snapshot, SnapshotOffer, SnapshotStore, inmemory::SnapshotPolicy,
     },
     store::{EventFilter, StoredEvent},
-    subscription::{CheckpointStream, Checkpointed, SubscribableStore},
+    subscription::{Checkpointed, SubscribableStore},
 };
 use sqlx::{PgPool, Postgres, QueryBuilder, Row, postgres::PgListener};
 
@@ -146,7 +146,9 @@ where
         &self,
         filters: &[EventFilter<Self::Id, Self::Position>],
         from: Option<Self::Checkpoint>,
-    ) -> CheckpointStream<'_, Self> {
+    ) -> Pin<
+        Box<impl futures_core::Stream<Item = Result<Checkpointed<Self>, Self::Error>> + Send + '_>,
+    > {
         let pool = self.pool.clone();
         let filters = filters.to_vec();
         let mut cursor = from.unwrap_or(Watermark {
