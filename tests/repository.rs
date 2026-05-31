@@ -142,6 +142,10 @@ impl SnapshotStore<String> for FailingLoadSnapshotStore {
     type Error = SnapshotLoadError;
     type Position = u64;
 
+    #[allow(
+        clippy::unused_async_trait_impl,
+        reason = "the explicit Future form would make the Send bound depend on T"
+    )]
     async fn load<T>(
         &self,
         _: &str,
@@ -153,6 +157,10 @@ impl SnapshotStore<String> for FailingLoadSnapshotStore {
         Err(SnapshotLoadError)
     }
 
+    #[allow(
+        clippy::unused_async_trait_impl,
+        reason = "async keeps this test double equivalent to the trait future contract"
+    )]
     async fn offer_snapshot<CE, T, Create>(
         &self,
         _: &str,
@@ -176,6 +184,10 @@ impl SnapshotStore<String> for CorruptSnapshotStore {
     type Error = SnapshotLoadError;
     type Position = u64;
 
+    #[allow(
+        clippy::unused_async_trait_impl,
+        reason = "the explicit Future form would make the Send bound depend on T"
+    )]
     async fn load<T>(
         &self,
         _: &str,
@@ -187,6 +199,10 @@ impl SnapshotStore<String> for CorruptSnapshotStore {
         Err(SnapshotLoadError)
     }
 
+    #[allow(
+        clippy::unused_async_trait_impl,
+        reason = "async keeps this test double equivalent to the trait future contract"
+    )]
     async fn offer_snapshot<CE, T, Create>(
         &self,
         _: &str,
@@ -224,6 +240,10 @@ impl SnapshotStore<String> for TrackingSnapshotStore {
     type Error = Infallible;
     type Position = u64;
 
+    #[allow(
+        clippy::unused_async_trait_impl,
+        reason = "the explicit Future form would make the Send bound depend on T"
+    )]
     async fn load<T>(
         &self,
         _: &str,
@@ -236,6 +256,10 @@ impl SnapshotStore<String> for TrackingSnapshotStore {
         Ok(None)
     }
 
+    #[allow(
+        clippy::unused_async_trait_impl,
+        reason = "async keeps this test double equivalent to the trait future contract"
+    )]
     async fn offer_snapshot<CE, T, Create>(
         &self,
         _: &str,

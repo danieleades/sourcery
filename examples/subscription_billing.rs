@@ -13,28 +13,27 @@
 //!
 //! Key patterns demonstrated:
 //!
-//! - **`subscribe()` / `StreamExt::next()`** – the projection updates in real
-//!   time as commands are executed, with zero per-query replay cost.
+//! - **`subscribe()` / `current()`** – the subscription maintains the
+//!   projection in the background; `current()` reads the live read model with
+//!   zero per-query replay cost and without draining the update stream.
 //! - **Catch-up on start** – `start()` returns only after historical events are
 //!   replayed, so the projection is current before commands execute.
-//! - **Guard conditions from live state** – the command side reads the
-//!   subscription-maintained projection (via `Arc<Mutex<_>>`) to decide whether
-//!   cancellation is safe.
+//! - **Read-your-writes consistency** – writes use `*_tracked` repository
+//!   methods and await the returned token, then read `current()`, which is then
+//!   guaranteed to reflect the write.
+//! - **Guard conditions from live state** – the command side reads `current()`
+//!   to decide whether cancellation is safe — no event replay, no tracking how
+//!   many events each command emitted.
 //! - **Graceful shutdown** – `subscription.stop()` cleanly terminates the
 //!   background task.
 
-use std::{
-    collections::HashMap,
-    fmt,
-    sync::{Arc, Mutex},
-};
+use std::{collections::HashMap, fmt};
 
 use serde::{Deserialize, Serialize};
 use sourcery::{
     Aggregate, Apply, ApplyProjection, Create, DomainEvent, Handle, HandleCreate, Projection,
     Repository, store::inmemory,
 };
-use tokio_stream::StreamExt as _;
 
 // =============================================================================
 // Shared domain types
@@ -521,13 +520,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //
     // The subscription replays any historical events first (catch-up phase),
     // then transitions to processing live events as they are committed.
-    // `start()` returns only after catch-up completes.
-    // Each `stream.next()` yields the projection after one applied event.
+    // `start()` returns only after catch-up completes. The subscription
+    // maintains the projection in the background; `current()` reads it.
     // -------------------------------------------------------------------------
 
-    // Shared state: the subscription writes, the command side reads.
-    let live_projection = Arc::new(Mutex::new(CustomerBillingProjection::default()));
-    let mut subscription = repository
+    let subscription = repository
         .subscribe::<CustomerBillingProjection>(())
         .start()
         .await?;
@@ -535,15 +532,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Subscription caught up – ready to process commands.\n");
 
     // -------------------------------------------------------------------------
-    // Execute commands. Each commit automatically updates the subscription.
+    // Execute commands. Each tracked write returns a consistency token naming
+    // the exact commit. `subscription.read_after(token)` awaits that token,
+    // then reads `current()` — which is then guaranteed to reflect the write,
+    // with no event counting.
     // -------------------------------------------------------------------------
 
     let customer_id = String::from("ACME-001");
     let subscription_corr = format!("subscription/{}", customer_id.as_str());
 
     // 1. Activate the subscription
-    repository
-        .create::<Subscription, StartSubscription>(
+    let token = repository
+        .create_tracked::<Subscription, StartSubscription>(
             &customer_id,
             &StartSubscription {
                 plan_name: "Pro Annual".into(),
@@ -555,15 +555,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
         )
         .await?;
-    consume_updates(&mut subscription, &live_projection, 1).await?;
+    print_dashboard(&subscription.read_after(token).await?, "  [live]");
 
     // 2. Issue an invoice
     let invoice_id = InvoiceId::new(customer_id.clone(), "2024-INV-1001");
     let invoice_stream_id = invoice_id.to_string();
     let invoice_corr = format!("invoice/{}", invoice_id.invoice_number);
 
-    repository
-        .create::<Invoice, IssueInvoice>(
+    let token = repository
+        .create_tracked::<Invoice, IssueInvoice>(
             &invoice_stream_id,
             &IssueInvoice {
                 customer_id: customer_id.clone(),
@@ -576,11 +576,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
         )
         .await?;
-    consume_updates(&mut subscription, &live_projection, 1).await?;
+    print_dashboard(&subscription.read_after(token).await?, "  [live]");
 
     // 3. Record a partial payment
-    repository
-        .update::<Invoice, RecordPayment>(
+    let token = repository
+        .update_tracked::<Invoice, RecordPayment>(
             &invoice_stream_id,
             &RecordPayment {
                 amount_cents: 5_000,
@@ -591,11 +591,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
         )
         .await?;
-    consume_updates(&mut subscription, &live_projection, 1).await?;
+    print_dashboard(&subscription.read_after(token).await?, "  [live]");
 
     // 4. Record remaining balance (triggers InvoiceSettled)
-    repository
-        .update::<Invoice, RecordPayment>(
+    let token = repository
+        .update_tracked::<Invoice, RecordPayment>(
             &invoice_stream_id,
             &RecordPayment {
                 amount_cents: 7_000,
@@ -606,27 +606,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
         )
         .await?;
-    // The final payment appends `PaymentRecorded` and `InvoiceSettled`.
-    consume_updates(&mut subscription, &live_projection, 2).await?;
+    // The final payment appends `PaymentRecorded` and `InvoiceSettled`, but the
+    // caller never has to know that: awaiting the token covers the whole commit.
+    let dashboard = subscription.read_after(token).await?;
+    print_dashboard(&dashboard, "  [live]");
 
     // -------------------------------------------------------------------------
-    // Guard: read the live projection before allowing cancellation.
+    // Guard: read the live read model before allowing cancellation.
     //
-    // Because the projection is maintained by the subscription, this is a
-    // simple lock read — no event replay needed.
+    // `current()` already reflects every committed write above, so this is a
+    // plain in-memory read — no event replay, no Mutex, no event counting.
     // -------------------------------------------------------------------------
 
-    let can_cancel = {
-        let projection = live_projection.lock().expect("lock poisoned");
-        projection
-            .customer(&customer_id)
-            .is_some_and(|snapshot| snapshot.outstanding_balance_cents == 0)
-    };
+    let can_cancel = dashboard
+        .customer(&customer_id)
+        .is_some_and(|snapshot| snapshot.outstanding_balance_cents == 0);
 
     if can_cancel {
         println!("\nBalance is zero – proceeding with cancellation.");
-        repository
-            .update::<Subscription, CancelSubscription>(
+        let token = repository
+            .update_tracked::<Subscription, CancelSubscription>(
                 &customer_id,
                 &CancelSubscription {
                     reason: "customer requested cancellation".into(),
@@ -638,48 +637,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
             )
             .await?;
-        consume_updates(&mut subscription, &live_projection, 1).await?;
+        print_dashboard(&subscription.read_after(token).await?, "  [live]");
     } else {
         println!("\nSubscription not cancelled – outstanding balance detected.");
     }
 
     // -------------------------------------------------------------------------
-    // Print the final state from the live projection, then shut down.
+    // Print the final state from the live read model, then shut down.
     // -------------------------------------------------------------------------
 
     println!("\n=== Final Dashboard State ===");
-    {
-        let projection = live_projection.lock().expect("lock poisoned");
-        print_dashboard(&projection, "");
-    }
+    print_dashboard(&subscription.current(), "");
 
     // Graceful shutdown: stop the subscription and wait for its task to finish.
     subscription.stop().await?;
     println!("Subscription stopped.");
-
-    Ok(())
-}
-
-async fn consume_updates(
-    subscription: &mut sourcery::subscription::Subscription<
-        CustomerBillingProjection,
-        u64,
-        sourcery::store::inmemory::InMemoryError,
-    >,
-    live_projection: &Arc<Mutex<CustomerBillingProjection>>,
-    expected: usize,
-) -> Result<(), Box<dyn std::error::Error>> {
-    for _ in 0..expected {
-        let projection = subscription.next().await.ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "subscription stream ended unexpectedly",
-            )
-        })?;
-
-        *live_projection.lock().expect("lock poisoned") = projection.clone();
-        print_dashboard(&projection, "  [live]");
-    }
 
     Ok(())
 }

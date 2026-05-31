@@ -76,6 +76,17 @@ impl HandleCreate<AddItem> for Inventory {
     }
 }
 
+/// A command that intentionally produces no events.
+struct AddNothing;
+
+impl Handle<AddNothing> for Inventory {
+    type HandleError = Self::Error;
+
+    fn handle(&self, _command: &AddNothing) -> Result<Vec<Self::Event>, Self::Error> {
+        Ok(Vec::new())
+    }
+}
+
 // ============================================================================
 // Test Projection
 // ============================================================================
@@ -408,4 +419,101 @@ async fn consistency_token_is_none_when_empty() {
     let store = inmemory::Store::<String, ()>::new();
     let repo = Repository::new(store);
     assert!(repo.consistency_token().await.unwrap().is_none());
+}
+
+/// The one-shot `create_tracked`/`update_tracked` return a token bound to the
+/// write; awaiting it resolves and the projection reflects the write.
+#[tokio::test]
+async fn tracked_write_returns_resolvable_token() {
+    let store = inmemory::Store::<String, ()>::new();
+    let repo = Repository::new(store);
+
+    let subscription = repo.subscribe::<ItemCount>(()).start().await.unwrap();
+
+    let token = repo
+        .create_tracked::<Inventory, AddItem>(
+            &"inv1".to_string(),
+            &AddItem {
+                name: "apple".to_string(),
+            },
+            &(),
+        )
+        .await
+        .expect("create_tracked")
+        .expect("token for committed write");
+
+    // The token names exactly this write: position 0 (first, gap-free).
+    assert_eq!(*token.checkpoint(), 0);
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        subscription.wait_for(token),
+    )
+    .await
+    .expect("wait_for must not hang")
+    .expect("subscription reached token");
+
+    assert_eq!(subscription.processed(), Some(0));
+
+    subscription.stop().await.unwrap();
+}
+
+/// `read_after()` awaits a write token and returns the current projection
+/// without draining the update stream.
+#[tokio::test]
+async fn read_after_reflects_write_without_draining_stream() {
+    let store = inmemory::Store::<String, ()>::new();
+    let repo = Repository::new(store);
+
+    let subscription = repo.subscribe::<ItemCount>(()).start().await.unwrap();
+
+    // Before any write, current() is the initial projection.
+    assert_eq!(subscription.current().count, 0);
+
+    for name in ["apple", "banana", "cherry"] {
+        let token = repo
+            .upsert_tracked::<Inventory, AddItem>(
+                &"inv1".to_string(),
+                &AddItem {
+                    name: name.to_string(),
+                },
+                &(),
+            )
+            .await
+            .expect("upsert_tracked")
+            .expect("token");
+
+        let projection = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            subscription.read_after(Some(token)),
+        )
+        .await
+        .expect("read_after must not hang")
+        .expect("subscription read after token");
+
+        assert!(projection.count > 0);
+    }
+
+    // No `next()` draining anywhere — read_after/current sees all three writes.
+    assert_eq!(subscription.current().count, 3);
+    assert_eq!(subscription.read_after(None).await.unwrap().count, 3);
+
+    subscription.stop().await.unwrap();
+}
+
+/// A command that produces no events yields no token.
+#[tokio::test]
+async fn tracked_write_without_events_returns_none() {
+    let store = inmemory::Store::<String, ()>::new();
+    let repo = Repository::new(store);
+
+    add_item(&repo, "inv1", "apple").await;
+
+    // `AddNothing` handles to an empty event vec on the existing stream.
+    let token = repo
+        .update_tracked::<Inventory, AddNothing>(&"inv1".to_string(), &AddNothing, &())
+        .await
+        .expect("update_tracked");
+
+    assert!(token.is_none(), "no events committed, so no token");
 }

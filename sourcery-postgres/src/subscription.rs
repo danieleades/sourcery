@@ -277,6 +277,22 @@ where
             position: row.get("position"),
         }))
     }
+
+    async fn checkpoint_for_position(
+        &self,
+        position: &Self::Position,
+    ) -> Result<Option<Self::Checkpoint>, Self::Error> {
+        // `position` is the global `BIGSERIAL PRIMARY KEY`, so this is a single
+        // point lookup of the writing transaction's id.
+        let row = sqlx::query("SELECT xid FROM es_events WHERE position = $1")
+            .bind(position)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|row| Watermark {
+            xid: row.get("xid"),
+            position: *position,
+        }))
+    }
 }
 
 /// Durable storage for subscription checkpoints (and the projection state they

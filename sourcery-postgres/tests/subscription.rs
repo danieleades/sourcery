@@ -288,6 +288,45 @@ async fn current_checkpoint_reports_latest() {
 }
 
 #[tokio::test]
+async fn checkpoint_for_position_resolves_exact_watermark() {
+    let db = TestDb::new().await;
+    let store: Store<TestMetadata> = Store::new(db.pool.clone());
+    store.migrate().await.unwrap();
+
+    // No event at this position yet.
+    assert!(store.checkpoint_for_position(&1).await.unwrap().is_none());
+
+    let id = Uuid::new_v4();
+    let committed = store
+        .commit_events(
+            "test.agg",
+            &id,
+            NonEmpty::singleton(TestEvent {
+                data: "a".to_string(),
+            }),
+            &metadata(),
+        )
+        .await
+        .unwrap();
+    let position = committed.last_position;
+
+    // The exact checkpoint carries the writing transaction's id and this
+    // position, matching what a subscription delivers for the same row.
+    let checkpoint = store
+        .checkpoint_for_position(&position)
+        .await
+        .unwrap()
+        .expect("checkpoint for committed position");
+    assert_eq!(checkpoint.position, position);
+
+    let delivered = {
+        let mut stream = store.subscribe(&event_filters(), None);
+        next_event(&mut stream).await.checkpoint
+    };
+    assert_eq!(checkpoint, delivered);
+}
+
+#[tokio::test]
 async fn checkpoint_store_round_trip_and_staleness() {
     let db = TestDb::new().await;
     let store = CheckpointStore::always(db.pool.clone());

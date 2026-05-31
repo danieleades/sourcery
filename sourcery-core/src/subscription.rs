@@ -10,21 +10,24 @@
 //! A subscription:
 //! 1. Replays historical events (catch-up phase)
 //! 2. Transitions to processing live events as they are committed
-//! 3. Yields projection updates via a stream
+//! 3. Maintains the live projection, readable via
+//!    [`current`](Subscription::current), and also yields each update through a
+//!    stream
 //!
 //! # Example
 //!
 //! ```ignore
-//! use tokio_stream::StreamExt as _;
-//!
-//! let mut subscription = repository
+//! let subscription = repository
 //!     .subscribe::<Dashboard>(())
 //!     .start()
 //!     .await?;
 //!
-//! if let Some(dashboard) = subscription.next().await {
-//!     println!("{dashboard:?}");
-//! }
+//! // Read your own write: await the write's token, then read the live model.
+//! let token = repository
+//!     .update_tracked::<Account, Deposit>(&id, &deposit, &metadata)
+//!     .await?;
+//! let dashboard = subscription.read_after(token).await?;
+//! println!("{dashboard:?}");
 //!
 //! // Later, shut down gracefully
 //! subscription.stop().await?;
@@ -249,6 +252,23 @@ pub trait SubscribableStore: EventStore {
     fn latest_checkpoint(
         &self,
     ) -> impl Future<Output = Result<Option<Self::Checkpoint>, Self::Error>> + Send;
+
+    /// Resolve the exact [`Checkpoint`](Self::Checkpoint) of the event
+    /// committed at `position` (the `last_position` returned by a commit).
+    ///
+    /// This mints an *exact* read-your-writes token bound to a specific write,
+    /// tighter than [`latest_checkpoint`](Self::latest_checkpoint): it names
+    /// precisely the caller's commit rather than the global head, so a
+    /// subscriber awaiting it never blocks on unrelated concurrent writes.
+    /// Returns `None` when no event exists at `position`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store-specific error when the query fails.
+    fn checkpoint_for_position(
+        &self,
+        position: &Self::Position,
+    ) -> impl Future<Output = Result<Option<Self::Checkpoint>, Self::Error>> + Send;
 }
 // ANCHOR_END: subscribable_store_trait
 
@@ -349,6 +369,16 @@ where
     /// event). Drives [`processed`](Self::processed) and
     /// [`wait_for`](Self::wait_for); closes when the runtime task ends.
     progress: tokio::sync::watch::Receiver<Option<Cp>>,
+    /// Latest projection state the runtime has applied. Seeded with the resume
+    /// baseline and republished after every event, so
+    /// [`current`](Self::current) reads the live read model without
+    /// draining the update stream.
+    ///
+    /// A plain `Arc<Mutex<P>>` rather than a `watch` channel: the latter's
+    /// `Receiver<P>` would require `P: Sync` for the subscription to stay
+    /// `Sync`, tightening the bound on [`wait_for`](Self::wait_for). The
+    /// mutex is only ever held to clone in/out, never across an `.await`.
+    current: std::sync::Arc<std::sync::Mutex<P>>,
     handle: SubscriptionHandle<StoreError>,
 }
 
@@ -389,6 +419,64 @@ where
         self.progress.borrow().clone()
     }
 
+    /// The latest projection state the subscription has applied.
+    ///
+    /// A non-blocking read of the live read model that does **not** consume the
+    /// update stream, so it composes with [`wait_for`](Self::wait_for): await a
+    /// write's [`ConsistencyToken`], then call `current()` to observe a read
+    /// model guaranteed to reflect that write.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the background task panicked while updating the
+    /// projection (poisoning the internal mutex); a healthy subscription
+    /// never panics here.
+    #[must_use]
+    pub fn current(&self) -> P
+    where
+        P: Clone,
+    {
+        self.current
+            .lock()
+            .expect("projection mutex poisoned")
+            .clone()
+    }
+
+    /// Wait for `token`, then return the latest projection state.
+    ///
+    /// This is the convenience read-your-writes path for subscription-fed read
+    /// models: pass the optional token returned by `create_tracked`,
+    /// `update_tracked`, `upsert_tracked`, or `consistency_token`, and this
+    /// method waits only when there is something to wait for. It then returns
+    /// [`current`](Self::current) without consuming the update stream.
+    ///
+    /// Use [`wait_for`](Self::wait_for) directly when you need only the
+    /// progress barrier, or when you want to await several tokens before
+    /// performing one or more reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AwaitError::SubscriptionStopped`] if the runtime stops before
+    /// reaching the requested token.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the background task panicked while updating the
+    /// projection (poisoning the internal mutex); a healthy subscription
+    /// never panics here.
+    pub async fn read_after(&self, token: Option<ConsistencyToken<Cp>>) -> Result<P, AwaitError>
+    where
+        P: Clone + Send,
+        Cp: PartialOrd + Send + Sync,
+        StoreError: Send,
+    {
+        if let Some(token) = token {
+            self.wait_for(token).await?;
+        }
+
+        Ok(self.current())
+    }
+
     /// Wait until this subscription has processed at least up to `token`.
     ///
     /// This bridges CQRS eventual consistency into a read-your-writes
@@ -399,7 +487,7 @@ where
     /// Resolves immediately if the subscription has already advanced past
     /// `token` (including writes this projection does not subscribe to, whose
     /// tokens never exceed the latest relevant checkpoint). The returned future
-    /// carries no timeout; wrap it in [`tokio::time::timeout`] or `select!` to
+    /// carries no timeout; wrap it in `tokio::time::timeout` or `select!` to
     /// bound the wait. Waking is event-driven (no polling): the future is
     /// notified only when the runtime advances.
     ///
@@ -513,6 +601,11 @@ where
         // Resume from the persisted checkpoint, if any.
         let (projection, from_checkpoint) = load_snapshot::<P, SS>(&snapshots, &instance_id).await;
 
+        // Live read model: seeded with the resume baseline and republished after
+        // each event so `current()` reads state without draining the update
+        // stream. Shared with the background task via `Arc<Mutex<_>>`.
+        let current = std::sync::Arc::new(std::sync::Mutex::new(projection.clone()));
+
         // Read-your-writes progress channel. Seeded with the resume checkpoint
         // so `processed()`/`wait_for()` account for the snapshot baseline. The
         // background task advances it as it processes events; when the task
@@ -544,6 +637,7 @@ where
             projection,
             update_tx,
             progress_tx,
+            current: std::sync::Arc::clone(&current),
             catchup_target,
             // `last_checkpoint` tracks matching events; `observed` is the global
             // progress cursor (max of matching checkpoints and frontiers). They
@@ -567,6 +661,7 @@ where
             Ok(()) => Ok(Subscription {
                 updates: update_rx,
                 progress: progress_rx,
+                current,
                 handle: SubscriptionHandle {
                     stop_tx: Some(stop_tx),
                     task: Some(task),
@@ -600,6 +695,7 @@ where
     projection: P,
     update_tx: tokio::sync::mpsc::UnboundedSender<P>,
     progress_tx: tokio::sync::watch::Sender<Option<S::Checkpoint>>,
+    current: std::sync::Arc<std::sync::Mutex<P>>,
     catchup_target: Option<S::Checkpoint>,
     last_checkpoint: Option<S::Checkpoint>,
     observed: Option<S::Checkpoint>,
@@ -698,6 +794,10 @@ where
                     &mut self.last_checkpoint,
                     &mut self.events_since_snapshot,
                 )?;
+                // Publish the new state for `current()`. Done before advancing
+                // progress (below) so a `wait_for` waiter that wakes on the
+                // checkpoint always observes a `current()` that includes it.
+                *self.current.lock().expect("projection mutex poisoned") = self.projection.clone();
                 checkpoint
             }
         };

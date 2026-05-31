@@ -379,6 +379,20 @@ where
         };
         std::future::ready(Ok(latest))
     }
+
+    fn checkpoint_for_position(
+        &self,
+        position: &Self::Position,
+    ) -> impl Future<Output = Result<Option<Self::Checkpoint>, Self::Error>> + Send {
+        // Checkpoint == position for the in-memory store: positions are gap-free
+        // and assigned under the write lock, so a committed position is itself a
+        // valid, exact cursor. Report `None` for positions not yet assigned.
+        let checkpoint = {
+            let guard = self.inner.read().expect("in-memory store lock poisoned");
+            (*position < guard.next_position).then_some(*position)
+        };
+        std::future::ready(Ok(checkpoint))
+    }
 }
 
 /// Append a batch of pre-serialised events to the store, assigning positions.

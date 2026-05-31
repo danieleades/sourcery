@@ -17,8 +17,8 @@ keywords = ["event-sourcing", "cqrs"]
 readme = "README.md"
 
 [workspace.lints.clippy]
-pedantic = "warn"
-nursery = "warn"
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
 
 [package]
 name = "sourcery"
