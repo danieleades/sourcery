@@ -239,3 +239,173 @@ async fn subscription_with_snapshot_resumes() {
 
     sub2.stop().await.unwrap();
 }
+
+// ============================================================================
+// Read-your-writes: consistency tokens + Subscription::wait_for
+// ============================================================================
+//
+// A separate aggregate whose event `ItemCount` does NOT subscribe to. Writes
+// here advance the global log without producing any event the projection's
+// filter matches — the case that would stall a naive `wait_for` and which the
+// frontier mechanism must handle.
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct NoteRecorded {
+    text: String,
+}
+
+impl DomainEvent for NoteRecorded {
+    const KIND: &'static str = "note-recorded";
+}
+
+#[derive(Default, Clone, Serialize, Deserialize, Aggregate)]
+#[aggregate(
+    id = String,
+    error = String,
+    events(NoteRecorded),
+    create(NoteRecorded),
+    derives(Debug, PartialEq, Eq)
+)]
+struct Notebook {
+    notes: u32,
+}
+
+impl Apply<NoteRecorded> for Notebook {
+    fn apply(&mut self, _event: &NoteRecorded) {
+        self.notes += 1;
+    }
+}
+
+impl Create<NoteRecorded> for Notebook {
+    fn create(_event: &NoteRecorded) -> Self {
+        Self { notes: 0 }
+    }
+}
+
+#[derive(Debug)]
+struct RecordNote {
+    text: String,
+}
+
+impl HandleCreate<RecordNote> for Notebook {
+    type HandleCreateError = Self::Error;
+
+    fn handle_create(command: &RecordNote) -> Result<Vec<Self::Event>, Self::HandleCreateError> {
+        Ok(vec![
+            NoteRecorded {
+                text: command.text.clone(),
+            }
+            .into(),
+        ])
+    }
+}
+
+async fn record_note(repo: &Repository<inmemory::Store<String, ()>>, id: &str, text: &str) {
+    let id = id.to_string();
+    let command = RecordNote {
+        text: text.to_string(),
+    };
+    repo.create::<Notebook, RecordNote>(&id, &command, &())
+        .await
+        .expect("record note");
+}
+
+/// After a matching write, the token resolves once the subscription has applied
+/// it — and the projection then reflects the write.
+#[tokio::test]
+async fn wait_for_resolves_after_matching_write() {
+    let store = inmemory::Store::<String, ()>::new();
+    let repo = Repository::new(store);
+
+    let subscription = repo.subscribe::<ItemCount>(()).start().await.unwrap();
+
+    add_item(&repo, "inv1", "apple").await;
+    let token = repo
+        .consistency_token()
+        .await
+        .unwrap()
+        .expect("token after write");
+
+    // Bounded so a regression surfaces as a failure rather than a hang.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        subscription.wait_for(token),
+    )
+    .await
+    .expect("wait_for must not hang")
+    .expect("subscription reached token");
+
+    assert_eq!(
+        subscription.processed(),
+        Some(0),
+        "global progress reflects the single committed event"
+    );
+
+    subscription.stop().await.unwrap();
+}
+
+/// The crux: a token from a write the projection FILTERS OUT must still resolve
+/// (via the global frontier), not stall. Without frontiers the subscription's
+/// cursor would never reach the note's checkpoint and this would hang.
+#[tokio::test]
+async fn wait_for_resolves_for_filtered_out_write() {
+    let store = inmemory::Store::<String, ()>::new();
+    let repo = Repository::new(store);
+
+    let subscription = repo.subscribe::<ItemCount>(()).start().await.unwrap();
+
+    // Write only an event `ItemCount` does not subscribe to.
+    record_note(&repo, "note1", "hello").await;
+    let token = repo
+        .consistency_token()
+        .await
+        .unwrap()
+        .expect("token after write");
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        subscription.wait_for(token),
+    )
+    .await
+    .expect("wait_for must resolve via frontier, not hang")
+    .expect("subscription reached token");
+
+    subscription.stop().await.unwrap();
+}
+
+/// A token captured before a subscription exists still resolves once a later
+/// subscription catches up past it.
+#[tokio::test]
+async fn wait_for_resolves_against_historical_token() {
+    let store = inmemory::Store::<String, ()>::new();
+    let repo = Repository::new(store);
+
+    add_item(&repo, "inv1", "apple").await;
+    add_item(&repo, "inv1", "banana").await;
+    let token = repo
+        .consistency_token()
+        .await
+        .unwrap()
+        .expect("token after writes");
+
+    // Subscription starts fresh and must catch up through the token.
+    let subscription = repo.subscribe::<ItemCount>(()).start().await.unwrap();
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        subscription.wait_for(token),
+    )
+    .await
+    .expect("wait_for must not hang")
+    .expect("subscription caught up to token");
+
+    subscription.stop().await.unwrap();
+}
+
+/// An empty store has nothing to wait for.
+#[tokio::test]
+async fn consistency_token_is_none_when_empty() {
+    let store = inmemory::Store::<String, ()>::new();
+    let repo = Repository::new(store);
+    assert!(repo.consistency_token().await.unwrap().is_none());
+}

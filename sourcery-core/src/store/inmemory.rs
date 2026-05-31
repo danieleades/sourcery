@@ -26,7 +26,7 @@ use crate::{
         CommitError, Committed, EventFilter, EventStore, GloballyOrderedStore, LoadEventsResult,
         OptimisticCommitError, StoredEvent, StreamKey,
     },
-    subscription::{Checkpointed, SubscribableStore},
+    subscription::{Checkpointed, Delivery, SubscribableStore},
 };
 
 /// Event stream stored in memory with fixed position and data types.
@@ -291,9 +291,8 @@ where
         &self,
         filters: &[EventFilter<Self::Id, Self::Position>],
         from: Option<Self::Checkpoint>,
-    ) -> Pin<
-        Box<impl futures_core::Stream<Item = Result<Checkpointed<Self>, Self::Error>> + Send + '_>,
-    > {
+    ) -> Pin<Box<impl futures_core::Stream<Item = Result<Delivery<Self>, Self::Error>> + Send + '_>>
+    {
         let filters = filters.to_vec();
         let inner = self.inner.clone();
 
@@ -305,16 +304,23 @@ where
         };
 
         Box::pin(async_stream::stream! {
-            // 1. Load and yield historical events
-            let historical = {
+            // Snapshot the matching events and the global frontier together
+            // under one lock, so the frontier provably covers every matching
+            // event in the batch (positions are gap-free under the write lock).
+            let drain = || {
                 let guard = inner.read().expect("in-memory store lock poisoned");
-                load_matching_events(&guard, &filters)
+                let events = load_matching_events(&guard, &filters);
+                // Highest committed position; `None` while the store is empty.
+                let frontier = guard.next_position.checked_sub(1);
+                drop(guard);
+                (events, frontier)
             };
 
             let mut last_position = from;
 
+            // 1. Catch-up: yield historical matching events, then the frontier.
+            let (historical, frontier) = drain();
             for event in historical {
-                // Skip events at or before our starting position
                 if let Some(ref lp) = last_position
                     && event.position <= *lp
                 {
@@ -322,16 +328,15 @@ where
                 }
                 last_position = Some(event.position);
                 let checkpoint = event.position;
-                yield Ok(Checkpointed { checkpoint, event });
+                yield Ok(Delivery::Event(Checkpointed { checkpoint, event }));
+            }
+            if let Some(frontier) = frontier {
+                yield Ok(Delivery::Frontier(frontier));
             }
 
-            // 2. Process live events from broadcast; stop when the store is dropped.
+            // 2. Live: drain matching events on each notification, then frontier.
             while let Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) = rx.recv().await {
-                let events = {
-                    let guard = inner.read().expect("in-memory store lock poisoned");
-                    load_matching_events(&guard, &filters)
-                };
-
+                let (events, frontier) = drain();
                 for event in events {
                     if let Some(ref lp) = last_position
                         && event.position <= *lp
@@ -340,7 +345,10 @@ where
                     }
                     last_position = Some(event.position);
                     let checkpoint = event.position;
-                    yield Ok(Checkpointed { checkpoint, event });
+                    yield Ok(Delivery::Event(Checkpointed { checkpoint, event }));
+                }
+                if let Some(frontier) = frontier {
+                    yield Ok(Delivery::Frontier(frontier));
                 }
             }
         })
@@ -357,6 +365,17 @@ where
             load_matching_events(&guard, filters)
                 .last()
                 .map(|event| event.position)
+        };
+        std::future::ready(Ok(latest))
+    }
+
+    fn latest_checkpoint(
+        &self,
+    ) -> impl Future<Output = Result<Option<Self::Checkpoint>, Self::Error>> + Send {
+        // Positions are gap-free; the highest committed one is the global cursor.
+        let latest = {
+            let guard = self.inner.read().expect("in-memory store lock poisoned");
+            guard.next_position.checked_sub(1)
         };
         std::future::ready(Ok(latest))
     }

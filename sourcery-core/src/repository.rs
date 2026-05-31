@@ -48,7 +48,7 @@ use crate::{
         CommitError, EventFilter, EventStore, GloballyOrderedStore, OptimisticCommitError,
         StoredEvents,
     },
-    subscription::{SubscribableStore, SubscriptionBuilder},
+    subscription::{ConsistencyToken, SubscribableStore, SubscriptionBuilder},
 };
 
 /// Internal alias for aggregate load/replay failures.
@@ -1240,6 +1240,51 @@ where
         SS: SnapshotStore<P::InstanceId, Position = S::Checkpoint> + Send + Sync + 'static,
     {
         SubscriptionBuilder::new(self.store.clone(), snapshots, instance_id)
+    }
+
+    /// Mint a global read-your-writes [`ConsistencyToken`] capturing the log's
+    /// latest committed point.
+    ///
+    /// Call this immediately after a write (e.g. [`update`](Self::update)) to
+    /// capture "the log now includes my commit", then hand the token to
+    /// [`Subscription::wait_for`](crate::subscription::Subscription::wait_for)
+    /// before querying *any* subscription-fed read model — that model is then
+    /// guaranteed to reflect the write. Returns `None` only when the store is
+    /// empty (nothing to wait for).
+    ///
+    /// The token is projection-independent: it is a point in the global commit
+    /// order, not tied to which events a particular projection consumes. A
+    /// subscription resolves it against its *global* progress cursor (advanced
+    /// by frontiers across filtered-out events), so `wait_for` returns even
+    /// when the write does not touch that projection's filter, rather than
+    /// stalling.
+    ///
+    /// The returned token is [`Serialize`]/[`DeserializeOwned`]: return it to a
+    /// client and present it on a later read to extend read-your-writes across
+    /// a process boundary.
+    ///
+    /// # When you do not need this
+    ///
+    /// [`load_projection`](Self::load_projection) rebuilds from the event
+    /// stream and is already consistent with prior writes; tokens are only
+    /// for subscription-fed read models. For "is *my entity* updated", that
+    /// on-demand path is simpler and immune to global-checkpoint latency.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store error if resolving the latest checkpoint fails.
+    pub async fn consistency_token(
+        &self,
+    ) -> Result<Option<ConsistencyToken<S::Checkpoint>>, S::Error>
+    where
+        S: SubscribableStore,
+        M: Sync,
+    {
+        Ok(self
+            .store
+            .latest_checkpoint()
+            .await?
+            .map(ConsistencyToken::new))
     }
 }
 

@@ -38,7 +38,7 @@ use sourcery_core::{
         OfferSnapshotError, Snapshot, SnapshotOffer, SnapshotStore, inmemory::SnapshotPolicy,
     },
     store::{EventFilter, StoredEvent},
-    subscription::{Checkpointed, SubscribableStore},
+    subscription::{Checkpointed, Delivery, SubscribableStore},
 };
 use sqlx::{PgPool, Postgres, QueryBuilder, Row, postgres::PgListener};
 
@@ -107,23 +107,38 @@ where
     Ok((xid, crate::row_to_stored_event::<M>(row)?))
 }
 
+/// The current stability boundary: `pg_snapshot_xmin` of a fresh snapshot.
+///
+/// Every transaction with `xid < xmin` is settled forever, so its events can
+/// never be undercut by a lower-positioned in-flight sibling. Captured once per
+/// drain cycle and shared by [`load_stable_batch`] and the frontier derivation
+/// so both agree on exactly which events are stable.
+async fn current_xmin(pool: &PgPool) -> Result<i64, Error> {
+    let row = sqlx::query("SELECT pg_snapshot_xmin(pg_current_snapshot())::text::bigint AS xmin")
+        .fetch_one(pool)
+        .await?;
+    Ok(row.get("xmin"))
+}
+
 /// Load the next stable batch after `cursor`, ordered by `(xid, position)`.
 ///
-/// Only events whose transaction is settled (`xid < xmin`) are returned, so the
-/// result can never be undercut later by a lower-positioned in-flight write.
+/// Only events from settled transactions (`xid < xmin`) are returned, using the
+/// caller-supplied `xmin` so the batch and the cycle's frontier share one
+/// boundary.
 async fn load_stable_batch<M>(
     pool: &PgPool,
     filters: &[EventFilter<uuid::Uuid, i64>],
     cursor: Watermark,
+    xmin: i64,
 ) -> Result<Vec<EventRow<M>>, Error>
 where
     M: serde::de::DeserializeOwned,
 {
     let mut qb = QueryBuilder::<Postgres>::new(
         "SELECT aggregate_kind, aggregate_id, event_kind, position, xid, data, metadata FROM \
-         es_events WHERE xid < pg_snapshot_xmin(pg_current_snapshot())::text::bigint AND (xid, \
-         position) > (",
+         es_events WHERE xid < ",
     );
+    qb.push_bind(xmin).push(" AND (xid, position) > (");
     qb.push_bind(cursor.xid)
         .push(", ")
         .push_bind(cursor.position)
@@ -146,9 +161,8 @@ where
         &self,
         filters: &[EventFilter<Self::Id, Self::Position>],
         from: Option<Self::Checkpoint>,
-    ) -> Pin<
-        Box<impl futures_core::Stream<Item = Result<Checkpointed<Self>, Self::Error>> + Send + '_>,
-    > {
+    ) -> Pin<Box<impl futures_core::Stream<Item = Result<Delivery<Self>, Self::Error>> + Send + '_>>
+    {
         let pool = self.pool.clone();
         let filters = filters.to_vec();
         let mut cursor = from.unwrap_or(Watermark {
@@ -167,9 +181,24 @@ where
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             loop {
-                // Drain every stable event past the cursor.
+                // Capture the stability boundary once, then drain and derive the
+                // frontier against the *same* `xmin`. This is the correctness
+                // crux: if the frontier used a fresher `xmin` than the drain, a
+                // matching event could have become stable in `(cursor, frontier]`
+                // without being delivered, and advancing a waiter past it would
+                // break read-your-writes. Tying both to one `xmin` makes the
+                // frontier provably cover only delivered matching events.
+                let xmin = match current_xmin(&pool).await {
+                    Ok(xmin) => xmin,
+                    Err(error) => {
+                        yield Err(error);
+                        return;
+                    }
+                };
+
+                // Drain every stable event (`xid < xmin`) past the cursor.
                 loop {
-                    let batch = match load_stable_batch::<M>(&pool, &filters, cursor).await {
+                    let batch = match load_stable_batch::<M>(&pool, &filters, cursor, xmin).await {
                         Ok(batch) => batch,
                         Err(error) => {
                             yield Err(error);
@@ -180,12 +209,27 @@ where
                     let drained = batch.len();
                     for (xid, event) in batch {
                         cursor = Watermark { xid, position: event.position };
-                        yield Ok(Checkpointed { checkpoint: cursor, event });
+                        yield Ok(Delivery::Event(Checkpointed { checkpoint: cursor, event }));
                     }
 
                     if drained < BATCH_LIMIT {
                         break;
                     }
+                }
+
+                // Every matching event with `xid < xmin` is now delivered, so the
+                // highest checkpoint guaranteed delivered is everything strictly
+                // below the boundary: `(xmin - 1, i64::MAX)`. This synthetic
+                // watermark only advances waiters' global progress; it is never a
+                // resume or dedup cursor (those use real event watermarks), and a
+                // later real event has `xid >= xmin`, so it sorts strictly above
+                // the frontier and is never skipped.
+                if let Some(frontier_xid) = xmin.checked_sub(1) {
+                    let frontier = Watermark {
+                        xid: frontier_xid,
+                        position: i64::MAX,
+                    };
+                    yield Ok(Delivery::Frontier(frontier));
                 }
 
                 // Wait for a commit notification or the poll tick.
@@ -213,6 +257,21 @@ where
         qb.push(" ORDER BY xid DESC, position DESC LIMIT 1");
 
         let row = qb.build().fetch_optional(&self.pool).await?;
+        Ok(row.map(|row| Watermark {
+            xid: row.get("xid"),
+            position: row.get("position"),
+        }))
+    }
+
+    async fn latest_checkpoint(&self) -> Result<Option<Self::Checkpoint>, Self::Error> {
+        // Unfiltered, plain visibility: the caller's just-committed write is
+        // included. Not `xmin`-gated — the token need only *become* stable, which
+        // it does once the writing transaction finishes and `xmin` passes it.
+        let row = sqlx::query(
+            "SELECT xid, position FROM es_events ORDER BY xid DESC, position DESC LIMIT 1",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
         Ok(row.map(|row| Watermark {
             xid: row.get("xid"),
             position: row.get("position"),

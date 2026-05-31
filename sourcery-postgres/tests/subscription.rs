@@ -11,7 +11,7 @@ use sourcery_core::{
     event::DomainEvent,
     snapshot::{Snapshot, SnapshotOffer, SnapshotStore},
     store::{EventFilter, EventStore},
-    subscription::SubscribableStore,
+    subscription::{Checkpointed, Delivery, SubscribableStore},
 };
 use sourcery_postgres::{
     Store,
@@ -68,6 +68,45 @@ fn event_filters() -> [EventFilter<Uuid, i64>; 1] {
     [EventFilter::for_event(TestEvent::KIND)]
 }
 
+/// Await the next matching event within 5s, skipping [`Delivery::Frontier`]
+/// global-progress markers (which carry no event).
+async fn next_event<S>(stream: &mut S) -> Checkpointed<Store<TestMetadata>>
+where
+    S: tokio_stream::Stream<Item = Result<Delivery<Store<TestMetadata>>, sourcery_postgres::Error>>
+        + Unpin,
+{
+    loop {
+        match timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("event within timeout")
+            .expect("stream yielded an item")
+            .expect("item is ok")
+        {
+            Delivery::Event(event) => return event,
+            Delivery::Frontier(_) => {}
+        }
+    }
+}
+
+/// Poll for up to `within` for a matching event, skipping frontier markers.
+/// Returns `true` if no event arrived in the window (frontiers are allowed).
+async fn no_event_within<S>(stream: &mut S, within: Duration) -> bool
+where
+    S: tokio_stream::Stream<Item = Result<Delivery<Store<TestMetadata>>, sourcery_postgres::Error>>
+        + Unpin,
+{
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        match tokio::time::timeout_at(deadline, stream.next()).await {
+            Err(_) => return true,
+            Ok(item) => match item.expect("stream item").expect("ok item") {
+                Delivery::Event(_) => return false,
+                Delivery::Frontier(_) => {}
+            },
+        }
+    }
+}
+
 /// Insert one event directly, returning `(position, xid)`. Used to construct
 /// precise concurrency scenarios that `commit_events` (which commits
 /// immediately) cannot express.
@@ -116,16 +155,8 @@ async fn subscription_catches_up_then_streams_live() {
     let filters = event_filters();
     let mut stream = store.subscribe(&filters, None);
 
-    let first = timeout(Duration::from_secs(5), stream.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    let second = timeout(Duration::from_secs(5), stream.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+    let first = next_event(&mut stream).await;
+    let second = next_event(&mut stream).await;
     assert!(first.checkpoint < second.checkpoint);
 
     // A live commit is delivered (NOTIFY wakes the subscriber).
@@ -141,11 +172,7 @@ async fn subscription_catches_up_then_streams_live() {
         .await
         .unwrap();
 
-    let third = timeout(Duration::from_secs(5), stream.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+    let third = next_event(&mut stream).await;
     assert!(second.checkpoint < third.checkpoint);
 }
 
@@ -179,26 +206,18 @@ async fn in_flight_transaction_gap_is_not_skipped() {
     let mut stream = store.subscribe(&filters, None);
 
     // While A is in-flight, B is withheld (its xid is at/above xmin) even though
-    // it is committed — nothing is delivered.
-    let gated = timeout(Duration::from_millis(900), stream.next()).await;
+    // it is committed — no event is delivered. Frontiers may still arrive, but
+    // only below A's xid (xmin is pinned by A), so they never cover B.
     assert!(
-        gated.is_err(),
+        no_event_within(&mut stream, Duration::from_millis(900)).await,
         "B must not be delivered while A is in-flight"
     );
 
     // Once A settles, both become deliverable, in (xid, position) order.
     tx_a.commit().await.unwrap();
 
-    let first = timeout(Duration::from_secs(5), stream.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    let second = timeout(Duration::from_secs(5), stream.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+    let first = next_event(&mut stream).await;
+    let second = next_event(&mut stream).await;
 
     assert_eq!(
         first.event.position, pos_a,
@@ -234,21 +253,12 @@ async fn subscription_resumes_from_checkpoint() {
     // Consume the first event, remember its checkpoint, drop the stream.
     let checkpoint = {
         let mut stream = store.subscribe(&filters, None);
-        let first = timeout(Duration::from_secs(5), stream.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        first.checkpoint
+        next_event(&mut stream).await.checkpoint
     };
 
     // Resuming from that checkpoint must skip the already-seen event.
     let mut resumed = store.subscribe(&filters, Some(checkpoint));
-    let next = timeout(Duration::from_secs(5), resumed.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+    let next = next_event(&mut resumed).await;
     assert!(next.checkpoint > checkpoint);
 }
 
