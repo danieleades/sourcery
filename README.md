@@ -76,6 +76,7 @@ impl Handle<DepositFunds> for Account {
 | [`quickstart`](examples/quickstart.rs) | Minimal aggregate + projection |
 | [`inventory_report`](examples/inventory_report.rs) | Cross-aggregate projection |
 | [`subscription_billing`](examples/subscription_billing.rs) | Real-world billing domain |
+| [`read_your_writes`](examples/read_your_writes.rs) | Consistency tokens for live read models |
 | [`versioned_events`](examples/versioned_events.rs) | Schema migration via serde |
 | [`optimistic_concurrency`](examples/optimistic_concurrency.rs) | Conflict detection and retry |
 | [`snapshotting`](examples/snapshotting.rs) | Aggregate snapshots for performance |

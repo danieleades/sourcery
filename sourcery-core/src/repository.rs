@@ -48,7 +48,7 @@ use crate::{
         CommitError, EventFilter, EventStore, GloballyOrderedStore, OptimisticCommitError,
         StoredEvents,
     },
-    subscription::{SubscribableStore, SubscriptionBuilder},
+    subscription::{ConsistencyToken, SubscribableStore, SubscriptionBuilder},
 };
 
 /// Internal alias for aggregate load/replay failures.
@@ -430,6 +430,10 @@ where
     type Prepared = ();
     type SnapshotError = Infallible;
 
+    #[allow(
+        clippy::unused_async_trait_impl,
+        reason = "async keeps this no-op implementation equivalent to the trait future contract"
+    )]
     async fn load_base(&self, _kind: &str, _id: &S::Id) -> Option<(A, S::Position)> {
         None
     }
@@ -443,6 +447,10 @@ where
 
     fn prepare_snapshot_from_new(&self, _events: &NonEmpty<A::Event>) -> Self::Prepared {}
 
+    #[allow(
+        clippy::unused_async_trait_impl,
+        reason = "async keeps this no-op implementation equivalent to the trait future contract"
+    )]
     async fn offer_snapshot(
         &self,
         _kind: &str,
@@ -829,7 +837,7 @@ where
         events: NonEmpty<A::Event>,
         prepared_snapshot: M::Prepared,
         metadata: &S::Metadata,
-    ) -> Result<(), CommandError<A::Error, C::ConcurrencyError, S::Error, M::SnapshotError>>
+    ) -> Result<S::Position, CommandError<A::Error, C::ConcurrencyError, S::Error, M::SnapshotError>>
     where
         A: Aggregate<Id = S::Id>,
         A::Event: EventKind + Serialize + Send + Sync,
@@ -850,11 +858,13 @@ where
                 A::KIND,
                 id,
                 events_since_snapshot,
-                new_position,
+                new_position.clone(),
                 prepared_snapshot,
             )
             .await
-            .map_err(CommandError::Snapshot)
+            .map_err(CommandError::Snapshot)?;
+
+        Ok(new_position)
     }
 
     /// Persist new events produced from a creation command.
@@ -866,7 +876,7 @@ where
         id: &S::Id,
         events: NonEmpty<A::Event>,
         metadata: &S::Metadata,
-    ) -> Result<(), CommandError<A::Error, C::ConcurrencyError, S::Error, M::SnapshotError>>
+    ) -> Result<S::Position, CommandError<A::Error, C::ConcurrencyError, S::Error, M::SnapshotError>>
     where
         A: Aggregate<Id = S::Id>,
         A::Event: EventKind + Serialize + Send + Sync,
@@ -876,15 +886,40 @@ where
     {
         let total_events_since_snapshot = events.len() as u64;
         let prepared = self.snapshots.prepare_snapshot_from_new(&events);
-        self.persist_events::<A>(
-            id,
-            None,
-            total_events_since_snapshot,
-            events,
-            prepared,
-            metadata,
-        )
-        .await
+
+        // Creation is a store-level new-stream commit regardless of the
+        // repository's update concurrency strategy. A created stream must not
+        // already exist, and that guarantee must be atomic with the append: an
+        // `Unchecked` repository still gets last-writer-wins for *updates*, but
+        // never a racy double-create (two concurrent creates both appending).
+        // A conflict here therefore means the stream already exists.
+        let new_position = self
+            .store
+            .commit_events_optimistic::<A::Event>(A::KIND, id, None, events, metadata)
+            .await
+            .map_err(|error| match error {
+                OptimisticCommitError::Conflict(_) => {
+                    CommandError::Lifecycle(LifecycleError::AggregateAlreadyExists)
+                }
+                OptimisticCommitError::Store(err)
+                | OptimisticCommitError::Serialization { source: err, .. } => {
+                    CommandError::Store(err)
+                }
+            })?
+            .last_position;
+
+        self.snapshots
+            .offer_snapshot(
+                A::KIND,
+                id,
+                total_events_since_snapshot,
+                new_position.clone(),
+                prepared,
+            )
+            .await
+            .map_err(CommandError::Snapshot)?;
+
+        Ok(new_position)
     }
 
     /// Persist events produced by handling a command against an existing
@@ -900,7 +935,7 @@ where
         events_since_snapshot: u64,
         events: NonEmpty<A::Event>,
         metadata: &S::Metadata,
-    ) -> Result<(), CommandError<A::Error, C::ConcurrencyError, S::Error, M::SnapshotError>>
+    ) -> Result<S::Position, CommandError<A::Error, C::ConcurrencyError, S::Error, M::SnapshotError>>
     where
         A: Aggregate<Id = S::Id>,
         A::Event: EventKind + Serialize + Send + Sync,
@@ -946,26 +981,46 @@ where
         M: SnapshotPolicy<S, A> + Sync,
         M::Prepared: Send,
     {
-        if self
-            .store
-            .stream_version(A::KIND, id)
+        self.create_committed::<A, Cmd>(id, command, metadata)
             .await
-            .map_err(CommandError::Store)?
-            .is_some()
-        {
-            return Err(CommandError::Lifecycle(
-                LifecycleError::AggregateAlreadyExists,
-            ));
-        }
+            .map(|_| ())
+    }
 
+    /// Shared body of [`create`](Self::create) and
+    /// [`create_tracked`](Self::create_tracked). Returns the committed last
+    /// position, or `None` when the command produced no events.
+    async fn create_committed<A, Cmd>(
+        &self,
+        id: &S::Id,
+        command: &Cmd,
+        metadata: &S::Metadata,
+    ) -> Result<
+        Option<S::Position>,
+        CommandError<A::Error, C::ConcurrencyError, S::Error, M::SnapshotError>,
+    >
+    where
+        A: Aggregate<Id = S::Id> + HandleCreate<Cmd>,
+        A::Event: EventKind + Serialize + Send + Sync,
+        Cmd: Sync,
+        S::Metadata: Clone,
+        C: CommitPolicy<S>,
+        M: SnapshotPolicy<S, A> + Sync,
+        M::Prepared: Send,
+    {
         let new_events = <A as HandleCreate<Cmd>>::handle_create(command)
             .map_err(|error| CommandError::Aggregate(error.into()))?;
 
         let Some(events) = NonEmpty::from_vec(new_events) else {
-            return Ok(());
+            return Ok(None);
         };
 
-        self.finalize_create::<A>(id, events, metadata).await
+        // No preflight existence check: `finalize_create` commits as a new
+        // stream and reports `AggregateAlreadyExists` atomically on conflict.
+        // The old `stream_version` preflight was a TOCTOU window that let two
+        // concurrent creates both succeed under `Unchecked`.
+        self.finalize_create::<A>(id, events, metadata)
+            .await
+            .map(Some)
     }
 
     /// Execute a command against an existing aggregate stream.
@@ -992,6 +1047,32 @@ where
         M: SnapshotPolicy<S, A> + Sync,
         M::Prepared: Send,
     {
+        self.update_committed::<A, Cmd>(id, command, metadata)
+            .await
+            .map(|_| ())
+    }
+
+    /// Shared body of [`update`](Self::update) and
+    /// [`update_tracked`](Self::update_tracked). Returns the committed last
+    /// position, or `None` when the command produced no events.
+    async fn update_committed<A, Cmd>(
+        &self,
+        id: &S::Id,
+        command: &Cmd,
+        metadata: &S::Metadata,
+    ) -> Result<
+        Option<S::Position>,
+        CommandError<A::Error, C::ConcurrencyError, S::Error, M::SnapshotError>,
+    >
+    where
+        A: Aggregate<Id = S::Id> + Handle<Cmd> + Send,
+        A::Event: ProjectionEvent + EventKind + Serialize + Send + Sync,
+        Cmd: Sync,
+        S::Metadata: Clone,
+        C: CommitPolicy<S>,
+        M: SnapshotPolicy<S, A> + Sync,
+        M::Prepared: Send,
+    {
         let LoadedAggregate {
             aggregate,
             version,
@@ -1006,7 +1087,7 @@ where
             .map_err(|error| CommandError::Aggregate(error.into()))?;
 
         let Some(events) = NonEmpty::from_vec(new_events) else {
-            return Ok(());
+            return Ok(None);
         };
 
         self.finalize_update::<A>(
@@ -1018,6 +1099,7 @@ where
             metadata,
         )
         .await
+        .map(Some)
     }
 
     /// Execute a command that may create or update an aggregate stream.
@@ -1049,6 +1131,32 @@ where
         M: SnapshotPolicy<S, A> + Sync,
         M::Prepared: Send,
     {
+        self.upsert_committed::<A, Cmd>(id, command, metadata)
+            .await
+            .map(|_| ())
+    }
+
+    /// Shared body of [`upsert`](Self::upsert) and
+    /// [`upsert_tracked`](Self::upsert_tracked). Returns the committed last
+    /// position, or `None` when the command produced no events.
+    async fn upsert_committed<A, Cmd>(
+        &self,
+        id: &S::Id,
+        command: &Cmd,
+        metadata: &S::Metadata,
+    ) -> Result<
+        Option<S::Position>,
+        CommandError<A::Error, C::ConcurrencyError, S::Error, M::SnapshotError>,
+    >
+    where
+        A: Aggregate<Id = S::Id> + Handle<Cmd> + HandleCreate<Cmd> + Send,
+        A::Event: ProjectionEvent + EventKind + Serialize + Send + Sync,
+        Cmd: Sync,
+        S::Metadata: Clone,
+        C: CommitPolicy<S>,
+        M: SnapshotPolicy<S, A> + Sync,
+        M::Prepared: Send,
+    {
         if let Some(LoadedAggregate {
             aggregate,
             version,
@@ -1062,7 +1170,7 @@ where
                 .map_err(|error| CommandError::Aggregate(error.into()))?;
 
             let Some(events) = NonEmpty::from_vec(new_events) else {
-                return Ok(());
+                return Ok(None);
             };
 
             self.finalize_update::<A>(
@@ -1074,15 +1182,18 @@ where
                 metadata,
             )
             .await
+            .map(Some)
         } else {
             let new_events = <A as HandleCreate<Cmd>>::handle_create(command)
                 .map_err(|error| CommandError::Aggregate(error.into()))?;
 
             let Some(events) = NonEmpty::from_vec(new_events) else {
-                return Ok(());
+                return Ok(None);
             };
 
-            self.finalize_create::<A>(id, events, metadata).await
+            self.finalize_create::<A>(id, events, metadata)
+                .await
+                .map(Some)
         }
     }
 }
@@ -1185,14 +1296,18 @@ where
     /// # Example
     ///
     /// ```ignore
-    /// use tokio_stream::StreamExt as _;
+    /// use tokio_stream::StreamExt;
     ///
-    /// let mut subscription = repo
+    /// let subscription = repo
     ///     .subscribe::<Dashboard>(())
     ///     .start()
     ///     .await?;
     ///
-    /// while let Some(dashboard) = subscription.next().await {
+    /// // Current state plus a stream of every subsequent update, taken
+    /// // atomically so no update is missed across the boundary.
+    /// let (dashboard, mut updates) = subscription.updates();
+    /// println!("{dashboard:?}");
+    /// while let Some(dashboard) = updates.next().await {
     ///     println!("{dashboard:?}");
     /// }
     /// ```
@@ -1240,6 +1355,204 @@ where
         SS: SnapshotStore<P::InstanceId, Position = S::Checkpoint> + Send + Sync + 'static,
     {
         SubscriptionBuilder::new(self.store.clone(), snapshots, instance_id)
+    }
+
+    /// Execute a command against an existing aggregate stream and return an
+    /// exact read-your-writes [`ConsistencyToken`] for the resulting commit.
+    ///
+    /// This is the one-shot read-your-writes path: it performs the same write
+    /// as [`update`](Self::update), then hands back a token naming
+    /// *precisely* this commit. Pass it to
+    /// [`Subscription::wait_for`](crate::subscription::Subscription::wait_for)
+    /// before querying a subscription-fed read model and that model is
+    /// guaranteed to reflect the write. Returns `Ok(None)` when the command
+    /// produced no events (nothing to wait for).
+    ///
+    /// Unlike [`consistency_token`](Self::consistency_token), the token is
+    /// bound to your write rather than the global commit head, so awaiting
+    /// it never blocks on unrelated concurrent writes — and there is no
+    /// "call it immediately after" convention to honour. The token is still
+    /// [`Serialize`]/[`DeserializeOwned`] for handing to a client to extend
+    /// read-your-writes across a process boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CommandError`] on the same conditions as
+    /// [`update`](Self::update), or [`CommandError::Store`] if the commit's
+    /// checkpoint cannot be resolved.
+    pub async fn update_tracked<A, Cmd>(
+        &self,
+        id: &S::Id,
+        command: &Cmd,
+        metadata: &S::Metadata,
+    ) -> Result<
+        Option<ConsistencyToken<S::Checkpoint>>,
+        CommandError<A::Error, C::ConcurrencyError, S::Error, M::SnapshotError>,
+    >
+    where
+        S: SubscribableStore,
+        A: Aggregate<Id = S::Id> + Handle<Cmd> + Send,
+        A::Event: ProjectionEvent + EventKind + Serialize + Send + Sync,
+        Cmd: Sync,
+        S::Metadata: Clone,
+        C: CommitPolicy<S>,
+        M: SnapshotPolicy<S, A> + Sync,
+        M::Prepared: Send,
+    {
+        let position = self
+            .update_committed::<A, Cmd>(id, command, metadata)
+            .await?;
+        self.token_for(position).await.map_err(CommandError::Store)
+    }
+
+    /// Execute an upsert command and return an exact read-your-writes
+    /// [`ConsistencyToken`] for the resulting commit.
+    ///
+    /// The token-returning counterpart of [`upsert`](Self::upsert); see
+    /// [`update_tracked`](Self::update_tracked) for the read-your-writes
+    /// semantics. Returns `Ok(None)` when the command produced no events.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CommandError`] on the same conditions as
+    /// [`upsert`](Self::upsert), or [`CommandError::Store`] if the commit's
+    /// checkpoint cannot be resolved.
+    pub async fn upsert_tracked<A, Cmd>(
+        &self,
+        id: &S::Id,
+        command: &Cmd,
+        metadata: &S::Metadata,
+    ) -> Result<
+        Option<ConsistencyToken<S::Checkpoint>>,
+        CommandError<A::Error, C::ConcurrencyError, S::Error, M::SnapshotError>,
+    >
+    where
+        S: SubscribableStore,
+        A: Aggregate<Id = S::Id> + Handle<Cmd> + HandleCreate<Cmd> + Send,
+        A::Event: ProjectionEvent + EventKind + Serialize + Send + Sync,
+        Cmd: Sync,
+        S::Metadata: Clone,
+        C: CommitPolicy<S>,
+        M: SnapshotPolicy<S, A> + Sync,
+        M::Prepared: Send,
+    {
+        let position = self
+            .upsert_committed::<A, Cmd>(id, command, metadata)
+            .await?;
+        self.token_for(position).await.map_err(CommandError::Store)
+    }
+
+    /// Execute a creation command and return an exact read-your-writes
+    /// [`ConsistencyToken`] for the resulting commit.
+    ///
+    /// The token-returning counterpart of [`create`](Self::create); see
+    /// [`update_tracked`](Self::update_tracked) for the read-your-writes
+    /// semantics. Returns `Ok(None)` when the command produced no events.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CommandError`] on the same conditions as
+    /// [`create`](Self::create), or [`CommandError::Store`] if the commit's
+    /// checkpoint cannot be resolved.
+    pub async fn create_tracked<A, Cmd>(
+        &self,
+        id: &S::Id,
+        command: &Cmd,
+        metadata: &S::Metadata,
+    ) -> Result<
+        Option<ConsistencyToken<S::Checkpoint>>,
+        CommandError<A::Error, C::ConcurrencyError, S::Error, M::SnapshotError>,
+    >
+    where
+        S: SubscribableStore,
+        A: Aggregate<Id = S::Id> + HandleCreate<Cmd>,
+        A::Event: EventKind + Serialize + Send + Sync,
+        Cmd: Sync,
+        S::Metadata: Clone,
+        C: CommitPolicy<S>,
+        M: SnapshotPolicy<S, A> + Sync,
+        M::Prepared: Send,
+    {
+        let position = self
+            .create_committed::<A, Cmd>(id, command, metadata)
+            .await?;
+        self.token_for(position).await.map_err(CommandError::Store)
+    }
+
+    /// Resolve the exact [`ConsistencyToken`] for a just-committed position,
+    /// or `None` when no events were committed.
+    async fn token_for(
+        &self,
+        position: Option<S::Position>,
+    ) -> Result<Option<ConsistencyToken<S::Checkpoint>>, S::Error>
+    where
+        S: SubscribableStore,
+        M: Sync,
+    {
+        let Some(position) = position else {
+            return Ok(None);
+        };
+        Ok(self
+            .store
+            .checkpoint_for_position(&position)
+            .await?
+            .map(ConsistencyToken::new))
+    }
+
+    /// Mint a global read-your-writes [`ConsistencyToken`] capturing the log's
+    /// latest committed point, independent of any single write.
+    ///
+    /// For the common "wait for the write I just made" case, prefer the
+    /// one-shot [`update_tracked`](Self::update_tracked) /
+    /// [`upsert_tracked`](Self::upsert_tracked) /
+    /// [`create_tracked`](Self::create_tracked), which return a token bound to
+    /// the commit. Reach for this method when there is no single write to hang
+    /// a token on:
+    ///
+    /// - **Read-freshness / monotonic reads** — capture "as current as *now*"
+    ///   without performing a write, then await it before a read so the read
+    ///   never regresses.
+    /// - **Batching writes** — perform many cheap [`update`](Self::update)s,
+    ///   then mint *one* token covering all of them instead of collecting and
+    ///   `max()`-ing per-write tokens.
+    /// - **Out-of-band writes** — the write happened through a path that did
+    ///   not return a token (another service, a migration, a raw retry loop).
+    ///
+    /// The token is projection-independent: it is a point in the global commit
+    /// order, not tied to which events a particular projection consumes. A
+    /// subscription resolves it against its *global* progress cursor (advanced
+    /// by frontiers across filtered-out events), so `wait_for` returns even
+    /// when the captured point does not touch that projection's filter, rather
+    /// than stalling. Because it is the global head, awaiting it may block on
+    /// unrelated concurrent writes — `update_tracked` avoids that. Returns
+    /// `None` only when the store is empty.
+    ///
+    /// The returned token is [`Serialize`]/[`DeserializeOwned`]: return it to a
+    /// client and present it on a later read to extend read-your-writes across
+    /// a process boundary.
+    ///
+    /// # When you do not need this
+    ///
+    /// [`load_projection`](Self::load_projection) rebuilds from the event
+    /// stream and is already consistent with prior writes; tokens are only
+    /// for subscription-fed read models. For "is *my entity* updated", that
+    /// on-demand path is simpler and immune to global-checkpoint latency.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store error if resolving the latest checkpoint fails.
+    pub async fn consistency_token(
+        &self,
+    ) -> Result<Option<ConsistencyToken<S::Checkpoint>>, S::Error>
+    where
+        S: SubscribableStore,
+        M: Sync,
+    {
+        Ok(self
+            .store
+            .latest_checkpoint()
+            .await?
+            .map(ConsistencyToken::new))
     }
 }
 

@@ -11,7 +11,7 @@ use sourcery_core::{
 };
 use sourcery_postgres::Store;
 use sqlx::PgPool;
-use testcontainers::{ContainerAsync, ImageExt as _, runners::AsyncRunner};
+use testcontainers::{ContainerAsync, ImageExt, runners::AsyncRunner};
 use testcontainers_modules::postgres::Postgres;
 use uuid::Uuid;
 
@@ -269,6 +269,41 @@ async fn load_events_returns_stored_events() {
 
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].kind(), "test-event");
+    assert_eq!(events[0].aggregate_id(), &id);
+}
+
+#[tokio::test]
+async fn load_events_deduplicates_events_matched_by_multiple_filters() {
+    let db = TestDb::new().await;
+    let store: Store<TestMetadata> = Store::new(db.pool.clone());
+    store.migrate().await.unwrap();
+
+    let id = Uuid::new_v4();
+    let metadata = test_metadata("user1");
+
+    store
+        .commit_events_optimistic(
+            "test.aggregate",
+            &id,
+            None,
+            NonEmpty::singleton(test_event("created data")),
+            &metadata,
+        )
+        .await
+        .unwrap();
+
+    // Two overlapping filters both match the single committed event: a global
+    // by-kind filter and an aggregate-scoped filter for the same kind. The
+    // event must be returned exactly once (matching in-memory store semantics),
+    // otherwise a projection would apply it twice.
+    let filters = vec![
+        EventFilter::for_event("test-event"),
+        EventFilter::for_aggregate("test-event", "test.aggregate", id),
+    ];
+
+    let events = store.load_events(&filters).await.unwrap();
+
+    assert_eq!(events.len(), 1);
     assert_eq!(events[0].aggregate_id(), &id);
 }
 

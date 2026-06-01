@@ -159,6 +159,10 @@ where
     type Error = Infallible;
     type Position = Pos;
 
+    #[allow(
+        clippy::unused_async_trait_impl,
+        reason = "the explicit Future form would make the Send bound depend on T"
+    )]
     async fn load<T>(&self, _kind: &str, _id: &Id) -> Result<Option<Snapshot<Pos, T>>, Self::Error>
     where
         T: DeserializeOwned,
@@ -166,6 +170,10 @@ where
         Ok(None)
     }
 
+    #[allow(
+        clippy::unused_async_trait_impl,
+        reason = "async keeps this no-op implementation equivalent to the trait future contract"
+    )]
     async fn offer_snapshot<CE, T, Create>(
         &self,
         _kind: &str,

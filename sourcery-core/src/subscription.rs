@@ -10,21 +10,24 @@
 //! A subscription:
 //! 1. Replays historical events (catch-up phase)
 //! 2. Transitions to processing live events as they are committed
-//! 3. Yields projection updates via a stream
+//! 3. Maintains the live projection, readable via
+//!    [`current`](Subscription::current), with each subsequent update available
+//!    through the opt-in stream from [`updates`](Subscription::updates)
 //!
 //! # Example
 //!
 //! ```ignore
-//! use tokio_stream::StreamExt as _;
-//!
-//! let mut subscription = repository
+//! let subscription = repository
 //!     .subscribe::<Dashboard>(())
 //!     .start()
 //!     .await?;
 //!
-//! if let Some(dashboard) = subscription.next().await {
-//!     println!("{dashboard:?}");
-//! }
+//! // Read your own write: await the write's token, then read the live model.
+//! let token = repository
+//!     .update_tracked::<Account, Deposit>(&id, &deposit, &metadata)
+//!     .await?;
+//! let dashboard = subscription.read_after(token).await?;
+//! println!("{dashboard:?}");
 //!
 //! // Later, shut down gracefully
 //! subscription.stop().await?;
@@ -32,18 +35,13 @@
 //!
 //! [`Repository::load_projection`]: crate::repository::Repository::load_projection
 
-use std::{
-    collections::HashMap,
-    future::Future,
-    pin::Pin,
-    task::{Context, Poll},
-};
+use std::{collections::HashMap, future::Future, pin::Pin};
 
 use futures_core::Stream;
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
-use tokio::task::JoinHandle;
-use tokio_stream::StreamExt as _;
+use tokio::{sync::broadcast, task::JoinHandle};
+use tokio_stream::{StreamExt, wrappers::BroadcastStream};
 
 use crate::{
     event::EventDecodeError,
@@ -51,6 +49,12 @@ use crate::{
     snapshot::{Snapshot, SnapshotStore},
     store::{EventFilter, EventStore, StoredEvent},
 };
+
+/// Capacity of the per-subscription broadcast channel backing
+/// [`Subscription::updates`]. A consumer that falls this far behind skips the
+/// intervening states (and can resync via [`Subscription::current`]) rather
+/// than stalling the runtime.
+const UPDATES_CHANNEL_CAPACITY: usize = 1024;
 
 /// A stored event paired with the [`Checkpoint`](SubscribableStore::Checkpoint)
 /// that marks its place in the commit-ordered delivery stream.
@@ -67,6 +71,88 @@ pub struct Checkpointed<S: SubscribableStore + ?Sized> {
         <S as EventStore>::Data,
         <S as EventStore>::Metadata,
     >,
+}
+
+/// An item yielded by [`SubscribableStore::subscribe`]: either a matching event
+/// or a global progress frontier.
+///
+/// Server-side filtering means non-matching events never reach the subscriber,
+/// so their checkpoints cannot be observed from the event stream. [`Frontier`]
+/// closes that gap: it reports the highest *stable* global checkpoint through
+/// which the store guarantees no (further) matching event exists, letting a
+/// subscriber advance a global progress cursor across filtered-out events. This
+/// is what makes [`Subscription::wait_for`] resolve a global
+/// [`ConsistencyToken`] instead of stalling when a write does not touch the
+/// projection's filter.
+///
+/// A `Frontier` carries no event and must not apply a handler, emit an update,
+/// or trigger a snapshot — it only advances global progress.
+///
+/// [`Frontier`]: Delivery::Frontier
+pub enum Delivery<S: SubscribableStore + ?Sized> {
+    /// A filter-matching event at its delivery checkpoint.
+    Event(Checkpointed<S>),
+    /// No (further) matching event exists through this stable global
+    /// checkpoint; advance global progress to here.
+    Frontier(S::Checkpoint),
+}
+
+/// An opaque, ordered marker for a point in a store's commit-ordered delivery
+/// stream, used to bridge CQRS eventual consistency into read-your-writes.
+///
+/// A token is produced *after a write* by
+/// [`Repository::consistency_token`](crate::repository::Repository::consistency_token)
+/// and consumed by [`Subscription::wait_for`], which blocks until a read-side
+/// subscription has processed at least up to that point. Awaiting a token
+/// before querying a subscription-fed read model guarantees the model reflects
+/// the write — turning an eventually-consistent projection into a monotonic,
+/// read-your-writes one on demand.
+///
+/// The token wraps a store's [`Checkpoint`](SubscribableStore::Checkpoint), so
+/// it inherits the checkpoint's total order. To await several writes at once,
+/// keep the largest (`tokens.into_iter().max()`). It is [`Serialize`]/
+/// [`DeserializeOwned`] so it can be returned to a client and presented on a
+/// later read, extending the guarantee across a process boundary.
+///
+/// # On-demand projections do not need this
+///
+/// [`Repository::load_projection`](crate::repository::Repository::load_projection)
+/// rebuilds from the event stream on each call and is already strongly
+/// consistent with prior writes. Tokens exist for *subscription-fed* read
+/// models
+/// (see [`Repository::subscribe`](crate::repository::Repository::subscribe)),
+/// which are the only place the eventual-consistency window is observable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ConsistencyToken<C>(C);
+
+impl<C> ConsistencyToken<C> {
+    /// Wrap a checkpoint as a consistency token.
+    pub const fn new(checkpoint: C) -> Self {
+        Self(checkpoint)
+    }
+
+    /// Borrow the underlying checkpoint.
+    pub const fn checkpoint(&self) -> &C {
+        &self.0
+    }
+
+    /// Unwrap into the underlying checkpoint.
+    pub fn into_checkpoint(self) -> C {
+        self.0
+    }
+}
+
+/// Error returned by [`Subscription::wait_for`] when the requested checkpoint
+/// cannot be awaited.
+#[derive(Debug, Error)]
+pub enum AwaitError {
+    /// The subscription stopped (gracefully or due to a failure) before
+    /// processing up to the requested checkpoint.
+    ///
+    /// To recover the underlying failure, call
+    /// [`Subscription::stop`](Subscription::stop) and inspect its error.
+    #[error("subscription stopped before reaching the requested checkpoint")]
+    SubscriptionStopped,
 }
 
 /// A store that supports push-based event subscriptions.
@@ -112,15 +198,26 @@ pub trait SubscribableStore: EventStore {
     /// `from` is **exclusive**: the stream yields events strictly *after* the
     /// given checkpoint. Pass `None` to start from the beginning.
     ///
-    /// **Delivery guarantee**: at-least-once, in strictly increasing
+    /// **Delivery guarantee**: matching events ([`Delivery::Event`]) are
+    /// delivered at-least-once in strictly increasing
     /// [`Checkpoint`](Self::Checkpoint) order. The stream may yield duplicate
     /// events during the catch-up-to-live transition; the subscription loop
     /// deduplicates by checkpoint.
+    ///
+    /// **Frontier guarantee**: whenever the stream has delivered every matching
+    /// event through some stable global checkpoint `F` and is about to idle, it
+    /// yields [`Delivery::Frontier(F)`](Delivery::Frontier). `F` must be chosen
+    /// so that no matching event with checkpoint `<= F` can ever be delivered
+    /// afterwards (i.e. `F` is below the store's stability boundary). This lets
+    /// subscribers advance a *global* progress cursor across filtered-out
+    /// events, which [`Subscription::wait_for`] relies on. Stores that
+    /// cannot cheaply compute a frontier may omit it, at the cost of
+    /// `wait_for` stalling for tokens beyond the projection's own events.
     fn subscribe(
         &self,
         filters: &[EventFilter<Self::Id, Self::Position>],
         from: Option<Self::Checkpoint>,
-    ) -> Pin<Box<impl Stream<Item = Result<Checkpointed<Self>, Self::Error>> + Send + '_>>;
+    ) -> Pin<Box<impl Stream<Item = Result<Delivery<Self>, Self::Error>> + Send + '_>>;
 
     /// The largest checkpoint currently reachable by catch-up for `filters`.
     ///
@@ -133,6 +230,45 @@ pub trait SubscribableStore: EventStore {
     fn current_checkpoint(
         &self,
         filters: &[EventFilter<Self::Id, Self::Position>],
+    ) -> impl Future<Output = Result<Option<Self::Checkpoint>, Self::Error>> + Send;
+
+    /// The latest committed [`Checkpoint`](Self::Checkpoint) across *all*
+    /// events, ignoring filters; `None` when the store is empty.
+    ///
+    /// This mints a global, projection-independent read-your-writes token: call
+    /// it after a write to capture "the log now includes my commit", then await
+    /// the token on any subscription via [`Subscription::wait_for`]. Unlike
+    /// [`current_checkpoint`](Self::current_checkpoint), it is unfiltered, so
+    /// the token is meaningful regardless of which projection later
+    /// consumes it.
+    ///
+    /// The returned checkpoint must be one a subscriber's global progress
+    /// cursor can eventually reach — i.e. the caller's just-committed
+    /// events are included and become stable. It need not itself be below
+    /// the stability boundary at call time; it only has to become so.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store-specific error when the query fails.
+    fn latest_checkpoint(
+        &self,
+    ) -> impl Future<Output = Result<Option<Self::Checkpoint>, Self::Error>> + Send;
+
+    /// Resolve the exact [`Checkpoint`](Self::Checkpoint) of the event
+    /// committed at `position` (the `last_position` returned by a commit).
+    ///
+    /// This mints an *exact* read-your-writes token bound to a specific write,
+    /// tighter than [`latest_checkpoint`](Self::latest_checkpoint): it names
+    /// precisely the caller's commit rather than the global head, so a
+    /// subscriber awaiting it never blocks on unrelated concurrent writes.
+    /// Returns `None` when no event exists at `position`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store-specific error when the query fails.
+    fn checkpoint_for_position(
+        &self,
+        position: &Self::Position,
     ) -> impl Future<Output = Result<Option<Self::Checkpoint>, Self::Error>> + Send;
 }
 // ANCHOR_END: subscribable_store_trait
@@ -218,22 +354,47 @@ where
     }
 }
 
-/// Stream-first subscription handle that yields projection snapshots.
+/// A running subscription: a live read model plus an opt-in stream of updates.
 ///
-/// Each `Stream` item is the projection state after one event has been applied.
-/// Consume updates with `StreamExt::next()`, and call [`stop()`] for graceful
-/// shutdown.
+/// Read the materialised state at any time with [`current`](Self::current), or
+/// await a write with [`wait_for`](Self::wait_for) /
+/// [`read_after`](Self::read_after). For reactive consumers,
+/// [`updates`](Self::updates) hands back the current snapshot together with a
+/// [`Stream`] of every subsequent state, taken atomically so no update is lost
+/// or duplicated across the boundary. Call [`stop()`] for graceful shutdown.
 ///
 /// [`stop()`]: Self::stop
-pub struct Subscription<P, StoreError>
+pub struct Subscription<P, Cp, StoreError>
 where
     StoreError: std::error::Error + 'static,
 {
-    updates: tokio::sync::mpsc::UnboundedReceiver<P>,
+    /// Broadcasts each applied projection state to live [`updates`] streams.
+    /// The runtime only sends when there is at least one receiver, so a
+    /// subscription used purely for [`current`]/[`wait_for`] never queues
+    /// anything.
+    ///
+    /// [`updates`]: Self::updates
+    /// [`current`]: Self::current
+    /// [`wait_for`]: Self::wait_for
+    updates_tx: broadcast::Sender<P>,
+    /// Latest checkpoint the runtime has processed (`None` until the first
+    /// event). Drives [`processed`](Self::processed) and
+    /// [`wait_for`](Self::wait_for); closes when the runtime task ends.
+    progress: tokio::sync::watch::Receiver<Option<Cp>>,
+    /// Latest projection state the runtime has applied. Seeded with the resume
+    /// baseline and republished after every event, so
+    /// [`current`](Self::current) reads the live read model without
+    /// subscribing to the update stream.
+    ///
+    /// A plain `Arc<Mutex<P>>` rather than a `watch` channel: the latter's
+    /// `Receiver<P>` would require `P: Sync` for the subscription to stay
+    /// `Sync`, tightening the bound on [`wait_for`](Self::wait_for). The
+    /// mutex is only ever held to clone in/out, never across an `.await`.
+    current: std::sync::Arc<std::sync::Mutex<P>>,
     handle: SubscriptionHandle<StoreError>,
 }
 
-impl<P, StoreError> Subscription<P, StoreError>
+impl<P, Cp, StoreError> Subscription<P, Cp, StoreError>
 where
     StoreError: std::error::Error + 'static,
 {
@@ -242,7 +403,12 @@ where
     /// # Errors
     ///
     /// Returns the subscription's error if it failed before being stopped.
-    pub async fn stop(self) -> Result<(), SubscriptionError<StoreError>> {
+    pub async fn stop(self) -> Result<(), SubscriptionError<StoreError>>
+    where
+        P: Send,
+        Cp: Send + Sync,
+        StoreError: Send,
+    {
         self.handle.stop().await
     }
 
@@ -251,16 +417,146 @@ where
     pub fn is_running(&self) -> bool {
         self.handle.is_running()
     }
-}
 
-impl<P, StoreError> Stream for Subscription<P, StoreError>
-where
-    StoreError: std::error::Error + 'static,
-{
-    type Item = P;
+    /// The latest checkpoint this subscription has processed, or `None` if it
+    /// has not yet applied any event past its starting point.
+    ///
+    /// This is a non-blocking snapshot of read-side progress. To *wait* for a
+    /// specific point, use [`wait_for`](Self::wait_for).
+    #[must_use]
+    pub fn processed(&self) -> Option<Cp>
+    where
+        Cp: Clone,
+    {
+        self.progress.borrow().clone()
+    }
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.updates.poll_recv(cx)
+    /// The latest projection state the subscription has applied.
+    ///
+    /// A non-blocking read of the live read model that does **not** consume the
+    /// update stream, so it composes with [`wait_for`](Self::wait_for): await a
+    /// write's [`ConsistencyToken`], then call `current()` to observe a read
+    /// model guaranteed to reflect that write.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the background task panicked while updating the
+    /// projection (poisoning the internal mutex); a healthy subscription
+    /// never panics here.
+    #[must_use]
+    pub fn current(&self) -> P
+    where
+        P: Clone,
+    {
+        self.current
+            .lock()
+            .expect("projection mutex poisoned")
+            .clone()
+    }
+
+    /// Subscribe to live projection updates, returning the current state and a
+    /// [`Stream`] of every state that follows.
+    ///
+    /// The snapshot and the stream are taken atomically: every event is on
+    /// exactly one side of the boundary — folded into the returned snapshot, or
+    /// yielded by the stream — so none is lost or duplicated. This avoids the
+    /// snapshot-then-subscribe race of reading [`current`](Self::current) and
+    /// subscribing separately. Events processed before this call (including the
+    /// catch-up phase) are reflected in the snapshot, not replayed through the
+    /// stream.
+    ///
+    /// Each stream item is the projection state after one event. A consumer
+    /// that falls behind the channel's capacity skips the intervening states
+    /// rather than blocking the runtime; call [`current`](Self::current) to
+    /// resynchronise. Ignore the snapshot (`let (_, stream) = sub.updates();`)
+    /// for a pure live-delta stream.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the background task panicked while updating the
+    /// projection (poisoning the internal mutex); a healthy subscription never
+    /// panics here.
+    pub fn updates(&self) -> (P, impl Stream<Item = P> + Send + 'static)
+    where
+        P: Clone + Send + 'static,
+    {
+        // Subscribe and snapshot under the same lock the runtime holds when it
+        // republishes state and broadcasts (see `handle_delivery`), so the
+        // snapshot/stream boundary is exact: an event folded into `snapshot`
+        // was broadcast before this `subscribe`, and any later event is
+        // delivered by the returned stream.
+        let guard = self.current.lock().expect("projection mutex poisoned");
+        let stream = BroadcastStream::new(self.updates_tx.subscribe()).filter_map(Result::ok);
+        (guard.clone(), stream)
+    }
+
+    /// Wait for `token`, then return the latest projection state.
+    ///
+    /// This is the convenience read-your-writes path for subscription-fed read
+    /// models: pass the optional token returned by `create_tracked`,
+    /// `update_tracked`, `upsert_tracked`, or `consistency_token`, and this
+    /// method waits only when there is something to wait for. It then returns
+    /// [`current`](Self::current) without consuming the update stream.
+    ///
+    /// Use [`wait_for`](Self::wait_for) directly when you need only the
+    /// progress barrier, or when you want to await several tokens before
+    /// performing one or more reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AwaitError::SubscriptionStopped`] if the runtime stops before
+    /// reaching the requested token.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the background task panicked while updating the
+    /// projection (poisoning the internal mutex); a healthy subscription
+    /// never panics here.
+    pub async fn read_after(&self, token: Option<ConsistencyToken<Cp>>) -> Result<P, AwaitError>
+    where
+        P: Clone + Send,
+        Cp: PartialOrd + Send + Sync,
+        StoreError: Send,
+    {
+        if let Some(token) = token {
+            self.wait_for(token).await?;
+        }
+
+        Ok(self.current())
+    }
+
+    /// Wait until this subscription has processed at least up to `token`.
+    ///
+    /// This bridges CQRS eventual consistency into a read-your-writes
+    /// guarantee: after a write, obtain a token from
+    /// [`Repository::consistency_token`](crate::repository::Repository::consistency_token),
+    /// await it here, then query the read model — it will reflect the write.
+    ///
+    /// Resolves immediately if the subscription has already advanced past
+    /// `token` (including writes this projection does not subscribe to, whose
+    /// tokens never exceed the latest relevant checkpoint). The returned future
+    /// carries no timeout; wrap it in `tokio::time::timeout` or `select!` to
+    /// bound the wait. Waking is event-driven (no polling): the future is
+    /// notified only when the runtime advances.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AwaitError::SubscriptionStopped`] if the runtime stops before
+    /// reaching `token`. Call [`stop`](Self::stop) afterwards to surface the
+    /// underlying failure, if any.
+    pub async fn wait_for(&self, token: ConsistencyToken<Cp>) -> Result<(), AwaitError>
+    where
+        P: Send,
+        Cp: PartialOrd + Send + Sync,
+        StoreError: Send,
+    {
+        let target = token.checkpoint();
+        let mut progress = self.progress.clone();
+        progress
+            .wait_for(|processed| processed.as_ref().is_some_and(|cp| cp >= target))
+            .await
+            .map(|_| ())
+            .map_err(|_| AwaitError::SubscriptionStopped)
     }
 }
 
@@ -325,7 +621,9 @@ where
     ///
     /// `P` must implement [`Clone`] because each stream item yields an owned
     /// snapshot of the projection state.
-    pub async fn start(self) -> Result<Subscription<P, S::Error>, SubscriptionError<S::Error>>
+    pub async fn start(
+        self,
+    ) -> Result<Subscription<P, S::Checkpoint, S::Error>, SubscriptionError<S::Error>>
     where
         P: Clone,
     {
@@ -335,11 +633,25 @@ where
             instance_id,
         } = self;
 
-        let (update_tx, update_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Opt-in live update channel. The initial receiver is dropped: the
+        // runtime only broadcasts when a consumer has subscribed via
+        // `Subscription::updates`, so a subscription used purely for
+        // `current()`/`wait_for()` never clones or queues a single state.
+        let (updates_tx, _) = broadcast::channel(UPDATES_CHANNEL_CAPACITY);
 
         // Resume from the persisted checkpoint, if any.
-        let (mut projection, from_checkpoint) =
-            load_snapshot::<P, SS>(&snapshots, &instance_id).await;
+        let (projection, from_checkpoint) = load_snapshot::<P, SS>(&snapshots, &instance_id).await;
+
+        // Live read model: seeded with the resume baseline and republished after
+        // each event so `current()` reads state without draining the update
+        // stream. Shared with the background task via `Arc<Mutex<_>>`.
+        let current = std::sync::Arc::new(std::sync::Mutex::new(projection.clone()));
+
+        // Read-your-writes progress channel. Seeded with the resume checkpoint
+        // so `processed()`/`wait_for()` account for the snapshot baseline. The
+        // background task advances it as it processes events; when the task
+        // ends the sender drops, waking any waiters with `SubscriptionStopped`.
+        let (progress_tx, progress_rx) = tokio::sync::watch::channel(from_checkpoint.clone());
 
         // Filters are position-free: the subscription cursor is the checkpoint,
         // passed to `subscribe` directly rather than baked into the filters.
@@ -352,101 +664,45 @@ where
             .await
             .map_err(SubscriptionError::Store)?;
 
-        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
 
-        let mut last_checkpoint = from_checkpoint.clone();
-        let mut events_since_snapshot: u64 = 0;
+        // `caught_up` is true from the start when there is nothing to replay; the
+        // catch-up and live phases otherwise share a single loop in `run`.
+        let caught_up = catchup_target.is_none() || from_checkpoint >= catchup_target;
 
-        let task = tokio::spawn(async move {
-            let mut ready_tx = Some(ready_tx);
+        let subscription_loop = SubscriptionLoop {
+            snapshots,
+            instance_id,
+            handlers,
+            projection,
+            updates_tx: updates_tx.clone(),
+            progress_tx,
+            current: std::sync::Arc::clone(&current),
+            catchup_target,
+            // `last_checkpoint` tracks matching events; `observed` is the global
+            // progress cursor (max of matching checkpoints and frontiers). They
+            // start equal at the resume point but diverge as filtered-out writes
+            // advance `observed` for `wait_for` without moving `last_checkpoint`.
+            last_checkpoint: from_checkpoint.clone(),
+            observed: from_checkpoint.clone(),
+            events_since_snapshot: 0,
+            caught_up,
+        };
 
-            let signal_ready = |ready_tx: &mut Option<tokio::sync::oneshot::Sender<()>>| {
-                if let Some(tx) = ready_tx.take() {
-                    let _ = tx.send(());
-                }
-            };
-
-            // `caught_up` flips once we've replayed up to the target captured
-            // above; the catch-up and live phases share this single loop.
-            let mut caught_up = catchup_target.is_none() || last_checkpoint >= catchup_target;
-            if caught_up {
-                signal_ready(&mut ready_tx);
-            }
-
-            let mut stream = store.subscribe(&event_filters, from_checkpoint);
-
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = &mut stop_rx => {
-                        tracing::debug!("subscription stopped");
-                        break;
-                    }
-                    item = stream.next() => {
-                        let Some(result) = item else {
-                            tracing::debug!("subscription stream ended");
-                            break;
-                        };
-
-                        let delivery = result.map_err(SubscriptionError::Store)?;
-
-                        // Checkpoint-based deduplication (delivery order is
-                        // strictly increasing in checkpoint).
-                        if let Some(ref lc) = last_checkpoint
-                            && delivery.checkpoint <= *lc
-                        {
-                            continue;
-                        }
-
-                        process_subscription_event(
-                            &mut projection,
-                            delivery,
-                            &handlers,
-                            &store,
-                            &update_tx,
-                            &mut last_checkpoint,
-                            &mut events_since_snapshot,
-                        )?;
-
-                        // Signal readiness once we've replayed up to the target.
-                        if !caught_up
-                            && (catchup_target.is_none() || last_checkpoint >= catchup_target)
-                        {
-                            caught_up = true;
-                            signal_ready(&mut ready_tx);
-                        }
-
-                        // Offer a snapshot after every event; the snapshot
-                        // store's own policy decides whether to persist.
-                        maintain_snapshot(
-                            &snapshots,
-                            &instance_id,
-                            last_checkpoint.as_ref(),
-                            &mut events_since_snapshot,
-                            &projection,
-                        )
-                        .await;
-                    }
-                }
-            }
-
-            // Final snapshot on shutdown.
-            maintain_snapshot(
-                &snapshots,
-                &instance_id,
-                last_checkpoint.as_ref(),
-                &mut events_since_snapshot,
-                &projection,
-            )
-            .await;
-
-            Ok(())
-        });
+        let task = tokio::spawn(subscription_loop.run(
+            store,
+            event_filters,
+            from_checkpoint,
+            stop_rx,
+            ready_tx,
+        ));
 
         match ready_rx.await {
             Ok(()) => Ok(Subscription {
-                updates: update_rx,
+                updates_tx,
+                progress: progress_rx,
+                current,
                 handle: SubscriptionHandle {
                     stop_tx: Some(stop_tx),
                     task: Some(task),
@@ -458,6 +714,195 @@ where
                 Err(_) => Err(SubscriptionError::TaskPanicked),
             },
         }
+    }
+}
+
+/// Owned state for the background subscription loop, factored out of
+/// [`SubscriptionBuilder::start`] so that method stays focused on wiring up
+/// channels while the catch-up/live loop lives here.
+///
+/// `store` and the stream derived from it are intentionally *not* held here:
+/// the stream borrows the store for its whole lifetime, so keeping the store as
+/// a separate `run` parameter lets the per-event handler take `&mut self`
+/// without conflicting with that borrow.
+struct SubscriptionLoop<S, P, SS>
+where
+    S: SubscribableStore,
+    P: Projection<Id = S::Id>,
+{
+    snapshots: SS,
+    instance_id: P::InstanceId,
+    handlers: HashMap<&'static str, crate::projection::EventHandler<P, S>>,
+    projection: P,
+    updates_tx: broadcast::Sender<P>,
+    progress_tx: tokio::sync::watch::Sender<Option<S::Checkpoint>>,
+    current: std::sync::Arc<std::sync::Mutex<P>>,
+    catchup_target: Option<S::Checkpoint>,
+    last_checkpoint: Option<S::Checkpoint>,
+    observed: Option<S::Checkpoint>,
+    events_since_snapshot: u64,
+    caught_up: bool,
+}
+
+impl<S, P, SS> SubscriptionLoop<S, P, SS>
+where
+    S: SubscribableStore + Clone + Send + Sync + 'static,
+    S::Data: Send,
+    S::Metadata: Send + Sync,
+    P: Projection<Id = S::Id, Metadata = S::Metadata> + Clone + Serialize + Send + Sync + 'static,
+    P::InstanceId: Send + Sync + 'static,
+    P::Metadata: Send,
+    SS: SnapshotStore<P::InstanceId, Position = S::Checkpoint> + Send + Sync + 'static,
+{
+    /// Drive the shared catch-up + live loop until stopped or the stream ends,
+    /// taking a final snapshot on the way out.
+    async fn run(
+        mut self,
+        store: S,
+        event_filters: Vec<EventFilter<S::Id, S::Position>>,
+        from_checkpoint: Option<S::Checkpoint>,
+        mut stop_rx: tokio::sync::oneshot::Receiver<()>,
+        ready_tx: tokio::sync::oneshot::Sender<()>,
+    ) -> Result<(), SubscriptionError<S::Error>> {
+        let mut ready_tx = Some(ready_tx);
+        if self.caught_up {
+            signal(&mut ready_tx);
+        }
+
+        let mut stream = store.subscribe(&event_filters, from_checkpoint);
+
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut stop_rx => {
+                    tracing::debug!("subscription stopped");
+                    break;
+                }
+                item = stream.next() => {
+                    let Some(result) = item else {
+                        tracing::debug!("subscription stream ended");
+                        break;
+                    };
+                    self.handle_delivery(result, &store, &mut ready_tx).await?;
+                }
+            }
+        }
+
+        // Final snapshot on shutdown.
+        maintain_snapshot(
+            &self.snapshots,
+            &self.instance_id,
+            self.last_checkpoint.as_ref(),
+            &mut self.events_since_snapshot,
+            &self.projection,
+        )
+        .await;
+
+        Ok(())
+    }
+
+    /// Apply one stream item: advance the global cursor on a frontier, or
+    /// deduplicate, dispatch, advance progress, signal catch-up readiness, and
+    /// offer a snapshot on a matching event.
+    async fn handle_delivery(
+        &mut self,
+        result: Result<Delivery<S>, S::Error>,
+        store: &S,
+        ready_tx: &mut Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> Result<(), SubscriptionError<S::Error>> {
+        let checkpoint = match result.map_err(SubscriptionError::Store)? {
+            Delivery::Frontier(frontier) => {
+                // No event: advance global progress only.
+                advance_observed(&mut self.observed, &self.progress_tx, frontier);
+                return Ok(());
+            }
+            Delivery::Event(delivery) => {
+                // Checkpoint-based deduplication (delivery order is strictly
+                // increasing in checkpoint).
+                if let Some(ref lc) = self.last_checkpoint
+                    && delivery.checkpoint <= *lc
+                {
+                    return Ok(());
+                }
+
+                let checkpoint = delivery.checkpoint.clone();
+                process_subscription_event(
+                    &mut self.projection,
+                    delivery,
+                    &self.handlers,
+                    store,
+                    &mut self.last_checkpoint,
+                    &mut self.events_since_snapshot,
+                )?;
+                // Publish the new state and broadcast it under one lock. Holding
+                // the lock across both makes `updates()` (which subscribes and
+                // snapshots under the same lock) see an exact boundary, and
+                // doing it before advancing progress (below) ensures a
+                // `wait_for` waiter that wakes on the checkpoint always observes
+                // a `current()` that includes it. The broadcast is skipped when
+                // no consumer is subscribed, so a `current()`-only subscription
+                // never clones state for the stream.
+                {
+                    let mut current = self.current.lock().expect("projection mutex poisoned");
+                    *current = self.projection.clone();
+                    if self.updates_tx.receiver_count() > 0 {
+                        // Clone through the guard so the broadcast provably
+                        // happens under the same lock `updates()` holds.
+                        let _ = self.updates_tx.send(current.clone());
+                    }
+                }
+                checkpoint
+            }
+        };
+
+        // Advance read-your-writes progress before the (possibly slow) snapshot
+        // offer, so waiters wake as early as possible.
+        advance_observed(&mut self.observed, &self.progress_tx, checkpoint);
+
+        // Signal readiness once we've replayed up to the target.
+        if !self.caught_up
+            && (self.catchup_target.is_none() || self.last_checkpoint >= self.catchup_target)
+        {
+            self.caught_up = true;
+            signal(ready_tx);
+        }
+
+        // Offer a snapshot after every event; the snapshot store's own policy
+        // decides whether to persist.
+        maintain_snapshot(
+            &self.snapshots,
+            &self.instance_id,
+            self.last_checkpoint.as_ref(),
+            &mut self.events_since_snapshot,
+            &self.projection,
+        )
+        .await;
+
+        Ok(())
+    }
+}
+
+/// Signal one-time catch-up readiness, consuming the sender so later calls are
+/// no-ops. A dropped receiver is ignored.
+fn signal(ready_tx: &mut Option<tokio::sync::oneshot::Sender<()>>) {
+    if let Some(tx) = ready_tx.take() {
+        let _ = tx.send(());
+    }
+}
+
+/// Advance `observed` to `candidate` when it is greater, publishing the new
+/// global progress cursor to [`Subscription::wait_for`] waiters. `send_replace`
+/// ignores a dropped receiver.
+fn advance_observed<Cp>(
+    observed: &mut Option<Cp>,
+    progress_tx: &tokio::sync::watch::Sender<Option<Cp>>,
+    candidate: Cp,
+) where
+    Cp: Ord + Clone,
+{
+    if observed.as_ref().is_none_or(|current| candidate > *current) {
+        *observed = Some(candidate);
+        progress_tx.send_replace(observed.clone());
     }
 }
 
@@ -512,19 +957,21 @@ where
     .map_err(|error| SubscriptionError::EventDecode(error.into_decode_error()))
 }
 
-/// Process one event through handler dispatch, checkpoint tracking, and update
-/// emission.
+/// Process one event through handler dispatch and checkpoint tracking.
+///
+/// Publishing the new state (to `current()` and the live update stream) is the
+/// caller's responsibility, so it can do so atomically under the projection
+/// lock.
 fn process_subscription_event<P, S>(
     projection: &mut P,
     delivery: Checkpointed<S>,
     handlers: &HashMap<&'static str, crate::projection::EventHandler<P, S>>,
     store: &S,
-    updates_tx: &tokio::sync::mpsc::UnboundedSender<P>,
     last_checkpoint: &mut Option<S::Checkpoint>,
     events_since_snapshot: &mut u64,
 ) -> Result<(), SubscriptionError<S::Error>>
 where
-    P: Projection<Id = S::Id> + Clone,
+    P: Projection<Id = S::Id>,
     S: SubscribableStore,
 {
     let Checkpointed { checkpoint, event } = delivery;
@@ -537,8 +984,6 @@ where
 
     *last_checkpoint = Some(checkpoint);
     *events_since_snapshot += 1;
-
-    let _ = updates_tx.send(projection.clone());
 
     Ok(())
 }

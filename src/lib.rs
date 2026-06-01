@@ -15,8 +15,8 @@ pub use sourcery_core::{
     },
     subscription,
     subscription::{
-        Checkpointed, SubscribableStore, Subscription, SubscriptionBuilder, SubscriptionError,
-        SubscriptionHandle,
+        AwaitError, Checkpointed, ConsistencyToken, Delivery, SubscribableStore, Subscription,
+        SubscriptionBuilder, SubscriptionError, SubscriptionHandle,
     },
 };
 // Re-export proc macro derives so consumers only depend on `sourcery`.
