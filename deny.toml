@@ -10,12 +10,12 @@ allow = [
 ]
 confidence-threshold = 1.0
 
-# This workspace is allowed to be GPL-3.0, but none of it's dependencies are!
+# This workspace is allowed to be AGPL-3.0, but none of its dependencies are!
 exceptions = [
-    { allow = ["GPL-3.0-only"], crate = "sourcery" },
-    { allow = ["GPL-3.0-only"], crate = "sourcery-postgres" },
-    { allow = ["GPL-3.0-only"], crate = "sourcery-core" },
-    { allow = ["GPL-3.0-only"], crate = "sourcery-macros" },
+    { allow = ["AGPL-3.0-only"], crate = "sourcery" },
+    { allow = ["AGPL-3.0-only"], crate = "sourcery-postgres" },
+    { allow = ["AGPL-3.0-only"], crate = "sourcery-core" },
+    { allow = ["AGPL-3.0-only"], crate = "sourcery-macros" },
 ]
 
 [graph]
