@@ -33,7 +33,7 @@ sourcery = { version = "0.1", features = ["postgres"] }
 
 ## Minimum Rust Version
 
-This crate requires **Rust 1.88.0** or later (edition 2024).
+This crate requires **Rust 1.92.0** or later (edition 2024).
 
 ## Next
 

@@ -426,7 +426,14 @@ where
 
         for (i, filter) in filters.iter().enumerate() {
             if i > 0 {
-                qb.push(" UNION ALL ");
+                // `UNION` (not `UNION ALL`) dedups events matched by more than
+                // one filter — e.g. a global `events()` filter overlapping an
+                // `events_for()` filter on the same kind — so an event is
+                // applied to a projection exactly once. Rows are unique per
+                // event (`position` is the primary key and is selected), so the
+                // only rows `UNION` collapses are genuine duplicates. This keeps
+                // the result consistent with the in-memory store.
+                qb.push(" UNION ");
             }
 
             qb.push(

@@ -4,17 +4,21 @@ While `load_projection` rebuilds a projection from scratch on each call, **subsc
 
 ## Basic Usage
 
-Use `Repository::subscribe` to create a `SubscriptionBuilder`, call `start()`, then consume updates from the returned stream:
+Use `Repository::subscribe` to create a `SubscriptionBuilder`, call `start()`, then read the current state and stream subsequent updates via `updates()`:
 
 ```rust,ignore
-use tokio_stream::StreamExt as _;
+use tokio_stream::StreamExt;
 
-let mut subscription = repository
+let subscription = repository
     .subscribe::<Dashboard>(())
     .start()
     .await?;
 
-while let Some(dashboard) = subscription.next().await {
+// Current state plus a stream of every subsequent update, captured atomically
+// so no update is missed across the boundary.
+let (dashboard, mut updates) = subscription.updates();
+println!("{dashboard:?}");
+while let Some(dashboard) = updates.next().await {
     println!("{dashboard:?}");
 }
 ```
@@ -28,7 +32,7 @@ A subscription:
 
 1. **Catch-up phase** — Replays all historical events matching the projection's filters
 2. **Live phase** — Transitions to processing events as they are committed
-3. **Stream updates** — Yields the projection after each event
+3. **Publish updates** — Republishes the projection after each event to `current()` and any live `updates()` stream
 
 ```d2
 shape: sequence_diagram
@@ -44,20 +48,22 @@ Sub -> Sub: "Replay events (catch-up)"
 Sub -> App: "start() returns (caught up)" {style.stroke-dash: 3}
 Store -> Sub: "Live event" {style.stroke-dash: 3}
 Sub -> Sub: "apply_projection()"
-Sub -> App: "stream.next() -> projection" {style.stroke-dash: 3}
+Sub -> App: "updates() stream -> projection" {style.stroke-dash: 3}
 ```
 
 ## Consuming Updates
 
-Each stream item is the projection state after one event is applied. Drain the stream when you want to *react* to every update (push to WebSocket clients, invalidate caches, etc.):
+`updates()` returns the current projection state together with a stream of every state that follows, captured atomically so no update is lost or duplicated across the boundary. Events applied before the call (including the whole catch-up phase) are folded into the returned snapshot; the stream carries only what comes after. Use it when you want to *react* to every update (push to WebSocket clients, invalidate caches, etc.):
 
 ```rust,ignore
-while let Some(projection) = subscription.next().await {
+let (initial, mut updates) = subscription.updates();
+render(&initial);
+while let Some(projection) = updates.next().await {
     broadcast_to_clients(&projection);
 }
 ```
 
-If you only need the *latest* state — the common case for guard reads and read-your-writes — call `current()` instead. It returns the live projection without draining the stream, so it composes with `wait_for` (see [Read-Your-Writes](#read-your-writes-consistency)):
+If you only need the *latest* state — the common case for guard reads and read-your-writes — call `current()` instead. It returns the live projection without subscribing to the stream, so a subscription used purely this way never queues updates. It composes with `wait_for` (see [Read-Your-Writes](#read-your-writes-consistency)):
 
 ```rust,ignore
 let dashboard = subscription.current();
@@ -65,7 +71,7 @@ let dashboard = subscription.current();
 
 ## Stopping a Subscription
 
-The `start()` method returns a `Subscription` stream. Call `stop()` for graceful shutdown:
+The `start()` method returns a `Subscription` handle. Call `stop()` for graceful shutdown:
 
 ```rust,ignore
 subscription.stop().await?;
@@ -80,12 +86,14 @@ By default, subscriptions don't persist snapshots. Use `subscribe_with_snapshots
 ```rust,ignore
 let snapshot_store = inmemory::Store::every(100);
 
-let mut subscription = repository
+let subscription = repository
     .subscribe_with_snapshots::<Dashboard>((), snapshot_store)
     .start()
     .await?;
 
-while let Some(dashboard) = subscription.next().await {
+let (dashboard, mut updates) = subscription.updates();
+println!("{dashboard:?}");
+while let Some(dashboard) = updates.next().await {
     println!("{dashboard:?}");
 }
 ```
@@ -164,12 +172,13 @@ A common pattern is to share projection state between the subscription and the c
 let live_state = Arc::new(Mutex::new(Dashboard::default()));
 let state_for_consumer = live_state.clone();
 
-let mut subscription = repository
+let subscription = repository
     .subscribe::<Dashboard>(())
     .start()
     .await?;
 
-while let Some(projection) = subscription.next().await {
+let (_, mut updates) = subscription.updates();
+while let Some(projection) = updates.next().await {
     *state_for_consumer.lock().unwrap() = projection;
 }
 

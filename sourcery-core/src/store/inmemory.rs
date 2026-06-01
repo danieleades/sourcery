@@ -12,7 +12,7 @@
 //! ```
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     pin::Pin,
     sync::{Arc, RwLock},
 };
@@ -31,6 +31,11 @@ use crate::{
 
 /// Event stream stored in memory with fixed position and data types.
 type InMemoryStream<Id, M> = Vec<StoredEvent<Id, u64, serde_json::Value, M>>;
+
+/// Capacity of the commit-notification broadcast channel. A subscriber that
+/// lags this far behind misses notifications but recovers on the next one,
+/// since each notification triggers a full re-drain past its cursor.
+const NOTIFY_CHANNEL_CAPACITY: usize = 1024;
 
 /// In-memory event store that keeps streams in a hash map.
 ///
@@ -66,7 +71,7 @@ impl<Id, M> Store<Id, M> {
     /// Event positions start at `0` and increase globally across all streams.
     #[must_use]
     pub fn new() -> Self {
-        let (notify_tx, _) = broadcast::channel(1024);
+        let (notify_tx, _) = broadcast::channel(NOTIFY_CHANNEL_CAPACITY);
         Self {
             inner: Arc::new(RwLock::new(Inner {
                 streams: HashMap::new(),
@@ -145,15 +150,8 @@ where
         Self::Metadata: Clone,
     {
         let result = (|| {
-            // Serialize all events first
-            let mut staged = Vec::with_capacity(events.len());
-            for (index, event) in events.iter().enumerate() {
-                let data = serde_json::to_value(event).map_err(|e| CommitError::Serialization {
-                    index,
-                    source: InMemoryError::Serialization(Box::new(e)),
-                })?;
-                staged.push((event.kind().to_string(), data));
-            }
+            let staged = stage_events(&events)
+                .map_err(|(index, source)| CommitError::Serialization { index, source })?;
 
             let mut inner = self.inner.write().expect("in-memory store lock poisoned");
             let (last_position, notify_tx) =
@@ -183,17 +181,9 @@ where
         Self::Metadata: Clone,
     {
         let result = (|| {
-            // Serialize all events first
-            let mut staged = Vec::with_capacity(events.len());
-            for (index, event) in events.iter().enumerate() {
-                let data = serde_json::to_value(event).map_err(|e| {
-                    OptimisticCommitError::Serialization {
-                        index,
-                        source: InMemoryError::Serialization(Box::new(e)),
-                    }
-                })?;
-                staged.push((event.kind().to_string(), data));
-            }
+            let staged = stage_events(&events).map_err(|(index, source)| {
+                OptimisticCommitError::Serialization { index, source }
+            })?;
 
             let mut inner = self.inner.write().expect("in-memory store lock poisoned");
             let stream_key = StreamKey::new(aggregate_kind, aggregate_id.clone());
@@ -318,24 +308,10 @@ where
 
             let mut last_position = from;
 
-            // 1. Catch-up: yield historical matching events, then the frontier.
-            let (historical, frontier) = drain();
-            for event in historical {
-                if let Some(ref lp) = last_position
-                    && event.position <= *lp
-                {
-                    continue;
-                }
-                last_position = Some(event.position);
-                let checkpoint = event.position;
-                yield Ok(Delivery::Event(Checkpointed { checkpoint, event }));
-            }
-            if let Some(frontier) = frontier {
-                yield Ok(Delivery::Frontier(frontier));
-            }
-
-            // 2. Live: drain matching events on each notification, then frontier.
-            while let Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) = rx.recv().await {
+            // First pass is catch-up (drains immediately); each later pass is
+            // live, woken by a commit notification. Dedup by `last_position`
+            // makes the two phases identical, so they share one loop body.
+            loop {
                 let (events, frontier) = drain();
                 for event in events {
                     if let Some(ref lp) = last_position
@@ -349,6 +325,13 @@ where
                 }
                 if let Some(frontier) = frontier {
                     yield Ok(Delivery::Frontier(frontier));
+                }
+
+                // Wait for the next commit, then loop to re-drain. A lagged
+                // receiver still triggers a drain (dedup absorbs any overlap);
+                // a closed channel ends the stream.
+                if rx.recv().await == Err(broadcast::error::RecvError::Closed) {
+                    break;
                 }
             }
         })
@@ -393,6 +376,23 @@ where
         };
         std::future::ready(Ok(checkpoint))
     }
+}
+
+/// Serialise events to `(kind, json)` pairs, reporting the offending index on
+/// failure so callers can build their commit-specific `Serialization` variant.
+fn stage_events<E>(
+    events: &NonEmpty<E>,
+) -> Result<Vec<(String, serde_json::Value)>, (usize, InMemoryError)>
+where
+    E: crate::event::EventKind + serde::Serialize,
+{
+    let mut staged = Vec::with_capacity(events.len());
+    for (index, event) in events.iter().enumerate() {
+        let data = serde_json::to_value(event)
+            .map_err(|e| (index, InMemoryError::Serialization(Box::new(e))))?;
+        staged.push((event.kind().to_string(), data));
+    }
+    Ok(staged)
 }
 
 /// Append a batch of pre-serialised events to the store, assigning positions.
@@ -443,75 +443,50 @@ where
     Id: Clone + Eq + std::hash::Hash,
     M: Clone,
 {
-    use std::collections::HashSet;
+    // An event is included when it satisfies *any* filter — the set-union
+    // semantics of the Postgres store's `UNION`. Keying by the globally unique
+    // position deduplicates events matched by several overlapping filters (e.g.
+    // a global `events()` filter and an aggregate-scoped `events_for()` filter
+    // on the same kind), and yields the result already sorted by position.
+    let mut matched: BTreeMap<u64, StoredEvent<Id, u64, serde_json::Value, M>> = BTreeMap::new();
 
-    let mut result = Vec::new();
-    // Tracks (stream, kind) pairs already satisfied by aggregate-scoped
-    // filters so we do not duplicate them when applying global kind filters.
-    let mut seen: HashSet<(StreamKey<Id>, String)> = HashSet::new();
-
-    // Split filters into:
-    // - aggregate scoped: (aggregate_kind, aggregate_id) -> {event_kind -> after}
-    // - global kind scoped: event_kind -> after
-    let mut all_kinds: HashMap<String, Option<u64>> = HashMap::new();
-    let mut by_aggregate: HashMap<StreamKey<Id>, HashMap<String, Option<u64>>> = HashMap::new();
-
-    for filter in filters {
-        if let (Some(kind), Some(id)) = (&filter.aggregate_kind, &filter.aggregate_id) {
-            by_aggregate
-                .entry(StreamKey::new(kind.clone(), id.clone()))
-                .or_default()
-                .insert(filter.event_kind.clone(), filter.after_position);
-        } else {
-            all_kinds.insert(filter.event_kind.clone(), filter.after_position);
-        }
-    }
-
-    let passes_position_filter =
-        |event: &StoredEvent<Id, u64, serde_json::Value, M>, after_position: Option<u64>| -> bool {
-            after_position.is_none_or(|after| event.position > after)
-        };
-
-    // Apply aggregate-specific filters first. These are more precise and take
-    // precedence over global filters for the same (stream, event kind).
-    for (stream_key, kinds) in &by_aggregate {
-        if let Some(stream) = inner.streams.get(stream_key) {
-            for event in stream {
-                if let Some(&after_pos) = kinds.get(&event.kind)
-                    && passes_position_filter(event, after_pos)
-                {
-                    seen.insert((
-                        StreamKey::new(event.aggregate_kind.clone(), event.aggregate_id.clone()),
-                        event.kind.clone(),
-                    ));
-                    result.push(event.clone());
-                }
+    for stream in inner.streams.values() {
+        for event in stream {
+            if !matched.contains_key(&event.position)
+                && filters.iter().any(|filter| filter_matches(filter, event))
+            {
+                matched.insert(event.position, event.clone());
             }
         }
     }
 
-    // Then apply global kind filters, skipping events already included by the
-    // aggregate-specific pass above.
-    if !all_kinds.is_empty() {
-        for stream in inner.streams.values() {
-            for event in stream {
-                if let Some(&after_pos) = all_kinds.get(&event.kind)
-                    && passes_position_filter(event, after_pos)
-                {
-                    let key = (
-                        StreamKey::new(event.aggregate_kind.clone(), event.aggregate_id.clone()),
-                        event.kind.clone(),
-                    );
-                    if !seen.contains(&key) {
-                        result.push(event.clone());
-                    }
-                }
-            }
-        }
-    }
+    matched.into_values().collect()
+}
 
-    result.sort_by_key(|event| event.position);
-    result
+/// Whether `event` satisfies `filter`: the event kind must match, any present
+/// aggregate scope must match, and the position must be past `after_position`.
+///
+/// Mirrors the per-filter `WHERE` clause built by the Postgres store, so both
+/// stores agree on which events a filter set selects.
+fn filter_matches<Id, M>(
+    filter: &EventFilter<Id, u64>,
+    event: &StoredEvent<Id, u64, serde_json::Value, M>,
+) -> bool
+where
+    Id: Eq,
+{
+    filter.event_kind == event.kind
+        && filter
+            .aggregate_kind
+            .as_ref()
+            .is_none_or(|kind| *kind == event.aggregate_kind)
+        && filter
+            .aggregate_id
+            .as_ref()
+            .is_none_or(|id| *id == event.aggregate_id)
+        && filter
+            .after_position
+            .is_none_or(|after| event.position > after)
 }
 
 #[cfg(test)]

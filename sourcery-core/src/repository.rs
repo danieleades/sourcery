@@ -886,15 +886,40 @@ where
     {
         let total_events_since_snapshot = events.len() as u64;
         let prepared = self.snapshots.prepare_snapshot_from_new(&events);
-        self.persist_events::<A>(
-            id,
-            None,
-            total_events_since_snapshot,
-            events,
-            prepared,
-            metadata,
-        )
-        .await
+
+        // Creation is a store-level new-stream commit regardless of the
+        // repository's update concurrency strategy. A created stream must not
+        // already exist, and that guarantee must be atomic with the append: an
+        // `Unchecked` repository still gets last-writer-wins for *updates*, but
+        // never a racy double-create (two concurrent creates both appending).
+        // A conflict here therefore means the stream already exists.
+        let new_position = self
+            .store
+            .commit_events_optimistic::<A::Event>(A::KIND, id, None, events, metadata)
+            .await
+            .map_err(|error| match error {
+                OptimisticCommitError::Conflict(_) => {
+                    CommandError::Lifecycle(LifecycleError::AggregateAlreadyExists)
+                }
+                OptimisticCommitError::Store(err)
+                | OptimisticCommitError::Serialization { source: err, .. } => {
+                    CommandError::Store(err)
+                }
+            })?
+            .last_position;
+
+        self.snapshots
+            .offer_snapshot(
+                A::KIND,
+                id,
+                total_events_since_snapshot,
+                new_position.clone(),
+                prepared,
+            )
+            .await
+            .map_err(CommandError::Snapshot)?;
+
+        Ok(new_position)
     }
 
     /// Persist events produced by handling a command against an existing
@@ -982,18 +1007,6 @@ where
         M: SnapshotPolicy<S, A> + Sync,
         M::Prepared: Send,
     {
-        if self
-            .store
-            .stream_version(A::KIND, id)
-            .await
-            .map_err(CommandError::Store)?
-            .is_some()
-        {
-            return Err(CommandError::Lifecycle(
-                LifecycleError::AggregateAlreadyExists,
-            ));
-        }
-
         let new_events = <A as HandleCreate<Cmd>>::handle_create(command)
             .map_err(|error| CommandError::Aggregate(error.into()))?;
 
@@ -1001,6 +1014,10 @@ where
             return Ok(None);
         };
 
+        // No preflight existence check: `finalize_create` commits as a new
+        // stream and reports `AggregateAlreadyExists` atomically on conflict.
+        // The old `stream_version` preflight was a TOCTOU window that let two
+        // concurrent creates both succeed under `Unchecked`.
         self.finalize_create::<A>(id, events, metadata)
             .await
             .map(Some)
@@ -1279,14 +1296,18 @@ where
     /// # Example
     ///
     /// ```ignore
-    /// use tokio_stream::StreamExt as _;
+    /// use tokio_stream::StreamExt;
     ///
-    /// let mut subscription = repo
+    /// let subscription = repo
     ///     .subscribe::<Dashboard>(())
     ///     .start()
     ///     .await?;
     ///
-    /// while let Some(dashboard) = subscription.next().await {
+    /// // Current state plus a stream of every subsequent update, taken
+    /// // atomically so no update is missed across the boundary.
+    /// let (dashboard, mut updates) = subscription.updates();
+    /// println!("{dashboard:?}");
+    /// while let Some(dashboard) = updates.next().await {
     ///     println!("{dashboard:?}");
     /// }
     /// ```

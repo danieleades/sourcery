@@ -7,7 +7,7 @@ use sourcery::{
     Aggregate, Apply, ApplyProjection, Create, DomainEvent, Handle, HandleCreate, Projection,
     Repository, repository::CommandError, store::inmemory,
 };
-use tokio_stream::StreamExt as _;
+use tokio_stream::StreamExt;
 
 // ============================================================================
 // Test Domain
@@ -134,20 +134,19 @@ async fn add_item(repo: &Repository<inmemory::Store<String, ()>>, id: &str, name
 // ============================================================================
 
 #[tokio::test]
-async fn subscription_replays_historical_events() {
+async fn subscription_folds_historical_events_into_snapshot() {
     let store = inmemory::Store::new();
     let repo = Repository::new(store);
 
     add_item(&repo, "inv1", "apple").await;
     add_item(&repo, "inv1", "banana").await;
 
-    let mut subscription = repo.subscribe::<ItemCount>(()).start().await.unwrap();
+    let subscription = repo.subscribe::<ItemCount>(()).start().await.unwrap();
 
-    let first = subscription.next().await.unwrap();
-    let second = subscription.next().await.unwrap();
-
-    assert_eq!(first.count, 1);
-    assert_eq!(second.count, 2);
+    // Catch-up completes before `start()` returns, so the historical events are
+    // reflected in the snapshot rather than replayed through the stream.
+    let (snapshot, _stream) = subscription.updates();
+    assert_eq!(snapshot.count, 2);
 
     subscription.stop().await.unwrap();
 }
@@ -157,15 +156,17 @@ async fn subscription_receives_live_events() {
     let store = inmemory::Store::new();
     let repo = Repository::new(store);
 
-    let mut subscription = repo.subscribe::<ItemCount>(()).start().await.unwrap();
+    let subscription = repo.subscribe::<ItemCount>(()).start().await.unwrap();
+
+    // Subscribe before writing so live deltas are delivered to the stream.
+    let (snapshot, mut updates) = subscription.updates();
+    assert_eq!(snapshot.count, 0);
 
     add_item(&repo, "inv1", "cherry").await;
-    let first = subscription.next().await.unwrap();
-    assert_eq!(first.count, 1);
+    assert_eq!(updates.next().await.unwrap().count, 1);
 
     add_item(&repo, "inv1", "date").await;
-    let second = subscription.next().await.unwrap();
-    assert_eq!(second.count, 2);
+    assert_eq!(updates.next().await.unwrap().count, 2);
 
     subscription.stop().await.unwrap();
 }
@@ -177,14 +178,15 @@ async fn subscription_catches_up_then_receives_live() {
 
     add_item(&repo, "inv1", "historical").await;
 
-    let mut subscription = repo.subscribe::<ItemCount>(()).start().await.unwrap();
+    let subscription = repo.subscribe::<ItemCount>(()).start().await.unwrap();
 
-    let historical = subscription.next().await.unwrap();
-    assert_eq!(historical.count, 1);
+    // The historical event is in the snapshot; the stream carries only what
+    // follows the subscribe point.
+    let (snapshot, mut updates) = subscription.updates();
+    assert_eq!(snapshot.count, 1);
 
     add_item(&repo, "inv1", "live").await;
-    let live = subscription.next().await.unwrap();
-    assert_eq!(live.count, 2);
+    assert_eq!(updates.next().await.unwrap().count, 2);
 
     subscription.stop().await.unwrap();
 }
@@ -225,28 +227,28 @@ async fn subscription_with_snapshot_resumes() {
     let snapshots = SnapshotStore::<(), u64>::always();
 
     // First subscription: catches up and creates a snapshot on stop
-    let mut sub1 = repo
+    let sub1 = repo
         .subscribe_with_snapshots::<ItemCount, _>((), snapshots.clone())
         .start()
         .await
         .unwrap();
 
-    assert_eq!(sub1.next().await.unwrap().count, 1);
-    assert_eq!(sub1.next().await.unwrap().count, 2);
+    assert_eq!(sub1.current().count, 2);
     sub1.stop().await.unwrap();
 
     // Add more events
     add_item(&repo, "inv1", "c").await;
 
     // Second subscription: should resume from snapshot
-    let mut sub2 = repo
+    let sub2 = repo
         .subscribe_with_snapshots::<ItemCount, _>((), snapshots)
         .start()
         .await
         .unwrap();
 
-    // Should resume at snapshot and emit only the new event.
-    assert_eq!(sub2.next().await.unwrap().count, 3);
+    // Should resume at the snapshot baseline and fold the new event into the
+    // caught-up state.
+    assert_eq!(sub2.current().count, 3);
 
     sub2.stop().await.unwrap();
 }

@@ -11,8 +11,8 @@
 //! 1. Replays historical events (catch-up phase)
 //! 2. Transitions to processing live events as they are committed
 //! 3. Maintains the live projection, readable via
-//!    [`current`](Subscription::current), and also yields each update through a
-//!    stream
+//!    [`current`](Subscription::current), with each subsequent update available
+//!    through the opt-in stream from [`updates`](Subscription::updates)
 //!
 //! # Example
 //!
@@ -35,18 +35,13 @@
 //!
 //! [`Repository::load_projection`]: crate::repository::Repository::load_projection
 
-use std::{
-    collections::HashMap,
-    future::Future,
-    pin::Pin,
-    task::{Context, Poll},
-};
+use std::{collections::HashMap, future::Future, pin::Pin};
 
 use futures_core::Stream;
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
-use tokio::task::JoinHandle;
-use tokio_stream::StreamExt as _;
+use tokio::{sync::broadcast, task::JoinHandle};
+use tokio_stream::{StreamExt, wrappers::BroadcastStream};
 
 use crate::{
     event::EventDecodeError,
@@ -54,6 +49,12 @@ use crate::{
     snapshot::{Snapshot, SnapshotStore},
     store::{EventFilter, EventStore, StoredEvent},
 };
+
+/// Capacity of the per-subscription broadcast channel backing
+/// [`Subscription::updates`]. A consumer that falls this far behind skips the
+/// intervening states (and can resync via [`Subscription::current`]) rather
+/// than stalling the runtime.
+const UPDATES_CHANNEL_CAPACITY: usize = 1024;
 
 /// A stored event paired with the [`Checkpoint`](SubscribableStore::Checkpoint)
 /// that marks its place in the commit-ordered delivery stream.
@@ -121,7 +122,7 @@ pub enum Delivery<S: SubscribableStore + ?Sized> {
 /// models
 /// (see [`Repository::subscribe`](crate::repository::Repository::subscribe)),
 /// which are the only place the eventual-consistency window is observable.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ConsistencyToken<C>(C);
 
 impl<C> ConsistencyToken<C> {
@@ -353,18 +354,29 @@ where
     }
 }
 
-/// Stream-first subscription handle that yields projection snapshots.
+/// A running subscription: a live read model plus an opt-in stream of updates.
 ///
-/// Each `Stream` item is the projection state after one event has been applied.
-/// Consume updates with `StreamExt::next()`, and call [`stop()`] for graceful
-/// shutdown.
+/// Read the materialised state at any time with [`current`](Self::current), or
+/// await a write with [`wait_for`](Self::wait_for) /
+/// [`read_after`](Self::read_after). For reactive consumers,
+/// [`updates`](Self::updates) hands back the current snapshot together with a
+/// [`Stream`] of every subsequent state, taken atomically so no update is lost
+/// or duplicated across the boundary. Call [`stop()`] for graceful shutdown.
 ///
 /// [`stop()`]: Self::stop
 pub struct Subscription<P, Cp, StoreError>
 where
     StoreError: std::error::Error + 'static,
 {
-    updates: tokio::sync::mpsc::UnboundedReceiver<P>,
+    /// Broadcasts each applied projection state to live [`updates`] streams.
+    /// The runtime only sends when there is at least one receiver, so a
+    /// subscription used purely for [`current`]/[`wait_for`] never queues
+    /// anything.
+    ///
+    /// [`updates`]: Self::updates
+    /// [`current`]: Self::current
+    /// [`wait_for`]: Self::wait_for
+    updates_tx: broadcast::Sender<P>,
     /// Latest checkpoint the runtime has processed (`None` until the first
     /// event). Drives [`processed`](Self::processed) and
     /// [`wait_for`](Self::wait_for); closes when the runtime task ends.
@@ -372,7 +384,7 @@ where
     /// Latest projection state the runtime has applied. Seeded with the resume
     /// baseline and republished after every event, so
     /// [`current`](Self::current) reads the live read model without
-    /// draining the update stream.
+    /// subscribing to the update stream.
     ///
     /// A plain `Arc<Mutex<P>>` rather than a `watch` channel: the latter's
     /// `Receiver<P>` would require `P: Sync` for the subscription to stay
@@ -442,6 +454,42 @@ where
             .clone()
     }
 
+    /// Subscribe to live projection updates, returning the current state and a
+    /// [`Stream`] of every state that follows.
+    ///
+    /// The snapshot and the stream are taken atomically: every event is on
+    /// exactly one side of the boundary — folded into the returned snapshot, or
+    /// yielded by the stream — so none is lost or duplicated. This avoids the
+    /// snapshot-then-subscribe race of reading [`current`](Self::current) and
+    /// subscribing separately. Events processed before this call (including the
+    /// catch-up phase) are reflected in the snapshot, not replayed through the
+    /// stream.
+    ///
+    /// Each stream item is the projection state after one event. A consumer
+    /// that falls behind the channel's capacity skips the intervening states
+    /// rather than blocking the runtime; call [`current`](Self::current) to
+    /// resynchronise. Ignore the snapshot (`let (_, stream) = sub.updates();`)
+    /// for a pure live-delta stream.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the background task panicked while updating the
+    /// projection (poisoning the internal mutex); a healthy subscription never
+    /// panics here.
+    pub fn updates(&self) -> (P, impl Stream<Item = P> + Send + 'static)
+    where
+        P: Clone + Send + 'static,
+    {
+        // Subscribe and snapshot under the same lock the runtime holds when it
+        // republishes state and broadcasts (see `handle_delivery`), so the
+        // snapshot/stream boundary is exact: an event folded into `snapshot`
+        // was broadcast before this `subscribe`, and any later event is
+        // delivered by the returned stream.
+        let guard = self.current.lock().expect("projection mutex poisoned");
+        let stream = BroadcastStream::new(self.updates_tx.subscribe()).filter_map(Result::ok);
+        (guard.clone(), stream)
+    }
+
     /// Wait for `token`, then return the latest projection state.
     ///
     /// This is the convenience read-your-writes path for subscription-fed read
@@ -509,17 +557,6 @@ where
             .await
             .map(|_| ())
             .map_err(|_| AwaitError::SubscriptionStopped)
-    }
-}
-
-impl<P, Cp, StoreError> Stream for Subscription<P, Cp, StoreError>
-where
-    StoreError: std::error::Error + 'static,
-{
-    type Item = P;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.updates.poll_recv(cx)
     }
 }
 
@@ -596,7 +633,11 @@ where
             instance_id,
         } = self;
 
-        let (update_tx, update_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Opt-in live update channel. The initial receiver is dropped: the
+        // runtime only broadcasts when a consumer has subscribed via
+        // `Subscription::updates`, so a subscription used purely for
+        // `current()`/`wait_for()` never clones or queues a single state.
+        let (updates_tx, _) = broadcast::channel(UPDATES_CHANNEL_CAPACITY);
 
         // Resume from the persisted checkpoint, if any.
         let (projection, from_checkpoint) = load_snapshot::<P, SS>(&snapshots, &instance_id).await;
@@ -635,7 +676,7 @@ where
             instance_id,
             handlers,
             projection,
-            update_tx,
+            updates_tx: updates_tx.clone(),
             progress_tx,
             current: std::sync::Arc::clone(&current),
             catchup_target,
@@ -659,7 +700,7 @@ where
 
         match ready_rx.await {
             Ok(()) => Ok(Subscription {
-                updates: update_rx,
+                updates_tx,
                 progress: progress_rx,
                 current,
                 handle: SubscriptionHandle {
@@ -693,7 +734,7 @@ where
     instance_id: P::InstanceId,
     handlers: HashMap<&'static str, crate::projection::EventHandler<P, S>>,
     projection: P,
-    update_tx: tokio::sync::mpsc::UnboundedSender<P>,
+    updates_tx: broadcast::Sender<P>,
     progress_tx: tokio::sync::watch::Sender<Option<S::Checkpoint>>,
     current: std::sync::Arc<std::sync::Mutex<P>>,
     catchup_target: Option<S::Checkpoint>,
@@ -790,14 +831,26 @@ where
                     delivery,
                     &self.handlers,
                     store,
-                    &self.update_tx,
                     &mut self.last_checkpoint,
                     &mut self.events_since_snapshot,
                 )?;
-                // Publish the new state for `current()`. Done before advancing
-                // progress (below) so a `wait_for` waiter that wakes on the
-                // checkpoint always observes a `current()` that includes it.
-                *self.current.lock().expect("projection mutex poisoned") = self.projection.clone();
+                // Publish the new state and broadcast it under one lock. Holding
+                // the lock across both makes `updates()` (which subscribes and
+                // snapshots under the same lock) see an exact boundary, and
+                // doing it before advancing progress (below) ensures a
+                // `wait_for` waiter that wakes on the checkpoint always observes
+                // a `current()` that includes it. The broadcast is skipped when
+                // no consumer is subscribed, so a `current()`-only subscription
+                // never clones state for the stream.
+                {
+                    let mut current = self.current.lock().expect("projection mutex poisoned");
+                    *current = self.projection.clone();
+                    if self.updates_tx.receiver_count() > 0 {
+                        // Clone through the guard so the broadcast provably
+                        // happens under the same lock `updates()` holds.
+                        let _ = self.updates_tx.send(current.clone());
+                    }
+                }
                 checkpoint
             }
         };
@@ -904,19 +957,21 @@ where
     .map_err(|error| SubscriptionError::EventDecode(error.into_decode_error()))
 }
 
-/// Process one event through handler dispatch, checkpoint tracking, and update
-/// emission.
+/// Process one event through handler dispatch and checkpoint tracking.
+///
+/// Publishing the new state (to `current()` and the live update stream) is the
+/// caller's responsibility, so it can do so atomically under the projection
+/// lock.
 fn process_subscription_event<P, S>(
     projection: &mut P,
     delivery: Checkpointed<S>,
     handlers: &HashMap<&'static str, crate::projection::EventHandler<P, S>>,
     store: &S,
-    updates_tx: &tokio::sync::mpsc::UnboundedSender<P>,
     last_checkpoint: &mut Option<S::Checkpoint>,
     events_since_snapshot: &mut u64,
 ) -> Result<(), SubscriptionError<S::Error>>
 where
-    P: Projection<Id = S::Id> + Clone,
+    P: Projection<Id = S::Id>,
     S: SubscribableStore,
 {
     let Checkpointed { checkpoint, event } = delivery;
@@ -929,8 +984,6 @@ where
 
     *last_checkpoint = Some(checkpoint);
     *events_since_snapshot += 1;
-
-    let _ = updates_tx.send(projection.clone());
 
     Ok(())
 }

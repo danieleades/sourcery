@@ -18,10 +18,10 @@ use sourcery_postgres::{
     subscription::{CheckpointStore, Watermark},
 };
 use sqlx::PgPool;
-use testcontainers::{ContainerAsync, ImageExt as _, runners::AsyncRunner};
+use testcontainers::{ContainerAsync, ImageExt, runners::AsyncRunner};
 use testcontainers_modules::postgres::Postgres;
 use tokio::time::timeout;
-use tokio_stream::StreamExt as _;
+use tokio_stream::StreamExt;
 use uuid::Uuid;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
