@@ -548,11 +548,11 @@ impl SabotageStore {
 }
 
 impl EventStore for SabotageStore {
-    type Id = String;
-    type Position = u64;
-    type Error = inmemory::InMemoryError;
-    type Metadata = ();
     type Data = JsonValue;
+    type Error = inmemory::InMemoryError;
+    type Id = String;
+    type Metadata = ();
+    type Position = u64;
 
     fn decode_event<E>(
         &self,
