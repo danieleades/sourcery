@@ -636,6 +636,71 @@ async fn reactor_handle_reports_liveness_and_progress() {
     reactor.stop().await.unwrap();
 }
 
+/// A reactor that uses [`ReactFilters::events_for`] to subscribe to every event
+/// kind emitted by a specific aggregate instance rather than a single event
+/// type.
+#[derive(Clone)]
+struct AllEventsReactor {
+    count: Arc<Mutex<usize>>,
+    source_id: String,
+}
+
+impl Reactor for AllEventsReactor {
+    type Id = String;
+    type Metadata = ();
+
+    const KIND: &'static str = "all-events-reactor";
+
+    fn filters<S>(&self) -> ReactFilters<S, Self>
+    where
+        S: sourcery::store::EventStore<Id = Self::Id, Metadata = Self::Metadata>,
+    {
+        ReactFilters::new().events_for::<Inventory>(&self.source_id)
+    }
+}
+
+impl React<<Inventory as Aggregate>::Event> for AllEventsReactor {
+    fn react(
+        &self,
+        _ctx: EventContext<'_, Self::Id, Self::Metadata>,
+        _event: &<Inventory as Aggregate>::Event,
+    ) -> impl Future<Output = Result<(), ReactError>> + Send {
+        let count = Arc::clone(&self.count);
+        async move {
+            *count.lock().expect("lock") += 1;
+            Ok(())
+        }
+    }
+}
+
+#[tokio::test]
+async fn reactor_events_for_delivers_all_aggregate_events() {
+    // `events_for` subscribes to the full projection-event sum type for a
+    // specific aggregate instance — verify that historical events arrive and are
+    // correctly decoded through the ProjectionEvent dispatch path.
+    let store = inmemory::Store::new();
+    let repo = Repository::new(store);
+    add_item(&repo, "inv1", "apple").await;
+    add_item(&repo, "inv1", "banana").await;
+
+    let count = Arc::new(Mutex::new(0usize));
+    let reactor = repo
+        .react(AllEventsReactor {
+            count: Arc::clone(&count),
+            source_id: "inv1".to_string(),
+        })
+        .start()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        *count.lock().expect("lock"),
+        2,
+        "events_for must deliver all historical events for the given aggregate instance"
+    );
+    reactor.stop().await.unwrap();
+}
+
 #[tokio::test]
 async fn reactor_stops_cleanly_during_retry_sleep() {
     let store = inmemory::Store::new();
