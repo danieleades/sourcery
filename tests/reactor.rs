@@ -12,7 +12,9 @@ use std::{
 use serde::{Deserialize, Serialize};
 use sourcery::{
     Aggregate, Apply, Create, DomainEvent, EventContext, Handle, HandleCreate, React, ReactError,
-    ReactFilters, Reactor, ReactorError, Repository, RetryPolicy, repository::CommandError,
+    ReactFilters, Reactor, ReactorError, Repository, RetryPolicy,
+    repository::CommandError,
+    snapshot::{OfferSnapshotError, Snapshot, SnapshotOffer, SnapshotStore},
     store::inmemory,
 };
 
@@ -532,4 +534,89 @@ async fn reactor_issues_commands_in_reaction_to_events() {
     assert_eq!(mirror.count, 2);
 
     reactor.stop().await.unwrap();
+}
+
+/// Checkpoint store that always returns an error on `load`.
+struct UnreachableCheckpointStore;
+
+impl SnapshotStore<String> for UnreachableCheckpointStore {
+    type Error = io::Error;
+    type Position = u64;
+
+    fn load<T>(
+        &self,
+        _kind: &str,
+        _id: &String,
+    ) -> impl std::future::Future<Output = Result<Option<Snapshot<Self::Position, T>>, Self::Error>> + Send
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        async { Err(io::Error::other("checkpoint store unreachable")) }
+    }
+
+    fn offer_snapshot<CE, T, Create>(
+        &self,
+        _kind: &str,
+        _id: &String,
+        _events_since_last_snapshot: u64,
+        _create_snapshot: Create,
+    ) -> impl std::future::Future<
+        Output = Result<SnapshotOffer, OfferSnapshotError<Self::Error, CE>>,
+    > + Send
+    where
+        CE: std::error::Error + Send + Sync + 'static,
+        T: Serialize,
+        Create: FnOnce() -> Result<Snapshot<Self::Position, T>, CE> + Send,
+    {
+        async { Ok(SnapshotOffer::Declined) }
+    }
+}
+
+#[tokio::test]
+async fn reactor_checkpoint_load_failure_surfaces_as_checkpoint_error() {
+    let store = inmemory::Store::new();
+    let repo = Repository::new(store);
+
+    let result = repo
+        .react(RecordingReactor::new(Arc::new(Mutex::new(Vec::new()))))
+        .with_checkpoints(UnreachableCheckpointStore)
+        .start()
+        .await;
+
+    assert!(
+        matches!(result, Err(ReactorError::Checkpoint(_))),
+        "a failing checkpoint store should surface as ReactorError::Checkpoint"
+    );
+}
+
+#[tokio::test]
+async fn reactor_stops_cleanly_during_retry_sleep() {
+    let store = inmemory::Store::new();
+    let repo = Repository::new(store);
+
+    // Start on an empty store so there are no historical events to process.
+    let reactor = repo
+        .react(AlwaysFailsReactor { fatal: false })
+        .with_retry(RetryPolicy::exponential(
+            Duration::from_millis(200),
+            Duration::from_millis(200),
+            None,
+        ))
+        .start()
+        .await
+        .unwrap();
+
+    // A live event triggers the retry loop; the reactor will sleep 200 ms
+    // between retries. Stopping before the sleep expires should interrupt it
+    // cleanly (via the biased select! on stop_rx) and return Ok.
+    add_item(&repo, "inv1", "apple").await;
+    tokio::task::yield_now().await;
+
+    let result = tokio::time::timeout(Duration::from_secs(5), reactor.stop()).await;
+    assert!(
+        result
+            .expect("reactor.stop() must complete within timeout")
+            .is_ok(),
+        "stopping a retrying reactor should succeed, not propagate the retry error"
+    );
 }
