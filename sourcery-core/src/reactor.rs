@@ -717,21 +717,15 @@ mod tests {
 
     #[test]
     fn retry_policy_delay_starts_at_initial() {
-        let policy = RetryPolicy::exponential(
-            Duration::from_millis(10),
-            Duration::from_secs(1),
-            None,
-        );
+        let policy =
+            RetryPolicy::exponential(Duration::from_millis(10), Duration::from_secs(1), None);
         assert_eq!(policy.next_delay(0), Duration::from_millis(10));
     }
 
     #[test]
     fn retry_policy_delay_doubles_each_step() {
-        let policy = RetryPolicy::exponential(
-            Duration::from_millis(10),
-            Duration::from_secs(1),
-            None,
-        );
+        let policy =
+            RetryPolicy::exponential(Duration::from_millis(10), Duration::from_secs(1), None);
         assert_eq!(policy.next_delay(1), Duration::from_millis(20));
         assert_eq!(policy.next_delay(2), Duration::from_millis(40));
         assert_eq!(policy.next_delay(3), Duration::from_millis(80));
@@ -739,11 +733,8 @@ mod tests {
 
     #[test]
     fn retry_policy_delay_saturates_at_max() {
-        let policy = RetryPolicy::exponential(
-            Duration::from_millis(10),
-            Duration::from_millis(50),
-            None,
-        );
+        let policy =
+            RetryPolicy::exponential(Duration::from_millis(10), Duration::from_millis(50), None);
         // 10ms * 8 = 80ms > 50ms cap
         assert_eq!(policy.next_delay(3), Duration::from_millis(50));
         assert_eq!(policy.next_delay(100), Duration::from_millis(50));
@@ -751,11 +742,8 @@ mod tests {
 
     #[test]
     fn retry_policy_large_index_no_overflow() {
-        let policy = RetryPolicy::exponential(
-            Duration::from_millis(10),
-            Duration::from_secs(5),
-            None,
-        );
+        let policy =
+            RetryPolicy::exponential(Duration::from_millis(10), Duration::from_secs(5), None);
         // Both very large indices should saturate silently rather than panicking.
         let _ = policy.next_delay(64);
         let _ = policy.next_delay(usize::MAX);
@@ -833,5 +821,4 @@ mod tests {
         let result = load_checkpoint::<_, i64, io::Error>(&store, "MyReactor", &id).await;
         assert_eq!(result.unwrap(), None);
     }
-
 }
