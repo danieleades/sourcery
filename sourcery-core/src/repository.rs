@@ -1746,4 +1746,35 @@ mod tests {
         assert!(msg.contains("concurrency conflict"));
         assert!(error.source().is_none());
     }
+
+    #[test]
+    fn lifecycle_error_aggregate_not_found_displays() {
+        let err = LifecycleError::AggregateNotFound;
+        assert_eq!(err.to_string(), "aggregate not found");
+    }
+
+    #[test]
+    fn lifecycle_error_aggregate_already_exists_displays() {
+        let err = LifecycleError::AggregateAlreadyExists;
+        assert_eq!(err.to_string(), "aggregate already exists");
+    }
+
+    #[test]
+    fn command_error_lifecycle_propagates_inner_message() {
+        // #[error(transparent)] means the outer message equals the inner one.
+        let inner = LifecycleError::AggregateNotFound;
+        let error: CommandError<String, Infallible, io::Error, Infallible> =
+            CommandError::Lifecycle(inner);
+        assert_eq!(error.to_string(), inner.to_string());
+    }
+
+    #[test]
+    fn command_error_projection_has_source() {
+        let error: CommandError<String, Infallible, io::Error, Infallible> =
+            CommandError::Projection(crate::projection::ProjectionError::Store(io::Error::other(
+                "store error",
+            )));
+        assert!(error.to_string().contains("rebuild aggregate"));
+        assert!(error.source().is_some());
+    }
 }

@@ -590,6 +590,53 @@ async fn reactor_checkpoint_load_failure_surfaces_as_checkpoint_error() {
 }
 
 #[tokio::test]
+async fn reactor_handle_reports_liveness_and_progress() {
+    // `is_running()` and `processed()` are the observable state API on a live
+    // reactor handle; verify their semantics before and after handling an event.
+    let store = inmemory::Store::new();
+    let repo = Repository::new(store);
+    let seen = Arc::new(Mutex::new(Vec::new()));
+
+    let reactor = repo
+        .react(RecordingReactor::new(Arc::clone(&seen)))
+        .start()
+        .await
+        .unwrap();
+
+    // Reactor just started on an empty store — no events processed yet.
+    assert!(reactor.is_running(), "reactor must be running after start");
+    assert!(
+        reactor.processed().is_none(),
+        "processed must be None before the first event"
+    );
+
+    let token = repo
+        .create_tracked::<Inventory, AddItem>(
+            &"inv1".to_string(),
+            &AddItem {
+                name: "fig".to_string(),
+            },
+            &(),
+        )
+        .await
+        .unwrap()
+        .expect("token");
+
+    tokio::time::timeout(Duration::from_secs(5), reactor.wait_for(token))
+        .await
+        .expect("reactor wait_for must not hang")
+        .expect("reactor reached token");
+
+    assert!(
+        reactor.processed().is_some(),
+        "processed must advance after an event is handled"
+    );
+    assert!(reactor.is_running(), "reactor must still be running");
+
+    reactor.stop().await.unwrap();
+}
+
+#[tokio::test]
 async fn reactor_stops_cleanly_during_retry_sleep() {
     let store = inmemory::Store::new();
     let repo = Repository::new(store);

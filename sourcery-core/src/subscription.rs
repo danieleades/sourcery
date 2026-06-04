@@ -1162,4 +1162,24 @@ mod tests {
         };
         assert!(!handle.is_running());
     }
+
+    #[test]
+    fn runner_error_event_decode_has_source() {
+        let inner = crate::event::EventDecodeError::Store(io::Error::other("bad bytes"));
+        let err: RunnerError<io::Error> = RunnerError::EventDecode(inner);
+        assert!(err.to_string().contains("decode event"));
+        assert!(err.source().is_some());
+    }
+
+    #[test]
+    fn runner_error_catchup_interrupted_displays() {
+        let err: RunnerError<io::Error> = RunnerError::CatchupInterrupted;
+        assert!(err.to_string().contains("catch-up"));
+    }
+
+    #[test]
+    fn await_error_subscription_stopped_displays() {
+        let err = AwaitError::SubscriptionStopped;
+        assert!(err.to_string().contains("stopped"));
+    }
 }

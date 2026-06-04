@@ -820,4 +820,41 @@ mod tests {
         let result = load_checkpoint::<_, i64, io::Error>(&store, "MyReactor", &id).await;
         assert_eq!(result.unwrap(), None);
     }
+
+    #[tokio::test]
+    async fn offer_checkpoint_stores_position_when_accepted() {
+        // When the store accepts the offer, offer_checkpoint returns true so
+        // the caller resets its pending-event counter — the mechanism that
+        // prevents unbounded accumulation between checkpoints.
+        let store = crate::snapshot::inmemory::Store::<i64>::always();
+        let id = "r1".to_string();
+        let result = offer_checkpoint::<_, io::Error>(&store, "MyReactor", &id, 1, &42_i64).await;
+        assert_eq!(result.unwrap(), true);
+    }
+
+    #[tokio::test]
+    async fn offer_checkpoint_returns_false_when_store_declines() {
+        // When the store declines (e.g. a batching policy), offer_checkpoint
+        // returns false so the caller keeps accumulating the pending-event count
+        // toward the next policy threshold.
+        let store = NoSnapshots::<i64>::new();
+        let id = "r1".to_string();
+        let result = offer_checkpoint::<_, io::Error>(&store, "MyReactor", &id, 1, &42_i64).await;
+        assert_eq!(result.unwrap(), false);
+    }
+
+    #[tokio::test]
+    async fn load_checkpoint_returns_stored_position() {
+        // After a checkpoint is durably written, resuming a reactor must load
+        // that exact position rather than replaying from the beginning.
+        let store = crate::snapshot::inmemory::Store::<i64>::always();
+        let id = "r1".to_string();
+        offer_checkpoint::<_, io::Error>(&store, "MyReactor", &id, 1, &99_i64)
+            .await
+            .unwrap();
+        let loaded = load_checkpoint::<_, i64, io::Error>(&store, "MyReactor", &id)
+            .await
+            .unwrap();
+        assert_eq!(loaded, Some(99_i64));
+    }
 }
