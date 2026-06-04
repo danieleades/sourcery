@@ -515,3 +515,21 @@ where
     M: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
 }
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error as StdError;
+
+    use super::Error;
+
+    #[test]
+    fn key_decode_error_includes_raw_value_in_display() {
+        let err = Error::KeyDecode {
+            raw: "not-a-valid-id".to_string(),
+            source: "bad format".into(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("not-a-valid-id"));
+        assert!(err.source().is_some());
+    }
+}

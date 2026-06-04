@@ -704,3 +704,134 @@ where
         Err(error) => Err(ReactorError::Checkpoint(Box::new(error))),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{error::Error, io, time::Duration};
+
+    use super::*;
+    use crate::snapshot::NoSnapshots;
+    use crate::subscription::RunnerError;
+
+    // --- RetryPolicy ---
+
+    #[test]
+    fn retry_policy_delay_starts_at_initial() {
+        let policy = RetryPolicy::exponential(
+            Duration::from_millis(10),
+            Duration::from_secs(1),
+            None,
+        );
+        assert_eq!(policy.next_delay(0), Duration::from_millis(10));
+    }
+
+    #[test]
+    fn retry_policy_delay_doubles_each_step() {
+        let policy = RetryPolicy::exponential(
+            Duration::from_millis(10),
+            Duration::from_secs(1),
+            None,
+        );
+        assert_eq!(policy.next_delay(1), Duration::from_millis(20));
+        assert_eq!(policy.next_delay(2), Duration::from_millis(40));
+        assert_eq!(policy.next_delay(3), Duration::from_millis(80));
+    }
+
+    #[test]
+    fn retry_policy_delay_saturates_at_max() {
+        let policy = RetryPolicy::exponential(
+            Duration::from_millis(10),
+            Duration::from_millis(50),
+            None,
+        );
+        // 10ms * 8 = 80ms > 50ms cap
+        assert_eq!(policy.next_delay(3), Duration::from_millis(50));
+        assert_eq!(policy.next_delay(100), Duration::from_millis(50));
+    }
+
+    #[test]
+    fn retry_policy_large_index_no_overflow() {
+        let policy = RetryPolicy::exponential(
+            Duration::from_millis(10),
+            Duration::from_secs(5),
+            None,
+        );
+        // Both very large indices should saturate silently rather than panicking.
+        let _ = policy.next_delay(64);
+        let _ = policy.next_delay(usize::MAX);
+    }
+
+    #[test]
+    fn retry_policy_default_has_sane_bounds() {
+        let policy = RetryPolicy::default();
+        // First retry should be short; after many retries it must cap.
+        assert!(policy.next_delay(0) < Duration::from_secs(1));
+        assert_eq!(policy.next_delay(usize::MAX), policy.max_delay);
+    }
+
+    // --- ReactError ---
+
+    #[test]
+    fn react_error_retry_display_mentions_retryable() {
+        let err = ReactError::retry(io::Error::other("transient failure"));
+        assert!(err.to_string().contains("retryable"));
+        assert!(err.source().is_some());
+    }
+
+    #[test]
+    fn react_error_fatal_display_mentions_fatal() {
+        let err = ReactError::fatal(io::Error::other("permanent failure"));
+        assert!(err.to_string().contains("fatal"));
+        assert!(err.source().is_some());
+    }
+
+    // --- ReactorError ---
+
+    #[test]
+    fn reactor_error_checkpoint_has_source() {
+        let err: ReactorError<io::Error> =
+            ReactorError::Checkpoint(Box::new(io::Error::other("db unavailable")));
+        assert!(err.to_string().contains("checkpoint"));
+        assert!(err.source().is_some());
+    }
+
+    #[test]
+    fn reactor_error_reaction_has_source() {
+        let err: ReactorError<io::Error> =
+            ReactorError::Reaction(Box::new(io::Error::other("side-effect failed")));
+        assert!(err.to_string().contains("reaction failed"));
+        assert!(err.source().is_some());
+    }
+
+    #[test]
+    fn reactor_error_runner_displays_transparently() {
+        let inner: RunnerError<io::Error> = RunnerError::TaskPanicked;
+        let err: ReactorError<io::Error> = ReactorError::Runner(inner);
+        assert!(err.to_string().contains("panicked"));
+    }
+
+    // --- offer_checkpoint ---
+
+    #[tokio::test]
+    async fn offer_checkpoint_skips_store_when_no_events_processed() {
+        // A reactor that has not yet processed any events should never write a
+        // checkpoint — the position has not advanced.
+        let store: NoSnapshots<i64> = NoSnapshots::new();
+        let id = "reactor-instance".to_string();
+        let result = offer_checkpoint::<_, io::Error>(&store, "MyReactor", &id, 0, &42_i64).await;
+        assert_eq!(result.unwrap(), false);
+    }
+
+    // --- load_checkpoint ---
+
+    #[tokio::test]
+    async fn load_checkpoint_returns_none_for_fresh_reactor() {
+        // A brand-new reactor with no prior checkpoint should start from the
+        // beginning of the stream (None position).
+        let store: NoSnapshots<i64> = NoSnapshots::new();
+        let id = "reactor-instance".to_string();
+        let result = load_checkpoint::<_, i64, io::Error>(&store, "MyReactor", &id).await;
+        assert_eq!(result.unwrap(), None);
+    }
+
+}
