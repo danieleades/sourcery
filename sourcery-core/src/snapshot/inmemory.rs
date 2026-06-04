@@ -2,7 +2,6 @@
 
 use std::{
     collections::HashMap,
-    hash::Hash,
     sync::{Arc, RwLock},
 };
 
@@ -98,17 +97,27 @@ impl Error {
 }
 
 /// Inner map type: one snapshot per (`kind`, `id`) pair.
-type SnapshotMap<Id, Pos> = HashMap<SnapshotKey<Id>, Snapshot<Pos, serde_json::Value>>;
+type SnapshotMap<Pos> = HashMap<SnapshotKey, Snapshot<Pos, serde_json::Value>>;
 /// Thread-safe shared handle to the snapshot map.
-type SharedSnapshots<Id, Pos> = Arc<RwLock<SnapshotMap<Id, Pos>>>;
+type SharedSnapshots<Pos> = Arc<RwLock<SnapshotMap<Pos>>>;
 
 /// In-memory snapshot store with configurable policy.
 ///
 /// This is a reference implementation suitable for testing and development.
 /// Production systems should implement [`SnapshotStore`] with durable storage.
 ///
-/// Keys are derived from `(kind, id)` directly, so `Id: Eq + Hash + Clone` is
-/// required for this store.
+/// Keys are the serde-serialised form of `(kind, id)`, so this single store
+/// type serves *any* `Id: Serialize` — including `()` for singleton projections
+/// — and one instance can hold snapshots keyed by several different id types at
+/// once. This matches the Postgres snapshot/checkpoint stores, whose `TEXT` key
+/// column is likewise written from a serialised id.
+///
+/// Id types used as keys must serialise **deterministically and injectively**:
+/// equal ids must produce one stable string and distinct ids distinct strings.
+/// This holds for all ordinary id types (newtypes over
+/// `String`/`Uuid`/integers, tuples, `Vec`, structs, enums, `BTreeMap`). Avoid
+/// `HashMap`/`HashSet` fields (iteration order is unstable) and lossy
+/// `#[serde(skip)]` in an id.
 ///
 /// Generic over `Pos` to match the `EventStore` position type.
 ///
@@ -121,12 +130,12 @@ type SharedSnapshots<Id, Pos> = Arc<RwLock<SnapshotMap<Id, Pos>>>;
 ///     .with_snapshots(snapshot::inmemory::Store::every(100));
 /// ```
 #[derive(Clone, Debug)]
-pub struct Store<Id, Pos> {
-    snapshots: SharedSnapshots<Id, Pos>,
+pub struct Store<Pos> {
+    snapshots: SharedSnapshots<Pos>,
     policy: SnapshotPolicy,
 }
 
-impl<Id, Pos> Store<Id, Pos> {
+impl<Pos> Store<Pos> {
     /// Create a snapshot store that saves after every command.
     ///
     /// Best for aggregates with expensive replay or many events.
@@ -166,15 +175,15 @@ impl<Id, Pos> Store<Id, Pos> {
     }
 }
 
-impl<Id, Pos> Default for Store<Id, Pos> {
+impl<Pos> Default for Store<Pos> {
     fn default() -> Self {
         Self::always()
     }
 }
 
-impl<Id, Pos> SnapshotStore<Id> for Store<Id, Pos>
+impl<Id, Pos> SnapshotStore<Id> for Store<Pos>
 where
-    Id: Clone + Eq + Hash + Send + Sync,
+    Id: Serialize + Send + Sync,
     Pos: Clone + Ord + Send + Sync,
 {
     type Error = Error;
@@ -185,15 +194,14 @@ where
     where
         T: DeserializeOwned,
     {
-        let key = SnapshotKey::new(kind, id.clone());
+        let key = SnapshotKey::new(kind, id)?;
         let stored = {
             let snapshots = self.snapshots.read().expect("snapshot store lock poisoned");
             snapshots.get(&key).cloned()
         };
         let snapshot = match stored {
             Some(snapshot) => {
-                let data = serde_json::from_value(snapshot.data.clone())
-                    .map_err(Error::deserialization)?;
+                let data = serde_json::from_value(snapshot.data).map_err(Error::deserialization)?;
                 Some(Snapshot {
                     position: snapshot.position,
                     data,
@@ -228,7 +236,7 @@ where
         };
         let data = serde_json::to_value(&snapshot.data)
             .map_err(|e| OfferSnapshotError::Snapshot(Error::serialization(e)))?;
-        let key = SnapshotKey::new(kind, id.clone());
+        let key = SnapshotKey::new(kind, id).map_err(OfferSnapshotError::Snapshot)?;
         let stored = Snapshot {
             position: snapshot.position,
             data,
@@ -258,19 +266,25 @@ where
 }
 
 /// Hash-map key for snapshots partitioned by aggregate kind and ID.
+///
+/// The id is stored as its serde-serialised string form so the store is generic
+/// over any `Id: Serialize`.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
-struct SnapshotKey<Id> {
+struct SnapshotKey {
     kind: String,
-    id: Id,
+    id: String,
 }
 
-impl<Id> SnapshotKey<Id> {
-    /// Build a snapshot key from aggregate identity.
-    fn new(kind: &str, id: Id) -> Self {
-        Self {
+impl SnapshotKey {
+    /// Build a snapshot key from aggregate identity, serialising the id.
+    fn new<Id>(kind: &str, id: &Id) -> Result<Self, Error>
+    where
+        Id: Serialize,
+    {
+        Ok(Self {
             kind: kind.to_string(),
-            id,
-        }
+            id: serde_json::to_string(id).map_err(Error::serialization)?,
+        })
     }
 }
 
@@ -314,7 +328,7 @@ mod tests {
 
     #[tokio::test]
     async fn load_returns_none_for_missing() {
-        let store = Store::<String, u64>::always();
+        let store = Store::<u64>::always();
         let result: Option<Snapshot<u64, String>> =
             store.load("test", &"id".to_string()).await.unwrap();
         assert!(result.is_none());
@@ -322,7 +336,7 @@ mod tests {
 
     #[tokio::test]
     async fn load_returns_stored_snapshot() {
-        let store = Store::<String, u64>::always();
+        let store = Store::<u64>::always();
         let id = "test-id".to_string();
 
         store
@@ -342,7 +356,7 @@ mod tests {
 
     #[tokio::test]
     async fn offer_declines_older_position() {
-        let store = Store::<String, u64>::always();
+        let store = Store::<u64>::always();
         let id = "test-id".to_string();
 
         // Store initial snapshot at position 10
@@ -377,7 +391,55 @@ mod tests {
 
     #[test]
     fn default_is_always() {
-        let store = Store::<String, u64>::default();
+        let store = Store::<u64>::default();
         assert!(matches!(store.policy, SnapshotPolicy::Always));
+    }
+
+    #[tokio::test]
+    async fn one_store_serves_multiple_key_types() {
+        // A single key-generic store holds snapshots keyed by `String`, `()`,
+        // and an integer at once, without collision — the capability that the
+        // old monomorphic `Store<Id, Pos>` could not provide.
+        let store = Store::<u64>::always();
+
+        store
+            .offer_snapshot::<Infallible, _, _>("agg", &"s1".to_string(), 1, || {
+                Ok(Snapshot {
+                    position: 1,
+                    data: "by-string",
+                })
+            })
+            .await
+            .unwrap();
+        store
+            .offer_snapshot::<Infallible, _, _>("singleton", &(), 1, || {
+                Ok(Snapshot {
+                    position: 2,
+                    data: "by-unit",
+                })
+            })
+            .await
+            .unwrap();
+        store
+            .offer_snapshot::<Infallible, _, _>("agg", &7u32, 1, || {
+                Ok(Snapshot {
+                    position: 3,
+                    data: "by-int",
+                })
+            })
+            .await
+            .unwrap();
+
+        let by_string: Snapshot<u64, String> =
+            store.load("agg", &"s1".to_string()).await.unwrap().unwrap();
+        let by_unit: Snapshot<u64, String> = store.load("singleton", &()).await.unwrap().unwrap();
+        let by_int: Snapshot<u64, String> = store.load("agg", &7u32).await.unwrap().unwrap();
+
+        assert_eq!(by_string.data, "by-string");
+        assert_eq!(by_unit.data, "by-unit");
+        assert_eq!(by_int.data, "by-int");
+        // The string id "s1" and the integer id 7 share the "agg" kind but do
+        // not collide.
+        assert_ne!(by_string.position, by_int.position);
     }
 }

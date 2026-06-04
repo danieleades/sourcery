@@ -17,8 +17,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use sourcery::{
-    Aggregate, Apply, ApplyProjection, Create, DomainEvent, Handle, HandleCreate, Repository,
-    snapshot::inmemory::Store as InMemorySnapshotStore, store::inmemory,
+    Aggregate, Apply, ApplyProjection, Create, DomainEvent, EventContext, Handle, HandleCreate,
+    Repository, snapshot::inmemory::Store as InMemorySnapshotStore, store::inmemory,
 };
 use thiserror::Error;
 
@@ -224,21 +224,29 @@ pub struct LoyaltySummary {
 }
 
 impl ApplyProjection<PointsEarned> for LoyaltySummary {
-    fn apply_projection(&mut self, aggregate_id: &Self::Id, event: &PointsEarned, &(): &()) {
+    fn apply_projection(
+        &mut self,
+        ctx: EventContext<'_, Self::Id, Self::Metadata>,
+        event: &PointsEarned,
+    ) {
         self.total_earned += event.amount;
         *self
             .customer_points
-            .entry(aggregate_id.clone())
+            .entry(ctx.aggregate_id.clone())
             .or_default() += event.amount;
     }
 }
 
 impl ApplyProjection<PointsRedeemed> for LoyaltySummary {
-    fn apply_projection(&mut self, aggregate_id: &Self::Id, event: &PointsRedeemed, &(): &()) {
+    fn apply_projection(
+        &mut self,
+        ctx: EventContext<'_, Self::Id, Self::Metadata>,
+        event: &PointsRedeemed,
+    ) {
         self.total_redeemed += event.amount;
         let entry = self
             .customer_points
-            .entry(aggregate_id.clone())
+            .entry(ctx.aggregate_id.clone())
             .or_default();
         *entry = entry.saturating_sub(event.amount);
     }
@@ -298,7 +306,7 @@ async fn run_always_snapshot_policy() -> ExampleResult {
     println!("2. Repository with always-snapshot policy");
 
     let event_store = inmemory::Store::new();
-    let snapshot_store = InMemorySnapshotStore::<String, u64>::always();
+    let snapshot_store = InMemorySnapshotStore::<u64>::always();
     let repo = Repository::new(event_store).with_snapshots(snapshot_store);
     let customer_id = "CUST-002".to_string();
 
@@ -344,7 +352,7 @@ async fn run_every_n_snapshot_policy() -> ExampleResult {
     println!("3. Repository with every-5-events policy");
 
     let event_store = inmemory::Store::new();
-    let snapshot_store = InMemorySnapshotStore::<String, u64>::every(5);
+    let snapshot_store = InMemorySnapshotStore::<u64>::every(5);
     let repo = Repository::new(event_store).with_snapshots(snapshot_store);
     let customer_id = "CUST-003".to_string();
 
@@ -393,7 +401,7 @@ async fn run_snapshot_restoration() -> ExampleResult {
     println!("4. Snapshot restoration after more activity");
 
     let event_store = inmemory::Store::new();
-    let snapshot_store = InMemorySnapshotStore::<String, u64>::every(3);
+    let snapshot_store = InMemorySnapshotStore::<u64>::every(3);
     let repo = Repository::new(event_store).with_snapshots(snapshot_store);
     let customer_id = "CUST-004".to_string();
 
@@ -453,7 +461,7 @@ async fn run_never_snapshot_policy() -> ExampleResult {
     println!("5. Never-snapshot policy (load-only mode)");
 
     let event_store = inmemory::Store::new();
-    let snapshot_store = InMemorySnapshotStore::<String, u64>::never();
+    let snapshot_store = InMemorySnapshotStore::<u64>::never();
     let repo = Repository::new(event_store).with_snapshots(snapshot_store);
     let customer_id = "CUST-005".to_string();
 
@@ -498,8 +506,10 @@ async fn run_projection_snapshotting() -> ExampleResult {
     println!("6. Projection snapshotting (global ordering required)");
 
     let event_store = inmemory::Store::new();
-    let snapshot_store = InMemorySnapshotStore::<String, u64>::every(2);
-    let repo = Repository::new(event_store).with_snapshots(snapshot_store);
+    // The projection snapshot store is supplied directly to
+    // `load_projection_with_snapshot`, independent of any aggregate snapshots.
+    let snapshot_store = InMemorySnapshotStore::<u64>::every(2);
+    let repo = Repository::new(event_store);
     let instance_id = "loyalty-summary".to_string();
 
     let customer_a = "CUST-P1".to_string();
@@ -534,7 +544,7 @@ async fn run_projection_snapshotting() -> ExampleResult {
     .await?;
 
     let projection: LoyaltySummary = repo
-        .load_projection_with_snapshot::<LoyaltySummary>(&instance_id)
+        .load_projection_with_snapshot(&instance_id, &snapshot_store)
         .await?;
 
     println!(

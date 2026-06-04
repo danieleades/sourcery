@@ -25,8 +25,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use sourcery::{
-    Aggregate, Apply, ApplyProjection, Create, DomainEvent, Handle, HandleCreate, Repository,
-    store::inmemory,
+    Aggregate, Apply, ApplyProjection, Create, DomainEvent, EventContext, Handle, HandleCreate,
+    Repository, store::inmemory,
 };
 
 // =============================================================================
@@ -334,12 +334,11 @@ pub struct ProductStats {
 impl ApplyProjection<ProductRestocked> for InventoryReport {
     fn apply_projection(
         &mut self,
-        aggregate_id: &Self::Id,
+        ctx: EventContext<'_, Self::Id, Self::Metadata>,
         event: &ProductRestocked,
-        _metadata: &Self::Metadata,
     ) {
         // aggregate_id already has the "product::" prefix stripped
-        let sku = aggregate_id;
+        let sku = ctx.aggregate_id;
 
         self.total_products_restocked += 1;
         self.total_items_in_stock += event.quantity;
@@ -355,12 +354,11 @@ impl ApplyProjection<ProductRestocked> for InventoryReport {
 impl ApplyProjection<InventoryAdjusted> for InventoryReport {
     fn apply_projection(
         &mut self,
-        aggregate_id: &Self::Id,
+        ctx: EventContext<'_, Self::Id, Self::Metadata>,
         event: &InventoryAdjusted,
-        _metadata: &Self::Metadata,
     ) {
         // aggregate_id already has the "product::" prefix stripped
-        let sku = aggregate_id;
+        let sku = ctx.aggregate_id;
 
         self.total_items_in_stock += event.quantity_delta;
 
@@ -376,13 +374,12 @@ impl ApplyProjection<InventoryAdjusted> for InventoryReport {
 impl ApplyProjection<SaleCompleted> for InventoryReport {
     fn apply_projection(
         &mut self,
-        aggregate_id: &Self::Id,
+        ctx: EventContext<'_, Self::Id, Self::Metadata>,
         event: &SaleCompleted,
-        _metadata: &Self::Metadata,
     ) {
         // Parse the composite ID to extract product SKU
         // Format: "{product_sku}::{sale_number}"
-        let sale_id = SaleId::try_from(aggregate_id.clone())
+        let sale_id = SaleId::try_from(ctx.aggregate_id.clone())
             .expect("aggregate_id should be valid SaleId format");
         let sku = &sale_id.product_sku;
 
@@ -403,9 +400,8 @@ impl ApplyProjection<SaleCompleted> for InventoryReport {
 impl ApplyProjection<SaleRefunded> for InventoryReport {
     fn apply_projection(
         &mut self,
-        _aggregate_id: &Self::Id,
+        _ctx: EventContext<'_, Self::Id, Self::Metadata>,
         event: &SaleRefunded,
-        _metadata: &Self::Metadata,
     ) {
         self.total_refunds_cents += event.amount_cents;
         self.total_sales_revenue_cents -= event.amount_cents;

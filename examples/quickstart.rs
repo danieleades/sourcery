@@ -7,7 +7,8 @@
 // ANCHOR: full_example
 use serde::{Deserialize, Serialize};
 use sourcery::{
-    Apply, ApplyProjection, Create, DomainEvent, Handle, HandleCreate, Repository, store::inmemory,
+    Apply, ApplyProjection, Create, DomainEvent, EventContext, Handle, HandleCreate, Repository,
+    store::inmemory,
 };
 
 // ANCHOR: events
@@ -146,7 +147,11 @@ pub struct TotalDeposits {
 }
 
 impl ApplyProjection<FundsDeposited> for TotalDeposits {
-    fn apply_projection(&mut self, _id: &Self::Id, event: &FundsDeposited, _meta: &Self::Metadata) {
+    fn apply_projection(
+        &mut self,
+        _ctx: EventContext<'_, Self::Id, Self::Metadata>,
+        event: &FundsDeposited,
+    ) {
         self.total += event.amount;
     }
 }

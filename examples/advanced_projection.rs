@@ -13,7 +13,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use sourcery::{
-    Aggregate, Apply, ApplyProjection, Create, DomainEvent, Filters, Projection, Repository,
+    Aggregate, Apply, ApplyProjection, Create, DomainEvent, EventContext, Filters, Projection,
+    Repository,
     store::{EventStore, inmemory},
     test::RepositoryTestExt,
 };
@@ -182,9 +183,8 @@ impl Projection for ProductSummary {
 impl ApplyProjection<ProductRestocked> for ProductSummary {
     fn apply_projection(
         &mut self,
-        _aggregate_id: &Self::Id,
+        _ctx: EventContext<'_, Self::Id, Self::Metadata>,
         event: &ProductRestocked,
-        _metadata: &Self::Metadata,
     ) {
         *self.stock_levels.entry(event.sku.clone()).or_default() += event.quantity;
     }
@@ -193,9 +193,8 @@ impl ApplyProjection<ProductRestocked> for ProductSummary {
 impl ApplyProjection<InventoryAdjusted> for ProductSummary {
     fn apply_projection(
         &mut self,
-        _aggregate_id: &Self::Id,
+        _ctx: EventContext<'_, Self::Id, Self::Metadata>,
         event: &InventoryAdjusted,
-        _metadata: &Self::Metadata,
     ) {
         *self.stock_levels.entry(event.sku.clone()).or_default() += event.delta;
     }
@@ -204,9 +203,8 @@ impl ApplyProjection<InventoryAdjusted> for ProductSummary {
 impl ApplyProjection<SaleCompleted> for ProductSummary {
     fn apply_projection(
         &mut self,
-        _aggregate_id: &Self::Id,
+        _ctx: EventContext<'_, Self::Id, Self::Metadata>,
         event: &SaleCompleted,
-        _metadata: &Self::Metadata,
     ) {
         *self.sales.entry(event.product_sku.clone()).or_default() += event.quantity;
     }
@@ -215,9 +213,8 @@ impl ApplyProjection<SaleCompleted> for ProductSummary {
 impl ApplyProjection<PromotionApplied> for ProductSummary {
     fn apply_projection(
         &mut self,
-        _aggregate_id: &Self::Id,
+        _ctx: EventContext<'_, Self::Id, Self::Metadata>,
         event: &PromotionApplied,
-        _metadata: &Self::Metadata,
     ) {
         *self
             .promotion_totals

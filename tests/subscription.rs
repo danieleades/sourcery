@@ -4,8 +4,8 @@
 
 use serde::{Deserialize, Serialize};
 use sourcery::{
-    Aggregate, Apply, ApplyProjection, Create, DomainEvent, Handle, HandleCreate, Projection,
-    Repository, repository::CommandError, store::inmemory,
+    Aggregate, Apply, ApplyProjection, Create, DomainEvent, EventContext, Handle, HandleCreate,
+    Projection, Repository, repository::CommandError, store::inmemory,
 };
 use tokio_stream::StreamExt;
 
@@ -100,9 +100,8 @@ struct ItemCount {
 impl ApplyProjection<ItemAdded> for ItemCount {
     fn apply_projection(
         &mut self,
-        _aggregate_id: &Self::Id,
+        _ctx: EventContext<'_, Self::Id, Self::Metadata>,
         _event: &ItemAdded,
-        &(): &Self::Metadata,
     ) {
         self.count += 1;
     }
@@ -224,7 +223,7 @@ async fn subscription_with_snapshot_resumes() {
     add_item(&repo, "inv1", "b").await;
 
     // SnapshotStore keyed by () (InstanceId of ItemCount)
-    let snapshots = SnapshotStore::<(), u64>::always();
+    let snapshots = SnapshotStore::<u64>::always();
 
     // First subscription: catches up and creates a snapshot on stop
     let sub1 = repo

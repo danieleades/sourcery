@@ -1,0 +1,36 @@
+[package]
+name = "storefront"
+description = "End-to-end example application for the Sourcery event-sourcing library"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Swap the in-memory store for Postgres. Reserved for the Postgres variant; the
+# default build is fully in-memory and needs no database.
+postgres = ["sourcery/postgres"]
+
+[dependencies]
+sourcery = { path = "../..", version = "0.2" }
+serde = { version = "1", default-features = false, features = ["derive", "std"] }
+serde_json = { version = "1", default-features = false, features = ["std"] }
+thiserror = { version = "2", default-features = false, features = ["std"] }
+tokio = { version = "1", default-features = false, features = ["macros", "rt-multi-thread", "time"] }
+tokio-stream = { version = "0.1", default-features = false }
+uuid = { version = "1", default-features = false, features = ["std", "v4", "serde"] }
+
+[dev-dependencies]
+# `test-util` exposes `TestFramework` and `RepositoryTestExt`, used only by the
+# integration tests in `tests/`.
+sourcery = { path = "../..", version = "0.2", features = ["test-util"] }
+tokio = { version = "1", default-features = false, features = ["macros", "rt-multi-thread", "time"] }
+
+[[bin]]
+name = "storefront"
+path = "src/main.rs"

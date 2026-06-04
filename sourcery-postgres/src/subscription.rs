@@ -30,7 +30,7 @@
 //! correctness safety-net, because a rolled-back oldest transaction advances
 //! `xmin` without emitting a notification.
 
-use std::{pin::Pin, time::Duration};
+use std::{fmt::Display, pin::Pin, str::FromStr, time::Duration};
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sourcery_core::{
@@ -56,7 +56,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(250);
 const BATCH_LIMIT: usize = 1024;
 
 /// A result row: the writing transaction id paired with the decoded event.
-type EventRow<M> = (i64, StoredEvent<uuid::Uuid, i64, serde_json::Value, M>);
+type EventRow<Id, M> = (i64, StoredEvent<Id, i64, serde_json::Value, M>);
 
 /// Commit-ordered subscription cursor: `(xid, position)`, lexicographically
 /// ordered (the `xid` field first, so derived `Ord` gives the right order).
@@ -73,9 +73,9 @@ pub struct Watermark {
 
 /// Append the filter match clause: an `OR` of per-filter predicates, wrapped in
 /// parentheses. An empty filter set matches nothing (`false`).
-fn push_filter_predicate<'a>(
+fn push_filter_predicate<'a, Id: Display>(
     qb: &mut QueryBuilder<'a, Postgres>,
-    filters: &'a [EventFilter<uuid::Uuid, i64>],
+    filters: &'a [EventFilter<Id, i64>],
 ) {
     qb.push("(");
     if filters.is_empty() {
@@ -91,7 +91,7 @@ fn push_filter_predicate<'a>(
             qb.push(" AND aggregate_kind = ").push_bind(kind.as_str());
         }
         if let Some(id) = &filter.aggregate_id {
-            qb.push(" AND aggregate_id = ").push_bind(*id);
+            qb.push(" AND aggregate_id = ").push_bind(id.to_string());
         }
         qb.push(")");
     }
@@ -99,12 +99,14 @@ fn push_filter_predicate<'a>(
 }
 
 /// Build a [`StoredEvent`] and its `xid` from a result row.
-fn row_to_event<M>(row: &sqlx::postgres::PgRow) -> Result<EventRow<M>, Error>
+fn row_to_event<Id, M>(row: &sqlx::postgres::PgRow) -> Result<EventRow<Id, M>, Error>
 where
+    Id: FromStr,
+    <Id as FromStr>::Err: std::error::Error + Send + Sync + 'static,
     M: serde::de::DeserializeOwned,
 {
     let xid: i64 = row.try_get("xid")?;
-    Ok((xid, crate::row_to_stored_event::<M>(row)?))
+    Ok((xid, crate::row_to_stored_event::<Id, M>(row)?))
 }
 
 /// The current stability boundary: `pg_snapshot_xmin` of a fresh snapshot.
@@ -125,13 +127,15 @@ async fn current_xmin(pool: &PgPool) -> Result<i64, Error> {
 /// Only events from settled transactions (`xid < xmin`) are returned, using the
 /// caller-supplied `xmin` so the batch and the cycle's frontier share one
 /// boundary.
-async fn load_stable_batch<M>(
+async fn load_stable_batch<Id, M>(
     pool: &PgPool,
-    filters: &[EventFilter<uuid::Uuid, i64>],
+    filters: &[EventFilter<Id, i64>],
     cursor: Watermark,
     xmin: i64,
-) -> Result<Vec<EventRow<M>>, Error>
+) -> Result<Vec<EventRow<Id, M>>, Error>
 where
+    Id: Display + FromStr + Sync,
+    <Id as FromStr>::Err: std::error::Error + Send + Sync + 'static,
     M: serde::de::DeserializeOwned,
 {
     let mut qb = QueryBuilder::<Postgres>::new(
@@ -148,11 +152,13 @@ where
         .push_bind(i64::try_from(BATCH_LIMIT).expect("BATCH_LIMIT fits in i64"));
 
     let rows = qb.build().fetch_all(pool).await?;
-    rows.iter().map(row_to_event::<M>).collect()
+    rows.iter().map(row_to_event::<Id, M>).collect()
 }
 
-impl<M> SubscribableStore for Store<M>
+impl<Id, M> SubscribableStore for Store<Id, M>
 where
+    Id: Clone + Send + Sync + 'static + Display + FromStr,
+    <Id as FromStr>::Err: std::error::Error + Send + Sync + 'static,
     M: Serialize + serde::de::DeserializeOwned + Clone + Send + Sync + 'static,
 {
     type Checkpoint = Watermark;
@@ -198,7 +204,7 @@ where
 
                 // Drain every stable event (`xid < xmin`) past the cursor.
                 loop {
-                    let batch = match load_stable_batch::<M>(&pool, &filters, cursor, xmin).await {
+                    let batch = match load_stable_batch::<Id, M>(&pool, &filters, cursor, xmin).await {
                         Ok(batch) => batch,
                         Err(error) => {
                             yield Err(error);

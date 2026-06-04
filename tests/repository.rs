@@ -9,7 +9,8 @@ use std::{
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sourcery::{
-    Aggregate, Apply, Create, DomainEvent, Handle, HandleCreate, Repository,
+    Aggregate, Apply, ApplyProjection, Create, DomainEvent, EventContext, Filters, Handle,
+    HandleCreate, Projection, Repository, StorageKey,
     repository::CommandError,
     snapshot::{
         OfferSnapshotError, Snapshot, SnapshotOffer, SnapshotStore,
@@ -124,6 +125,209 @@ impl Handle<RequireAtLeast> for Counter {
             return Err("insufficient value".to_string());
         }
         Ok(vec![])
+    }
+}
+
+// ============================================================================
+// Test Domain: Per-aggregate ID types
+// ============================================================================
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProductId(String);
+
+impl StorageKey<String> for ProductId {
+    fn to_key(&self) -> String {
+        format!("product:{}", self.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OrderId(u64);
+
+impl StorageKey<String> for OrderId {
+    fn to_key(&self) -> String {
+        format!("order:{}", self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ProductCreated {
+    product_id: String,
+    name: String,
+}
+
+impl DomainEvent for ProductCreated {
+    const KIND: &'static str = "product-created";
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ProductRenamed {
+    name: String,
+}
+
+impl DomainEvent for ProductRenamed {
+    const KIND: &'static str = "product-renamed";
+}
+
+#[derive(Default, Clone, Serialize, Deserialize, Aggregate)]
+#[aggregate(
+    id = ProductId,
+    error = String,
+    events(ProductCreated, ProductRenamed),
+    create(ProductCreated),
+    derives(Debug, PartialEq, Eq)
+)]
+struct Product {
+    id: String,
+    name: String,
+    rename_count: u32,
+}
+
+impl Apply<ProductCreated> for Product {
+    fn apply(&mut self, event: &ProductCreated) {
+        self.id.clone_from(&event.product_id);
+        self.name.clone_from(&event.name);
+    }
+}
+
+impl Apply<ProductRenamed> for Product {
+    fn apply(&mut self, event: &ProductRenamed) {
+        self.name.clone_from(&event.name);
+        self.rename_count += 1;
+    }
+}
+
+impl Create<ProductCreated> for Product {
+    fn create(event: &ProductCreated) -> Self {
+        let mut product = Self::default();
+        <Self as Apply<ProductCreated>>::apply(&mut product, event);
+        product
+    }
+}
+
+struct CreateProduct {
+    id: ProductId,
+    name: String,
+}
+
+impl HandleCreate<CreateProduct> for Product {
+    type HandleCreateError = Self::Error;
+
+    fn handle_create(command: &CreateProduct) -> Result<Vec<Self::Event>, Self::HandleCreateError> {
+        Ok(vec![
+            ProductCreated {
+                product_id: command.id.0.clone(),
+                name: command.name.clone(),
+            }
+            .into(),
+        ])
+    }
+}
+
+struct RenameProduct {
+    name: String,
+}
+
+impl Handle<RenameProduct> for Product {
+    type HandleError = Self::Error;
+
+    fn handle(&self, command: &RenameProduct) -> Result<Vec<Self::Event>, Self::Error> {
+        Ok(vec![
+            ProductRenamed {
+                name: command.name.clone(),
+            }
+            .into(),
+        ])
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct OrderPlaced {
+    order_id: u64,
+}
+
+impl DomainEvent for OrderPlaced {
+    const KIND: &'static str = "order-placed";
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct OrderLineAdded {
+    sku: String,
+    quantity: u32,
+}
+
+impl DomainEvent for OrderLineAdded {
+    const KIND: &'static str = "order-line-added";
+}
+
+#[derive(Default, Clone, Serialize, Deserialize, Aggregate)]
+#[aggregate(
+    id = OrderId,
+    error = String,
+    events(OrderPlaced, OrderLineAdded),
+    create(OrderPlaced),
+    derives(Debug, PartialEq, Eq)
+)]
+struct Order {
+    id: u64,
+    line_count: u32,
+    total_quantity: u32,
+}
+
+impl Apply<OrderPlaced> for Order {
+    fn apply(&mut self, event: &OrderPlaced) {
+        self.id = event.order_id;
+    }
+}
+
+impl Apply<OrderLineAdded> for Order {
+    fn apply(&mut self, event: &OrderLineAdded) {
+        self.line_count += 1;
+        self.total_quantity += event.quantity;
+    }
+}
+
+impl Create<OrderPlaced> for Order {
+    fn create(event: &OrderPlaced) -> Self {
+        let mut order = Self::default();
+        <Self as Apply<OrderPlaced>>::apply(&mut order, event);
+        order
+    }
+}
+
+struct PlaceOrder {
+    id: OrderId,
+}
+
+impl HandleCreate<PlaceOrder> for Order {
+    type HandleCreateError = Self::Error;
+
+    fn handle_create(command: &PlaceOrder) -> Result<Vec<Self::Event>, Self::HandleCreateError> {
+        Ok(vec![
+            OrderPlaced {
+                order_id: command.id.0,
+            }
+            .into(),
+        ])
+    }
+}
+
+struct AddOrderLine {
+    sku: String,
+    quantity: u32,
+}
+
+impl Handle<AddOrderLine> for Order {
+    type HandleError = Self::Error;
+
+    fn handle(&self, command: &AddOrderLine) -> Result<Vec<Self::Event>, Self::Error> {
+        Ok(vec![
+            OrderLineAdded {
+                sku: command.sku.clone(),
+                quantity: command.quantity,
+            }
+            .into(),
+        ])
     }
 }
 
@@ -281,9 +485,245 @@ impl SnapshotStore<String> for TrackingSnapshotStore {
 // ============================================================================
 
 #[tokio::test]
+async fn per_aggregate_ids_share_one_string_store() {
+    let store = inmemory::Store::<String, ()>::new();
+    let repo = Repository::new(store).without_concurrency_checking();
+
+    let product_id = ProductId("42".to_string());
+    let order_id = OrderId(42);
+
+    repo.create::<Product, CreateProduct>(
+        &product_id,
+        &CreateProduct {
+            id: product_id.clone(),
+            name: "Widget".to_string(),
+        },
+        &(),
+    )
+    .await
+    .unwrap();
+    repo.create::<Order, PlaceOrder>(&order_id, &PlaceOrder { id: order_id }, &())
+        .await
+        .unwrap();
+
+    repo.update::<Product, RenameProduct>(
+        &product_id,
+        &RenameProduct {
+            name: "Widget Pro".to_string(),
+        },
+        &(),
+    )
+    .await
+    .unwrap();
+    repo.update::<Order, AddOrderLine>(
+        &order_id,
+        &AddOrderLine {
+            sku: "42".to_string(),
+            quantity: 3,
+        },
+        &(),
+    )
+    .await
+    .unwrap();
+
+    let product = repo
+        .load::<Product>(&product_id)
+        .await
+        .unwrap()
+        .expect("product exists");
+    let order = repo
+        .load::<Order>(&order_id)
+        .await
+        .unwrap()
+        .expect("order exists");
+
+    assert_eq!(product.name, "Widget Pro");
+    assert_eq!(product.rename_count, 1);
+    assert_eq!(order.total_quantity, 3);
+    let product_key: String = product_id.to_key();
+    let order_key: String = order_id.to_key();
+    assert_ne!(product_key, order_key);
+    assert!(
+        repo.event_store()
+            .stream_version(Product::KIND, &product_key)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        repo.event_store()
+            .stream_version(Order::KIND, &order_key)
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+/// A per-order read model scoped to one `Order` instance. The store is keyed on
+/// `String`, but `Order` keys on the `OrderId` newtype — exercising
+/// `Filters::events_for::<Order>` with an `&OrderId`, the case the old
+/// `A: Aggregate<Id = S::Id>` bound made impossible.
+#[derive(Default)]
+struct OrderSummary {
+    lines: u32,
+    quantity: u32,
+}
+
+impl Projection for OrderSummary {
+    type Id = String;
+    type InstanceId = OrderId;
+    type Metadata = ();
+
+    const KIND: &'static str = "order-summary";
+
+    fn init(_instance_id: &OrderId) -> Self {
+        Self::default()
+    }
+
+    fn filters<S>(instance_id: &OrderId) -> Filters<S, Self>
+    where
+        S: EventStore<Id = String, Metadata = ()>,
+    {
+        Filters::new().events_for::<Order>(instance_id)
+    }
+}
+
+impl ApplyProjection<OrderEvent> for OrderSummary {
+    fn apply_projection(&mut self, _ctx: EventContext<'_, String, ()>, event: &OrderEvent) {
+        match event {
+            OrderEvent::OrderPlaced(_) => {}
+            OrderEvent::OrderLineAdded(line) => {
+                self.lines += 1;
+                self.quantity += line.quantity;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn scoped_projection_over_newtype_keyed_aggregate() {
+    let store = inmemory::Store::<String, ()>::new();
+    let repo = Repository::new(store).without_concurrency_checking();
+
+    let target = OrderId(1);
+    let other = OrderId(2);
+
+    for id in [target, other] {
+        repo.create::<Order, PlaceOrder>(&id, &PlaceOrder { id }, &())
+            .await
+            .unwrap();
+    }
+    repo.update::<Order, AddOrderLine>(
+        &target,
+        &AddOrderLine {
+            sku: "a".to_string(),
+            quantity: 3,
+        },
+        &(),
+    )
+    .await
+    .unwrap();
+    // A line on a *different* order instance that the scoped filter must exclude.
+    repo.update::<Order, AddOrderLine>(
+        &other,
+        &AddOrderLine {
+            sku: "b".to_string(),
+            quantity: 99,
+        },
+        &(),
+    )
+    .await
+    .unwrap();
+
+    let summary = repo.load_projection::<OrderSummary>(&target).await.unwrap();
+
+    assert_eq!(summary.lines, 1, "only the target order's line is counted");
+    assert_eq!(
+        summary.quantity, 3,
+        "the other order's quantity is excluded"
+    );
+}
+
+#[tokio::test]
+async fn per_aggregate_ids_share_snapshot_store() {
+    let store = inmemory::Store::<String, ()>::new();
+    let snapshots = InMemorySnapshotStore::<u64>::always();
+    let repo = Repository::new(store).with_snapshots(snapshots);
+
+    let product_id = ProductId("42".to_string());
+    let order_id = OrderId(42);
+
+    repo.create::<Product, CreateProduct>(
+        &product_id,
+        &CreateProduct {
+            id: product_id.clone(),
+            name: "Widget".to_string(),
+        },
+        &(),
+    )
+    .await
+    .unwrap();
+    repo.create::<Order, PlaceOrder>(&order_id, &PlaceOrder { id: order_id }, &())
+        .await
+        .unwrap();
+    repo.update::<Product, RenameProduct>(
+        &product_id,
+        &RenameProduct {
+            name: "Widget Pro".to_string(),
+        },
+        &(),
+    )
+    .await
+    .unwrap();
+    repo.update::<Order, AddOrderLine>(
+        &order_id,
+        &AddOrderLine {
+            sku: "42".to_string(),
+            quantity: 3,
+        },
+        &(),
+    )
+    .await
+    .unwrap();
+
+    let product_key: String = product_id.to_key();
+    let order_key: String = order_id.to_key();
+
+    let product_snapshot = repo
+        .snapshot_store()
+        .load::<Product>(Product::KIND, &product_key)
+        .await
+        .unwrap()
+        .expect("product snapshot exists");
+    let order_snapshot = repo
+        .snapshot_store()
+        .load::<Order>(Order::KIND, &order_key)
+        .await
+        .unwrap()
+        .expect("order snapshot exists");
+
+    assert_eq!(product_snapshot.data.name, "Widget Pro");
+    assert_eq!(order_snapshot.data.total_quantity, 3);
+
+    let product = repo
+        .load::<Product>(&product_id)
+        .await
+        .unwrap()
+        .expect("product resumes from snapshot");
+    let order = repo
+        .load::<Order>(&order_id)
+        .await
+        .unwrap()
+        .expect("order resumes from snapshot");
+
+    assert_eq!(product.name, product_snapshot.data.name);
+    assert_eq!(order.total_quantity, order_snapshot.data.total_quantity);
+}
+
+#[tokio::test]
 async fn saves_snapshot_and_exposes_snapshot_store() {
     let store = inmemory::Store::new();
-    let snapshots = InMemorySnapshotStore::<String, u64>::always();
+    let snapshots = InMemorySnapshotStore::<u64>::always();
     let repo = Repository::new(store)
         .with_snapshots(snapshots)
         .without_concurrency_checking();
@@ -304,7 +744,7 @@ async fn saves_snapshot_and_exposes_snapshot_store() {
 #[tokio::test]
 async fn no_events_does_not_persist_or_snapshot() {
     let store = inmemory::Store::new();
-    let snapshots = InMemorySnapshotStore::<String, u64>::always();
+    let snapshots = InMemorySnapshotStore::<u64>::always();
     let repo = Repository::new(store)
         .with_snapshots(snapshots)
         .without_concurrency_checking();

@@ -105,6 +105,37 @@ async fn offer_and_load_snapshot_roundtrip() {
 }
 
 #[tokio::test]
+async fn offer_and_load_snapshot_roundtrip_with_non_uuid_id() {
+    let db = TestDb::new().await;
+    let store = Store::always(db.pool.clone());
+    store.migrate().await.unwrap();
+
+    // The snapshot store is generic over any `Display` id, not just `Uuid`.
+    let id = "WIDGET-001".to_string();
+    let snapshot_data = "catalog snapshot".to_string();
+
+    let result = store
+        .offer_snapshot::<std::convert::Infallible, _, _>("catalog.product", &id, 10, || {
+            Ok(Snapshot {
+                position: 7,
+                data: snapshot_data.clone(),
+            })
+        })
+        .await
+        .unwrap();
+    assert_eq!(result, SnapshotOffer::Stored);
+
+    let loaded = store
+        .load::<String>("catalog.product", &id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(loaded.position, 7);
+    assert_eq!(loaded.data, snapshot_data);
+}
+
+#[tokio::test]
 async fn offer_updates_existing_snapshot_with_higher_position() {
     let db = TestDb::new().await;
     let store = Store::always(db.pool.clone());

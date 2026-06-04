@@ -11,6 +11,7 @@ use thiserror::Error;
 use crate::{
     aggregate::Aggregate,
     event::{DomainEvent, EventDecodeError, ProjectionEvent},
+    key::StorageKey,
     store::{EventFilter, EventStore, StoredEvent},
 };
 
@@ -55,22 +56,66 @@ pub trait Projection: Sized {
 }
 // ANCHOR_END: projection_trait
 
+/// Envelope context handed to a projection for each event.
+///
+/// The context contains store-level information about the event without
+/// polluting the pure domain event payload.
+#[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
+pub struct EventContext<'a, Id, M> {
+    /// The aggregate type that emitted the event.
+    pub aggregate_kind: &'a str,
+    /// The aggregate instance identifier that emitted the event.
+    pub aggregate_id: &'a Id,
+    /// The event type identifier.
+    pub event_kind: &'a str,
+    /// Infrastructure metadata supplied when the event was committed.
+    pub metadata: &'a M,
+}
+
+impl<'a, Id, M> EventContext<'a, Id, M> {
+    /// Construct an event context.
+    #[must_use]
+    pub const fn new(
+        aggregate_kind: &'a str,
+        aggregate_id: &'a Id,
+        event_kind: &'a str,
+        metadata: &'a M,
+    ) -> Self {
+        Self {
+            aggregate_kind,
+            aggregate_id,
+            event_kind,
+            metadata,
+        }
+    }
+
+    pub(crate) fn from_stored<Pos, Data>(stored: &'a StoredEvent<Id, Pos, Data, M>) -> Self {
+        Self::new(
+            &stored.aggregate_kind,
+            &stored.aggregate_id,
+            &stored.kind,
+            &stored.metadata,
+        )
+    }
+}
+
 /// Apply an event to a projection with access to envelope context.
 ///
-/// Implementations receive the aggregate identifier, the pure domain event,
-/// and metadata supplied by the backing store.
+/// Implementations receive event context, the pure domain event, and metadata
+/// supplied by the backing store through [`EventContext::metadata`].
 ///
 /// ```ignore
 /// impl ApplyProjection<InventoryAdjusted> for InventoryReport {
-///     fn apply_projection(&mut self, aggregate_id: &Self::Id, event: &InventoryAdjusted, _metadata: &Self::Metadata) {
-///         let stats = self.products.entry(aggregate_id.clone()).or_default();
+///     fn apply_projection(&mut self, ctx: EventContext<'_, Self::Id, Self::Metadata>, event: &InventoryAdjusted) {
+///         let stats = self.products.entry(ctx.aggregate_id.clone()).or_default();
 ///         stats.quantity += event.delta;
 ///     }
 /// }
 /// ```
 // ANCHOR: apply_projection_trait
 pub trait ApplyProjection<E>: Projection {
-    fn apply_projection(&mut self, aggregate_id: &Self::Id, event: &E, metadata: &Self::Metadata);
+    fn apply_projection(&mut self, ctx: EventContext<'_, Self::Id, Self::Metadata>, event: &E);
 }
 // ANCHOR_END: apply_projection_trait
 
@@ -119,14 +164,12 @@ impl<StoreError> HandlerError<StoreError> {
 pub(crate) type EventHandler<P, S> = Box<
     dyn Fn(
             &mut P,
-            &<S as EventStore>::Id,
             &StoredEvent<
                 <S as EventStore>::Id,
                 <S as EventStore>::Position,
                 <S as EventStore>::Data,
                 <S as EventStore>::Metadata,
             >,
-            &<S as EventStore>::Metadata,
             &S,
         ) -> Result<(), HandlerError<<S as EventStore>::Error>>
         + Send
@@ -138,6 +181,34 @@ pub(crate) type PositionedFilters<S, P> = (
     Vec<EventFilter<<S as EventStore>::Id, <S as EventStore>::Position>>,
     HashMap<&'static str, EventHandler<P, S>>,
 );
+
+/// Build the filter spec for one domain event type.
+pub(crate) fn event_spec<S, E>() -> EventFilter<S::Id, S::Position>
+where
+    S: EventStore,
+    E: DomainEvent,
+{
+    EventFilter::for_event(E::KIND)
+}
+
+type EventKindSpec<S> = (
+    &'static str,
+    EventFilter<<S as EventStore>::Id, <S as EventStore>::Position>,
+);
+
+/// Build filter specs for every event kind in a projection event sum type.
+pub(crate) fn events_specs<S, E>(
+    spec: impl Fn(&'static str) -> EventFilter<S::Id, S::Position>,
+) -> Vec<EventKindSpec<S>>
+where
+    S: EventStore,
+    E: ProjectionEvent,
+{
+    E::EVENT_KINDS
+        .iter()
+        .map(|&kind| (kind, spec(kind)))
+        .collect()
+}
 
 /// Combined filter configuration and handler map for a subscriber.
 ///
@@ -191,9 +262,9 @@ where
         self.specs.push(spec);
         self.handlers.insert(
             E::KIND,
-            Box::new(|proj, agg_id, stored, metadata, store| {
+            Box::new(|proj, stored, store| {
                 let event: E = store.decode_event(stored)?;
-                ApplyProjection::apply_projection(proj, agg_id, &event, metadata);
+                ApplyProjection::apply_projection(proj, EventContext::from_stored(stored), &event);
                 Ok(())
             }),
         );
@@ -208,13 +279,17 @@ where
         E: ProjectionEvent,
         P: ApplyProjection<E>,
     {
-        for &kind in E::EVENT_KINDS {
-            self.specs.push(spec(kind));
+        for (kind, spec) in events_specs::<S, E>(spec) {
+            self.specs.push(spec);
             self.handlers.insert(
                 kind,
-                Box::new(|proj, agg_id, stored, metadata, store| {
+                Box::new(|proj, stored, store| {
                     let event = E::from_stored(stored, store).map_err(HandlerError::EventDecode)?;
-                    ApplyProjection::apply_projection(proj, agg_id, &event, metadata);
+                    ApplyProjection::apply_projection(
+                        proj,
+                        EventContext::from_stored(stored),
+                        &event,
+                    );
                     Ok(())
                 }),
             );
@@ -228,7 +303,7 @@ where
         E: DomainEvent + serde::de::DeserializeOwned,
         P: ApplyProjection<E>,
     {
-        self.push_domain_event::<E>(EventFilter::for_event(E::KIND));
+        self.push_domain_event::<E>(event_spec::<S, E>());
         self
     }
 
@@ -245,30 +320,40 @@ where
     }
 
     /// Subscribe to a specific event type from a specific aggregate instance.
+    ///
+    /// The instance is named by the aggregate's own id type, which is projected
+    /// onto the store's raw key via [`StorageKey`] — mirroring the command-side
+    /// repository methods, so an aggregate that keys on a domain newtype scopes
+    /// exactly as it writes.
     #[must_use]
-    pub fn event_for<A, E>(mut self, aggregate_id: &S::Id) -> Self
+    pub fn event_for<A, E>(mut self, aggregate_id: &A::Id) -> Self
     where
-        A: Aggregate<Id = S::Id>,
+        A: Aggregate,
+        A::Id: StorageKey<S::Id>,
         E: DomainEvent + serde::de::DeserializeOwned,
         P: ApplyProjection<E>,
     {
         self.push_domain_event::<E>(EventFilter::for_aggregate(
             E::KIND,
             A::KIND,
-            aggregate_id.clone(),
+            aggregate_id.to_key(),
         ));
         self
     }
 
     /// Subscribe to all events from a specific aggregate instance.
+    ///
+    /// The instance is named by the aggregate's own id type (see
+    /// [`event_for`](Self::event_for)).
     #[must_use]
-    pub fn events_for<A>(mut self, aggregate_id: &S::Id) -> Self
+    pub fn events_for<A>(mut self, aggregate_id: &A::Id) -> Self
     where
-        A: Aggregate<Id = S::Id>,
+        A: Aggregate,
+        A::Id: StorageKey<S::Id>,
         A::Event: ProjectionEvent,
         P: ApplyProjection<A::Event>,
     {
-        let aggregate_id = aggregate_id.clone();
+        let aggregate_id = aggregate_id.to_key();
         self.push_projection_event::<A::Event>(move |kind| {
             EventFilter::for_aggregate(kind, A::KIND, aggregate_id.clone())
         });
