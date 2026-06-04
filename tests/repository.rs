@@ -4,19 +4,25 @@
 
 use std::{
     convert::Infallible,
+    future::Future,
     sync::atomic::{AtomicBool, Ordering},
 };
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde_json::Value as JsonValue;
 use sourcery::{
-    Aggregate, Apply, ApplyProjection, Create, DomainEvent, EventContext, Filters, Handle,
-    HandleCreate, Projection, Repository, StorageKey,
+    Aggregate, Apply, ApplyProjection, ConcurrencyConflict, Create, DomainEvent, EventContext,
+    Filters, Handle, HandleCreate, Projection, Repository, StorageKey,
+    event::EventKind,
     repository::CommandError,
     snapshot::{
         OfferSnapshotError, Snapshot, SnapshotOffer, SnapshotStore,
         inmemory::Store as InMemorySnapshotStore,
     },
-    store::{EventStore, inmemory},
+    store::{
+        CommitError, Committed, EventFilter, EventStore, NonEmpty, OptimisticCommitError,
+        StoredEvent, inmemory,
+    },
 };
 use thiserror::Error;
 
@@ -481,6 +487,158 @@ impl SnapshotStore<String> for TrackingSnapshotStore {
 }
 
 // ============================================================================
+// Test Domain: CounterTotal projection
+// ============================================================================
+
+/// A per-counter read model with snapshot support, used to exercise
+/// `load_projection_with_snapshot`.
+#[derive(Default, Serialize, Deserialize)]
+struct CounterTotal {
+    total: i32,
+}
+
+impl Projection for CounterTotal {
+    type Id = String;
+    type InstanceId = String;
+    type Metadata = ();
+
+    const KIND: &'static str = "counter-total";
+
+    fn init(_instance_id: &String) -> Self {
+        Self::default()
+    }
+
+    fn filters<S>(instance_id: &String) -> Filters<S, Self>
+    where
+        S: EventStore<Id = String, Metadata = ()>,
+    {
+        Filters::new().events_for::<Counter>(instance_id)
+    }
+}
+
+impl ApplyProjection<CounterEvent> for CounterTotal {
+    fn apply_projection(&mut self, _ctx: EventContext<'_, String, ()>, event: &CounterEvent) {
+        let CounterEvent::ValueAdded(e) = event;
+        self.total += e.amount;
+    }
+}
+
+// ============================================================================
+// Custom store for concurrency retry testing
+// ============================================================================
+
+/// Wraps an in-memory store and injects a single artificial
+/// `ConcurrencyConflict` on the first optimistic commit that has an
+/// `expected_version` (i.e., the first update, not the initial create).
+///
+/// This lets us deterministically exercise the retry path of
+/// `update_with_retry` without relying on real concurrent writes.
+struct SabotageStore {
+    inner: inmemory::Store<String, ()>,
+    conflicted: AtomicBool,
+}
+
+impl SabotageStore {
+    fn new() -> Self {
+        Self {
+            inner: inmemory::Store::new(),
+            conflicted: AtomicBool::new(false),
+        }
+    }
+}
+
+impl EventStore for SabotageStore {
+    type Id = String;
+    type Position = u64;
+    type Error = inmemory::InMemoryError;
+    type Metadata = ();
+    type Data = JsonValue;
+
+    fn decode_event<E>(
+        &self,
+        stored: &StoredEvent<String, u64, JsonValue, ()>,
+    ) -> Result<E, inmemory::InMemoryError>
+    where
+        E: DomainEvent + DeserializeOwned,
+    {
+        self.inner.decode_event(stored)
+    }
+
+    fn stream_version<'a>(
+        &'a self,
+        aggregate_kind: &'a str,
+        aggregate_id: &'a String,
+    ) -> impl Future<Output = Result<Option<u64>, inmemory::InMemoryError>> + Send + 'a {
+        self.inner.stream_version(aggregate_kind, aggregate_id)
+    }
+
+    fn commit_events<'a, E>(
+        &'a self,
+        aggregate_kind: &'a str,
+        aggregate_id: &'a String,
+        events: NonEmpty<E>,
+        _metadata: &'a (),
+    ) -> impl Future<Output = Result<Committed<u64>, CommitError<inmemory::InMemoryError>>> + Send + 'a
+    where
+        E: EventKind + Serialize + Send + Sync + 'a,
+        (): Clone,
+    {
+        self.inner
+            .commit_events(aggregate_kind, aggregate_id, events, &())
+    }
+
+    fn commit_events_optimistic<'a, E>(
+        &'a self,
+        aggregate_kind: &'a str,
+        aggregate_id: &'a String,
+        expected_version: Option<u64>,
+        events: NonEmpty<E>,
+        _metadata: &'a (),
+    ) -> impl Future<
+        Output = Result<Committed<u64>, OptimisticCommitError<u64, inmemory::InMemoryError>>,
+    > + Send
+    + 'a
+    where
+        E: EventKind + Serialize + Send + Sync + 'a,
+        (): Clone,
+    {
+        let kind = aggregate_kind.to_string();
+        let id = aggregate_id.clone();
+        let inner = self.inner.clone();
+        // Only sabotage the first update (expected_version is Some for updates,
+        // None for creates). Compare-exchange atomically claims the sabotage slot.
+        let inject = expected_version.is_some()
+            && self
+                .conflicted
+                .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok();
+        async move {
+            if inject {
+                Err(ConcurrencyConflict {
+                    expected: expected_version,
+                    actual: expected_version.map(|v| v + 1),
+                }
+                .into())
+            } else {
+                inner
+                    .commit_events_optimistic(&kind, &id, expected_version, events, &())
+                    .await
+            }
+        }
+    }
+
+    fn load_events<'a>(
+        &'a self,
+        filters: &'a [EventFilter<String, u64>],
+    ) -> impl Future<
+        Output = Result<Vec<StoredEvent<String, u64, JsonValue, ()>>, inmemory::InMemoryError>,
+    > + Send
+    + 'a {
+        self.inner.load_events(filters)
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -876,4 +1034,78 @@ async fn load_consults_snapshot_store() {
 
     assert!(counter.is_none());
     assert!(repo.snapshot_store().load_called());
+}
+
+#[tokio::test]
+async fn load_projection_with_snapshot_stores_and_resumes_from_snapshot() {
+    let store = inmemory::Store::<String, ()>::new();
+    let snapshots = InMemorySnapshotStore::<u64>::always();
+    let repo = Repository::new(store).without_concurrency_checking();
+
+    let id = "c1".to_string();
+    repo.create::<Counter, AddValue>(&id, &AddValue { amount: 3 }, &())
+        .await
+        .unwrap();
+    repo.update::<Counter, AddValue>(&id, &AddValue { amount: 7 }, &())
+        .await
+        .unwrap();
+
+    // First load: no snapshot yet — replays from events and offers a snapshot.
+    let total: CounterTotal = repo
+        .load_projection_with_snapshot(&id, &snapshots)
+        .await
+        .unwrap();
+    assert_eq!(total.total, 10);
+
+    assert!(
+        snapshots
+            .load::<CounterTotal>(CounterTotal::KIND, &id)
+            .await
+            .unwrap()
+            .is_some(),
+        "snapshot must be stored after first projection load"
+    );
+
+    // Add a new event after the snapshot was taken.
+    repo.update::<Counter, AddValue>(&id, &AddValue { amount: 5 }, &())
+        .await
+        .unwrap();
+
+    // Second load: resumes from the snapshot and applies only the new event.
+    let total2: CounterTotal = repo
+        .load_projection_with_snapshot(&id, &snapshots)
+        .await
+        .unwrap();
+    assert_eq!(
+        total2.total, 15,
+        "snapshot resume must apply only post-snapshot events"
+    );
+}
+
+#[tokio::test]
+async fn update_with_retry_retries_on_concurrency_conflict() {
+    let repo = Repository::new(SabotageStore::new());
+    let id = "c1".to_string();
+
+    repo.create::<Counter, AddValue>(&id, &AddValue { amount: 1 }, &())
+        .await
+        .unwrap();
+
+    // The SabotageStore injects a conflict on the first update commit.
+    // With max_retries=1 the second attempt sees the real store and succeeds.
+    let attempts = repo
+        .update_with_retry::<Counter, AddValue>(&id, &AddValue { amount: 1 }, &(), 1)
+        .await
+        .expect("update must succeed after one retry");
+
+    assert_eq!(
+        attempts, 2,
+        "exactly two attempts: one conflict, one success"
+    );
+
+    let counter: Counter = repo.load(&id).await.unwrap().expect("counter must exist");
+    assert_eq!(
+        counter.value, 2,
+        "both the create and the retried update are applied"
+    );
 }

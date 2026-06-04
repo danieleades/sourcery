@@ -27,6 +27,7 @@ pub use sourcery_core::{
     },
 };
 // Re-export proc macro derives so consumers only depend on `sourcery`.
+pub use sourcery_core::concurrency::ConcurrencyConflict;
 pub use sourcery_macros::{Aggregate, Projection};
 
 /// Event-store interfaces and built-in store implementations.
