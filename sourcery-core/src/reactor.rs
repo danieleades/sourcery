@@ -710,8 +710,7 @@ mod tests {
     use std::{error::Error, io, time::Duration};
 
     use super::*;
-    use crate::snapshot::NoSnapshots;
-    use crate::subscription::RunnerError;
+    use crate::{snapshot::NoSnapshots, subscription::RunnerError};
 
     // --- RetryPolicy ---
 
