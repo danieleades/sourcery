@@ -4,7 +4,7 @@
 //!
 //! - [`aggregate`] - Command-side primitives (`Aggregate`, `Apply`, `Handle`)
 //! - [`projection`] - Read-side primitives (`Projection`, `ApplyProjection`,
-//!   `Filters`)
+//!   `EventContext`, `Filters`)
 //! - [`repository`] - Command execution and aggregate lifecycle (`Repository`)
 //! - [`store`] - Event persistence abstraction (`EventStore`)
 //! - [`snapshot`] - Snapshot storage abstraction (`SnapshotStore`)
@@ -28,11 +28,15 @@
 pub mod aggregate;
 pub mod concurrency;
 pub mod event;
+pub mod key;
 pub mod projection;
+pub mod reactor;
 pub mod repository;
 pub mod snapshot;
 pub mod store;
 pub mod subscription;
+
+pub use key::StorageKey;
 
 // Test utilities module: public when feature enabled, internal for crate tests
 #[cfg(feature = "test-util")]

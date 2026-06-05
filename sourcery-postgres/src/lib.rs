@@ -12,7 +12,7 @@
 pub mod snapshot;
 pub mod subscription;
 
-use std::marker::PhantomData;
+use std::{fmt::Display, marker::PhantomData, str::FromStr};
 
 use nonempty::NonEmpty;
 use serde::{Serialize, de::DeserializeOwned};
@@ -44,21 +44,38 @@ pub enum Error {
     /// Event deserialisation failed while loading/replaying.
     #[error("deserialization error: {0}")]
     Deserialization(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
+    /// A stored `aggregate_id` could not be parsed back into the store's `Id`
+    /// type. The key column is `TEXT`, so this only triggers on a value outside
+    /// the range of `Id`'s string encoding (e.g. corruption or a manual edit).
+    #[error("invalid aggregate id {raw:?}: {source}")]
+    KeyDecode {
+        /// The raw `TEXT` value read from the column.
+        raw: String,
+        /// The `FromStr` error returned by the `Id` type.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    },
 }
 
 /// A PostgreSQL-backed [`EventStore`].
 ///
-/// Defaults are intentionally conservative:
+/// Generic over the aggregate identifier `Id` and the metadata type `M`,
+/// mirroring the in-memory [`Store`](sourcery_core::store::inmemory::Store).
+/// The `Id` is stored in a `TEXT` column via its [`Display`]/[`FromStr`]
+/// encoding, so any string-convertible id type works (`uuid::Uuid`, `String`,
+/// or a domain newtype).
+///
+/// Other defaults are intentionally conservative:
 /// - Positions are global and monotonic (`i64`, backed by `BIGSERIAL`).
 /// - Metadata is stored as `jsonb` (`M: Serialize + DeserializeOwned`).
 /// - Event data is stored as `jsonb`.
 #[derive(Clone)]
-pub struct Store<M> {
+pub struct Store<Id, M> {
     pool: PgPool,
-    _phantom: PhantomData<M>,
+    _phantom: PhantomData<(Id, M)>,
 }
 
-impl<M> Store<M> {
+impl<Id, M> Store<Id, M> {
     /// Construct a `PostgreSQL` event store from a connection pool.
     #[must_use]
     pub const fn new(pool: PgPool) -> Self {
@@ -69,14 +86,27 @@ impl<M> Store<M> {
     }
 }
 
-impl<M> Store<M>
+impl<Id, M> Store<Id, M>
 where
+    Id: Sync,
     M: Sync,
 {
     /// Apply the initial schema (idempotent).
     ///
     /// This uses `CREATE TABLE IF NOT EXISTS` style DDL so it can be run on
-    /// startup.
+    /// startup. The `aggregate_id` columns are `TEXT` so the store is generic
+    /// over `Id`.
+    ///
+    /// # Migrating an existing UUID deployment
+    ///
+    /// Stores created before `Id` became generic used a native `UUID` column.
+    /// To adopt this schema, run once per table:
+    ///
+    /// ```sql
+    /// ALTER TABLE es_streams   ALTER COLUMN aggregate_id TYPE TEXT USING aggregate_id::text;
+    /// ALTER TABLE es_events    ALTER COLUMN aggregate_id TYPE TEXT USING aggregate_id::text;
+    /// ALTER TABLE es_snapshots ALTER COLUMN aggregate_id TYPE TEXT USING aggregate_id::text;
+    /// ```
     ///
     /// # Errors
     ///
@@ -88,7 +118,7 @@ where
             r"
             CREATE TABLE IF NOT EXISTS es_streams (
                 aggregate_kind TEXT NOT NULL,
-                aggregate_id   UUID NOT NULL,
+                aggregate_id   TEXT NOT NULL,
                 last_position  BIGINT NULL,
                 PRIMARY KEY (aggregate_kind, aggregate_id)
             )
@@ -102,7 +132,7 @@ where
             CREATE TABLE IF NOT EXISTS es_events (
                 position       BIGSERIAL PRIMARY KEY,
                 aggregate_kind TEXT NOT NULL,
-                aggregate_id   UUID NOT NULL,
+                aggregate_id   TEXT NOT NULL,
                 event_kind     TEXT NOT NULL,
                 data           JSONB NOT NULL,
                 metadata       JSONB NOT NULL,
@@ -141,14 +171,23 @@ where
 /// Map a result row into a [`StoredEvent`]. The query must select the standard
 /// event columns: `aggregate_kind, aggregate_id, event_kind, position, data,
 /// metadata`.
-pub(crate) fn row_to_stored_event<M>(
+pub(crate) fn row_to_stored_event<Id, M>(
     row: &sqlx::postgres::PgRow,
-) -> Result<StoredEvent<uuid::Uuid, i64, serde_json::Value, M>, Error>
+) -> Result<StoredEvent<Id, i64, serde_json::Value, M>, Error>
 where
+    Id: FromStr,
+    <Id as FromStr>::Err: std::error::Error + Send + Sync + 'static,
     M: DeserializeOwned,
 {
     let aggregate_kind: String = row.try_get("aggregate_kind")?;
-    let aggregate_id: uuid::Uuid = row.try_get("aggregate_id")?;
+    let raw_id: String = row.try_get("aggregate_id")?;
+    let aggregate_id: Id =
+        raw_id
+            .parse()
+            .map_err(|source: <Id as FromStr>::Err| Error::KeyDecode {
+                raw: raw_id,
+                source: Box::new(source),
+            })?;
     let event_kind: String = row.try_get("event_kind")?;
     let position: i64 = row.try_get("position")?;
     let data: sqlx::types::Json<serde_json::Value> = row.try_get("data")?;
@@ -183,10 +222,10 @@ where
 
 /// Insert the stream row if absent (idempotent), so version checks and
 /// `last_position` updates have a row to target.
-async fn ensure_stream(
+async fn ensure_stream<Id: Display + Sync>(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     aggregate_kind: &str,
-    aggregate_id: &uuid::Uuid,
+    aggregate_id: &Id,
 ) -> Result<(), Error> {
     sqlx::query(
         r"
@@ -196,7 +235,7 @@ async fn ensure_stream(
         ",
     )
     .bind(aggregate_kind)
-    .bind(aggregate_id)
+    .bind(aggregate_id.to_string())
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -207,22 +246,24 @@ async fn ensure_stream(
 ///
 /// Takes ownership of `tx` and commits it. Returns the position of the last
 /// event written.
-async fn append_events_and_commit<M>(
+async fn append_events_and_commit<Id, M>(
     mut tx: sqlx::Transaction<'_, Postgres>,
     aggregate_kind: &str,
-    aggregate_id: &uuid::Uuid,
+    aggregate_id: &Id,
     prepared: Vec<(String, serde_json::Value)>,
     metadata: &M,
 ) -> Result<i64, Error>
 where
+    Id: Display + Sync,
     M: Serialize + Sync,
 {
+    let aggregate_id = aggregate_id.to_string();
     let mut qb = QueryBuilder::<Postgres>::new(
         "INSERT INTO es_events (aggregate_kind, aggregate_id, event_kind, data, metadata) ",
     );
     qb.push_values(prepared, |mut b, (kind, data)| {
         b.push_bind(aggregate_kind);
-        b.push_bind(aggregate_id);
+        b.push_bind(&aggregate_id);
         b.push_bind(kind);
         b.push_bind(sqlx::types::Json(data));
         b.push_bind(sqlx::types::Json(metadata));
@@ -241,7 +282,7 @@ where
     )
     .bind(last_position)
     .bind(aggregate_kind)
-    .bind(aggregate_id)
+    .bind(&aggregate_id)
     .execute(&mut *tx)
     .await?;
 
@@ -256,13 +297,15 @@ where
     Ok(last_position)
 }
 
-impl<M> EventStore for Store<M>
+impl<Id, M> EventStore for Store<Id, M>
 where
+    Id: Clone + Send + Sync + 'static + Display + FromStr,
+    <Id as FromStr>::Err: std::error::Error + Send + Sync + 'static,
     M: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
     type Data = serde_json::Value;
     type Error = Error;
-    type Id = uuid::Uuid;
+    type Id = Id;
     type Metadata = M;
     type Position = i64;
 
@@ -285,7 +328,7 @@ where
             r"SELECT last_position FROM es_streams WHERE aggregate_kind = $1 AND aggregate_id = $2",
         )
         .bind(aggregate_kind)
-        .bind(aggregate_id)
+        .bind(aggregate_id.to_string())
         .fetch_optional(&self.pool)
         .await?
         .flatten();
@@ -376,7 +419,7 @@ where
                 ",
         )
         .bind(aggregate_kind)
-        .bind(aggregate_id)
+        .bind(aggregate_id.to_string())
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| OptimisticCommitError::Store(Error::Database(e)))?;
@@ -447,7 +490,7 @@ where
             }
 
             if let Some(id) = &filter.aggregate_id {
-                qb.push(" AND aggregate_id = ").push_bind(id);
+                qb.push(" AND aggregate_id = ").push_bind(id.to_string());
             }
 
             if let Some(after) = filter.after_position {
@@ -461,11 +504,32 @@ where
         qb.push(") t ORDER BY position ASC");
 
         let rows = qb.build().fetch_all(&self.pool).await?;
-        rows.iter().map(row_to_stored_event::<M>).collect()
+        rows.iter().map(row_to_stored_event::<Id, M>).collect()
     }
 }
 
-impl<M> GloballyOrderedStore for Store<M> where
-    M: Serialize + DeserializeOwned + Clone + Send + Sync + 'static
+impl<Id, M> GloballyOrderedStore for Store<Id, M>
+where
+    Id: Clone + Send + Sync + 'static + Display + FromStr,
+    <Id as FromStr>::Err: std::error::Error + Send + Sync + 'static,
+    M: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
+}
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error as StdError;
+
+    use super::Error;
+
+    #[test]
+    fn key_decode_error_includes_raw_value_in_display() {
+        let err = Error::KeyDecode {
+            raw: "not-a-valid-id".to_string(),
+            source: "bad format".into(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("not-a-valid-id"));
+        assert!(err.source().is_some());
+    }
 }

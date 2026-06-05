@@ -11,8 +11,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use sourcery::{
-    Aggregate, Apply, ApplyProjection, Create, DomainEvent, Handle, HandleCreate, Projection,
-    Repository, store::inmemory,
+    Aggregate, Apply, ApplyProjection, Create, DomainEvent, EventContext, Handle, HandleCreate,
+    Projection, Repository, store::inmemory,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,22 +111,20 @@ pub struct AccountBalances {
 impl ApplyProjection<AccountOpened> for AccountBalances {
     fn apply_projection(
         &mut self,
-        account_id: &Self::Id,
+        ctx: EventContext<'_, Self::Id, Self::Metadata>,
         _event: &AccountOpened,
-        _metadata: &Self::Metadata,
     ) {
-        self.balances.insert(account_id.clone(), 0);
+        self.balances.insert(ctx.aggregate_id.clone(), 0);
     }
 }
 
 impl ApplyProjection<FundsDeposited> for AccountBalances {
     fn apply_projection(
         &mut self,
-        account_id: &Self::Id,
+        ctx: EventContext<'_, Self::Id, Self::Metadata>,
         event: &FundsDeposited,
-        _metadata: &Self::Metadata,
     ) {
-        *self.balances.entry(account_id.clone()).or_default() += event.amount;
+        *self.balances.entry(ctx.aggregate_id.clone()).or_default() += event.amount;
     }
 }
 

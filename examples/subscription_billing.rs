@@ -31,8 +31,8 @@ use std::{collections::HashMap, fmt};
 
 use serde::{Deserialize, Serialize};
 use sourcery::{
-    Aggregate, Apply, ApplyProjection, Create, DomainEvent, Handle, HandleCreate, Projection,
-    Repository, store::inmemory,
+    Aggregate, Apply, ApplyProjection, Create, DomainEvent, EventContext, Handle, HandleCreate,
+    Projection, Repository, store::inmemory,
 };
 
 // =============================================================================
@@ -423,85 +423,80 @@ impl CustomerBillingProjection {
 impl ApplyProjection<SubscriptionStarted> for CustomerBillingProjection {
     fn apply_projection(
         &mut self,
-        aggregate_id: &Self::Id,
+        ctx: EventContext<'_, Self::Id, Self::Metadata>,
         event: &SubscriptionStarted,
-        metadata: &Self::Metadata,
     ) {
-        let customer_id = aggregate_id;
+        let customer_id = ctx.aggregate_id;
         let snapshot = self.touch_customer(customer_id.to_owned());
         snapshot.active_plan = Some(event.plan_name.clone());
         snapshot.is_active = true;
         snapshot
             .last_correlation_id
-            .clone_from(&metadata.correlation_id);
-        snapshot.last_updated_by.clone_from(&metadata.user_id);
+            .clone_from(&ctx.metadata.correlation_id);
+        snapshot.last_updated_by.clone_from(&ctx.metadata.user_id);
     }
 }
 
 impl ApplyProjection<SubscriptionCancelled> for CustomerBillingProjection {
     fn apply_projection(
         &mut self,
-        aggregate_id: &Self::Id,
+        ctx: EventContext<'_, Self::Id, Self::Metadata>,
         _event: &SubscriptionCancelled,
-        metadata: &Self::Metadata,
     ) {
-        let customer_id = aggregate_id;
+        let customer_id = ctx.aggregate_id;
         let snapshot = self.touch_customer(customer_id.to_owned());
         snapshot.is_active = false;
         snapshot
             .last_correlation_id
-            .clone_from(&metadata.correlation_id);
-        snapshot.last_updated_by.clone_from(&metadata.user_id);
+            .clone_from(&ctx.metadata.correlation_id);
+        snapshot.last_updated_by.clone_from(&ctx.metadata.user_id);
     }
 }
 
 impl ApplyProjection<InvoiceIssued> for CustomerBillingProjection {
     fn apply_projection(
         &mut self,
-        _aggregate_id: &Self::Id,
+        ctx: EventContext<'_, Self::Id, Self::Metadata>,
         event: &InvoiceIssued,
-        metadata: &Self::Metadata,
     ) {
         let snapshot = self.touch_customer(event.customer_id.clone());
         snapshot.outstanding_balance_cents += event.amount_cents;
         snapshot.last_invoice_due = Some(event.due_date.clone());
         snapshot
             .last_correlation_id
-            .clone_from(&metadata.correlation_id);
-        snapshot.last_updated_by.clone_from(&metadata.user_id);
+            .clone_from(&ctx.metadata.correlation_id);
+        snapshot.last_updated_by.clone_from(&ctx.metadata.user_id);
     }
 }
 
 impl ApplyProjection<PaymentRecorded> for CustomerBillingProjection {
     fn apply_projection(
         &mut self,
-        _aggregate_id: &Self::Id,
+        ctx: EventContext<'_, Self::Id, Self::Metadata>,
         event: &PaymentRecorded,
-        metadata: &Self::Metadata,
     ) {
         let snapshot = self.touch_customer(event.customer_id.clone());
         snapshot.outstanding_balance_cents =
             (snapshot.outstanding_balance_cents - event.amount_cents).max(0);
         snapshot
             .last_correlation_id
-            .clone_from(&metadata.correlation_id);
-        snapshot.last_updated_by.clone_from(&metadata.user_id);
+            .clone_from(&ctx.metadata.correlation_id);
+        snapshot.last_updated_by.clone_from(&ctx.metadata.user_id);
     }
 }
 
 impl ApplyProjection<InvoiceSettled> for CustomerBillingProjection {
     fn apply_projection(
         &mut self,
-        _aggregate_id: &Self::Id,
+        ctx: EventContext<'_, Self::Id, Self::Metadata>,
         event: &InvoiceSettled,
-        metadata: &Self::Metadata,
     ) {
         let snapshot = self.touch_customer(event.customer_id.clone());
         snapshot.outstanding_balance_cents = 0;
         snapshot
             .last_correlation_id
-            .clone_from(&metadata.correlation_id);
-        snapshot.last_updated_by.clone_from(&metadata.user_id);
+            .clone_from(&ctx.metadata.correlation_id);
+        snapshot.last_updated_by.clone_from(&ctx.metadata.user_id);
     }
 }
 

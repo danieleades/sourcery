@@ -35,7 +35,7 @@
 //!
 //! [`Repository::load_projection`]: crate::repository::Repository::load_projection
 
-use std::{collections::HashMap, future::Future, pin::Pin};
+use std::{collections::HashMap, future::Future, marker::PhantomData, pin::Pin};
 
 use futures_core::Stream;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -273,9 +273,9 @@ pub trait SubscribableStore: EventStore {
 }
 // ANCHOR_END: subscribable_store_trait
 
-/// Errors that can occur during subscription lifecycle.
+/// Errors that can occur in the shared subscription/reactor runner lifecycle.
 #[derive(Debug, Error)]
-pub enum SubscriptionError<StoreError>
+pub enum RunnerError<StoreError>
 where
     StoreError: std::error::Error + 'static,
 {
@@ -299,25 +299,39 @@ where
 /// graceful shutdown and to observe task errors.
 ///
 /// [`stop()`]: SubscriptionHandle::stop
-pub struct SubscriptionHandle<StoreError>
+pub struct SubscriptionHandle<StoreError, TaskError = RunnerError<StoreError>>
 where
     StoreError: std::error::Error + 'static,
+    TaskError: From<RunnerError<StoreError>>,
 {
     stop_tx: Option<tokio::sync::oneshot::Sender<()>>,
-    task: Option<JoinHandle<Result<(), SubscriptionError<StoreError>>>>,
+    task: Option<JoinHandle<Result<(), TaskError>>>,
+    store_error: PhantomData<fn() -> StoreError>,
 }
 
-impl<StoreError> SubscriptionHandle<StoreError>
+impl<StoreError, TaskError> SubscriptionHandle<StoreError, TaskError>
 where
     StoreError: std::error::Error + 'static,
+    TaskError: From<RunnerError<StoreError>>,
 {
+    pub(crate) fn new(
+        stop_tx: tokio::sync::oneshot::Sender<()>,
+        task: JoinHandle<Result<(), TaskError>>,
+    ) -> Self {
+        Self {
+            stop_tx: Some(stop_tx),
+            task: Some(task),
+            store_error: PhantomData,
+        }
+    }
+
     /// Stop the subscription gracefully and wait for it to finish.
     ///
     /// # Errors
     ///
     /// Returns the subscription's error if it failed before being stopped.
     #[allow(clippy::missing_panics_doc)]
-    pub async fn stop(mut self) -> Result<(), SubscriptionError<StoreError>> {
+    pub async fn stop(mut self) -> Result<(), TaskError> {
         // By taking the tx, we ensure Drop won't try to send it again.
         if let Some(tx) = self.stop_tx.take() {
             let _ = tx.send(());
@@ -325,7 +339,9 @@ where
 
         // Taking the task ensures that is_running() returns false from here on.
         if let Some(task) = self.task.take() {
-            return task.await.map_err(|_| SubscriptionError::TaskPanicked)?;
+            return task
+                .await
+                .map_err(|_| TaskError::from(RunnerError::TaskPanicked))?;
         }
 
         Ok(())
@@ -338,9 +354,10 @@ where
     }
 }
 
-impl<StoreError> Drop for SubscriptionHandle<StoreError>
+impl<StoreError, TaskError> Drop for SubscriptionHandle<StoreError, TaskError>
 where
     StoreError: std::error::Error + 'static,
+    TaskError: From<RunnerError<StoreError>>,
 {
     fn drop(&mut self) {
         if self.is_running() {
@@ -403,7 +420,7 @@ where
     /// # Errors
     ///
     /// Returns the subscription's error if it failed before being stopped.
-    pub async fn stop(self) -> Result<(), SubscriptionError<StoreError>>
+    pub async fn stop(self) -> Result<(), RunnerError<StoreError>>
     where
         P: Send,
         Cp: Send + Sync,
@@ -623,7 +640,7 @@ where
     /// snapshot of the projection state.
     pub async fn start(
         self,
-    ) -> Result<Subscription<P, S::Checkpoint, S::Error>, SubscriptionError<S::Error>>
+    ) -> Result<Subscription<P, S::Checkpoint, S::Error>, RunnerError<S::Error>>
     where
         P: Clone,
     {
@@ -662,7 +679,7 @@ where
         let catchup_target = store
             .current_checkpoint(&event_filters)
             .await
-            .map_err(SubscriptionError::Store)?;
+            .map_err(RunnerError::Store)?;
 
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
@@ -671,14 +688,19 @@ where
         // catch-up and live phases otherwise share a single loop in `run`.
         let caught_up = catchup_target.is_none() || from_checkpoint >= catchup_target;
 
-        let subscription_loop = SubscriptionLoop {
+        let strategy = ProjectionStrategy {
             snapshots,
             instance_id,
             handlers,
             projection,
             updates_tx: updates_tx.clone(),
-            progress_tx,
             current: std::sync::Arc::clone(&current),
+            events_since_snapshot: 0,
+        };
+
+        let runner = EventRunner {
+            strategy,
+            progress_tx,
             catchup_target,
             // `last_checkpoint` tracks matching events; `observed` is the global
             // progress cursor (max of matching checkpoints and frontiers). They
@@ -686,17 +708,11 @@ where
             // advance `observed` for `wait_for` without moving `last_checkpoint`.
             last_checkpoint: from_checkpoint.clone(),
             observed: from_checkpoint.clone(),
-            events_since_snapshot: 0,
             caught_up,
         };
 
-        let task = tokio::spawn(subscription_loop.run(
-            store,
-            event_filters,
-            from_checkpoint,
-            stop_rx,
-            ready_tx,
-        ));
+        let task =
+            tokio::spawn(runner.run(store, event_filters, from_checkpoint, stop_rx, ready_tx));
 
         match ready_rx.await {
             Ok(()) => Ok(Subscription {
@@ -706,64 +722,87 @@ where
                 handle: SubscriptionHandle {
                     stop_tx: Some(stop_tx),
                     task: Some(task),
+                    store_error: PhantomData,
                 },
             }),
             Err(_) => match task.await {
-                Ok(Ok(())) => Err(SubscriptionError::CatchupInterrupted),
+                Ok(Ok(())) => Err(RunnerError::CatchupInterrupted),
                 Ok(Err(error)) => Err(error),
-                Err(_) => Err(SubscriptionError::TaskPanicked),
+                Err(_) => Err(RunnerError::TaskPanicked),
             },
         }
     }
 }
 
-/// Owned state for the background subscription loop, factored out of
-/// [`SubscriptionBuilder::start`] so that method stays focused on wiring up
-/// channels while the catch-up/live loop lives here.
-///
-/// `store` and the stream derived from it are intentionally *not* held here:
-/// the stream borrows the store for its whole lifetime, so keeping the store as
-/// a separate `run` parameter lets the per-event handler take `&mut self`
-/// without conflicting with that borrow.
-struct SubscriptionLoop<S, P, SS>
-where
-    S: SubscribableStore,
-    P: Projection<Id = S::Id>,
-{
-    snapshots: SS,
-    instance_id: P::InstanceId,
-    handlers: HashMap<&'static str, crate::projection::EventHandler<P, S>>,
-    projection: P,
-    updates_tx: broadcast::Sender<P>,
-    progress_tx: tokio::sync::watch::Sender<Option<S::Checkpoint>>,
-    current: std::sync::Arc<std::sync::Mutex<P>>,
-    catchup_target: Option<S::Checkpoint>,
-    last_checkpoint: Option<S::Checkpoint>,
-    observed: Option<S::Checkpoint>,
-    events_since_snapshot: u64,
-    caught_up: bool,
+/// Result of per-event strategy work in the shared runner.
+pub(crate) enum RunEventOutcome {
+    /// Event work completed and progress can be persisted/advanced.
+    Processed,
+    /// A cooperative stop was requested while the strategy was working.
+    Stop,
 }
 
-impl<S, P, SS> SubscriptionLoop<S, P, SS>
+/// Per-consumer strategy plugged into the shared catch-up + live event runner.
+pub(crate) trait RunStrategy<S>: Send
+where
+    S: SubscribableStore,
+{
+    /// Error surfaced by this consumer.
+    type Error: From<RunnerError<S::Error>> + Send + 'static;
+
+    /// Handle one already-deduplicated matching event.
+    fn on_event<'a>(
+        &'a mut self,
+        checkpoint: &'a S::Checkpoint,
+        event: &'a StoredEvent<S::Id, S::Position, S::Data, S::Metadata>,
+        store: &'a S,
+        stop_rx: &'a mut tokio::sync::oneshot::Receiver<()>,
+    ) -> impl Future<Output = Result<RunEventOutcome, Self::Error>> + Send + 'a;
+
+    /// Persist progress after a successful event. Strategies decide whether
+    /// persistence failures are fatal.
+    fn persist<'a>(
+        &'a mut self,
+        checkpoint: &'a S::Checkpoint,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a;
+
+    /// Final persistence on shutdown.
+    fn on_shutdown(
+        self,
+        last_checkpoint: Option<S::Checkpoint>,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+}
+
+/// Shared background runner for catch-up + live subscriptions.
+pub(crate) struct EventRunner<S, Strategy>
+where
+    S: SubscribableStore,
+    Strategy: RunStrategy<S>,
+{
+    pub(crate) strategy: Strategy,
+    pub(crate) progress_tx: tokio::sync::watch::Sender<Option<S::Checkpoint>>,
+    pub(crate) catchup_target: Option<S::Checkpoint>,
+    pub(crate) last_checkpoint: Option<S::Checkpoint>,
+    pub(crate) observed: Option<S::Checkpoint>,
+    pub(crate) caught_up: bool,
+}
+
+impl<S, Strategy> EventRunner<S, Strategy>
 where
     S: SubscribableStore + Clone + Send + Sync + 'static,
     S::Data: Send,
     S::Metadata: Send + Sync,
-    P: Projection<Id = S::Id, Metadata = S::Metadata> + Clone + Serialize + Send + Sync + 'static,
-    P::InstanceId: Send + Sync + 'static,
-    P::Metadata: Send,
-    SS: SnapshotStore<P::InstanceId, Position = S::Checkpoint> + Send + Sync + 'static,
+    Strategy: RunStrategy<S> + 'static,
 {
-    /// Drive the shared catch-up + live loop until stopped or the stream ends,
-    /// taking a final snapshot on the way out.
-    async fn run(
+    /// Drive the shared catch-up + live loop until stopped or the stream ends.
+    pub(crate) async fn run(
         mut self,
         store: S,
         event_filters: Vec<EventFilter<S::Id, S::Position>>,
         from_checkpoint: Option<S::Checkpoint>,
         mut stop_rx: tokio::sync::oneshot::Receiver<()>,
         ready_tx: tokio::sync::oneshot::Sender<()>,
-    ) -> Result<(), SubscriptionError<S::Error>> {
+    ) -> Result<(), Strategy::Error> {
         let mut ready_tx = Some(ready_tx);
         if self.caught_up {
             signal(&mut ready_tx);
@@ -783,22 +822,20 @@ where
                         tracing::debug!("subscription stream ended");
                         break;
                     };
-                    self.handle_delivery(result, &store, &mut ready_tx).await?;
+                    if matches!(
+                        self
+                        .handle_delivery(result, &store, &mut stop_rx, &mut ready_tx)
+                        .await?,
+                        RunEventOutcome::Stop
+                    ) {
+                        tracing::debug!("subscription stopped during event handling");
+                        break;
+                    }
                 }
             }
         }
 
-        // Final snapshot on shutdown.
-        maintain_snapshot(
-            &self.snapshots,
-            &self.instance_id,
-            self.last_checkpoint.as_ref(),
-            &mut self.events_since_snapshot,
-            &self.projection,
-        )
-        .await;
-
-        Ok(())
+        self.strategy.on_shutdown(self.last_checkpoint).await
     }
 
     /// Apply one stream item: advance the global cursor on a frontier, or
@@ -808,13 +845,14 @@ where
         &mut self,
         result: Result<Delivery<S>, S::Error>,
         store: &S,
+        stop_rx: &mut tokio::sync::oneshot::Receiver<()>,
         ready_tx: &mut Option<tokio::sync::oneshot::Sender<()>>,
-    ) -> Result<(), SubscriptionError<S::Error>> {
-        let checkpoint = match result.map_err(SubscriptionError::Store)? {
+    ) -> Result<RunEventOutcome, Strategy::Error> {
+        let checkpoint = match result.map_err(RunnerError::Store)? {
             Delivery::Frontier(frontier) => {
                 // No event: advance global progress only.
                 advance_observed(&mut self.observed, &self.progress_tx, frontier);
-                return Ok(());
+                return Ok(RunEventOutcome::Processed);
             }
             Delivery::Event(delivery) => {
                 // Checkpoint-based deduplication (delivery order is strictly
@@ -822,41 +860,23 @@ where
                 if let Some(ref lc) = self.last_checkpoint
                     && delivery.checkpoint <= *lc
                 {
-                    return Ok(());
+                    return Ok(RunEventOutcome::Processed);
                 }
 
-                let checkpoint = delivery.checkpoint.clone();
-                process_subscription_event(
-                    &mut self.projection,
-                    delivery,
-                    &self.handlers,
-                    store,
-                    &mut self.last_checkpoint,
-                    &mut self.events_since_snapshot,
-                )?;
-                // Publish the new state and broadcast it under one lock. Holding
-                // the lock across both makes `updates()` (which subscribes and
-                // snapshots under the same lock) see an exact boundary, and
-                // doing it before advancing progress (below) ensures a
-                // `wait_for` waiter that wakes on the checkpoint always observes
-                // a `current()` that includes it. The broadcast is skipped when
-                // no consumer is subscribed, so a `current()`-only subscription
-                // never clones state for the stream.
-                {
-                    let mut current = self.current.lock().expect("projection mutex poisoned");
-                    *current = self.projection.clone();
-                    if self.updates_tx.receiver_count() > 0 {
-                        // Clone through the guard so the broadcast provably
-                        // happens under the same lock `updates()` holds.
-                        let _ = self.updates_tx.send(current.clone());
-                    }
+                let outcome = self
+                    .strategy
+                    .on_event(&delivery.checkpoint, &delivery.event, store, stop_rx)
+                    .await?;
+                if matches!(outcome, RunEventOutcome::Stop) {
+                    return Ok(RunEventOutcome::Stop);
                 }
-                checkpoint
+                delivery.checkpoint
             }
         };
 
-        // Advance read-your-writes progress before the (possibly slow) snapshot
-        // offer, so waiters wake as early as possible.
+        self.last_checkpoint = Some(checkpoint.clone());
+        self.strategy.persist(&checkpoint).await?;
+
         advance_observed(&mut self.observed, &self.progress_tx, checkpoint);
 
         // Signal readiness once we've replayed up to the target.
@@ -867,18 +887,111 @@ where
             signal(ready_tx);
         }
 
-        // Offer a snapshot after every event; the snapshot store's own policy
-        // decides whether to persist.
-        maintain_snapshot(
-            &self.snapshots,
-            &self.instance_id,
-            self.last_checkpoint.as_ref(),
-            &mut self.events_since_snapshot,
-            &self.projection,
-        )
-        .await;
+        Ok(RunEventOutcome::Processed)
+    }
+}
 
-        Ok(())
+/// Projection-specific work plugged into the shared runner.
+struct ProjectionStrategy<S, P, SS>
+where
+    S: EventStore,
+    P: Projection<Id = S::Id>,
+{
+    snapshots: SS,
+    instance_id: P::InstanceId,
+    handlers: HashMap<&'static str, crate::projection::EventHandler<P, S>>,
+    projection: P,
+    updates_tx: broadcast::Sender<P>,
+    current: std::sync::Arc<std::sync::Mutex<P>>,
+    events_since_snapshot: u64,
+}
+
+// The strategy futures must be `Send` (the runner spawns them), which an
+// `async fn` return cannot express; the explicit `-> impl Future + Send` is
+// required, so `manual_async_fn` does not apply here.
+#[allow(clippy::manual_async_fn)]
+impl<S, P, SS> RunStrategy<S> for ProjectionStrategy<S, P, SS>
+where
+    S: SubscribableStore + Send + Sync + 'static,
+    S::Data: Send,
+    S::Metadata: Send + Sync,
+    P: Projection<Id = S::Id, Metadata = S::Metadata> + Clone + Serialize + Send + Sync + 'static,
+    P::InstanceId: Send + Sync + 'static,
+    P::Metadata: Send,
+    SS: SnapshotStore<P::InstanceId, Position = S::Checkpoint> + Send + Sync + 'static,
+{
+    type Error = RunnerError<S::Error>;
+
+    fn on_event<'a>(
+        &'a mut self,
+        _checkpoint: &'a S::Checkpoint,
+        event: &'a StoredEvent<S::Id, S::Position, S::Data, S::Metadata>,
+        store: &'a S,
+        _stop_rx: &'a mut tokio::sync::oneshot::Receiver<()>,
+    ) -> impl Future<Output = Result<RunEventOutcome, Self::Error>> + Send + 'a {
+        async move {
+            // Unknown kinds are ignored: filters can intentionally include
+            // wider sets than this projection currently handles.
+            if let Some(handler) = self.handlers.get(event.kind()) {
+                apply_handler(handler, &mut self.projection, event, store)?;
+            }
+
+            self.events_since_snapshot += 1;
+
+            // Publish the new state and broadcast it under one lock. Holding the
+            // lock across both makes `updates()` (which subscribes and snapshots
+            // under the same lock) see an exact boundary. The shared runner only
+            // advances `wait_for` progress after `on_event` returns (and after
+            // `persist`), so a waiter that wakes on a checkpoint always observes
+            // a `current()` that already includes it. The broadcast is skipped
+            // when no consumer is subscribed, so a `current()`-only subscription
+            // never clones state for the stream.
+            {
+                let mut current = self.current.lock().expect("projection mutex poisoned");
+                *current = self.projection.clone();
+                if self.updates_tx.receiver_count() > 0 {
+                    // Clone through the guard so the broadcast provably
+                    // happens under the same lock `updates()` holds.
+                    let _ = self.updates_tx.send(current.clone());
+                }
+            }
+
+            Ok(RunEventOutcome::Processed)
+        }
+    }
+
+    fn persist<'a>(
+        &'a mut self,
+        checkpoint: &'a S::Checkpoint,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a {
+        async move {
+            maintain_snapshot(
+                &self.snapshots,
+                &self.instance_id,
+                Some(checkpoint),
+                &mut self.events_since_snapshot,
+                &self.projection,
+            )
+            .await;
+            Ok(())
+        }
+    }
+
+    fn on_shutdown(
+        mut self,
+        last_checkpoint: Option<S::Checkpoint>,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        async move {
+            maintain_snapshot(
+                &self.snapshots,
+                &self.instance_id,
+                last_checkpoint.as_ref(),
+                &mut self.events_since_snapshot,
+                &self.projection,
+            )
+            .await;
+            Ok(())
+        }
     }
 }
 
@@ -936,56 +1049,19 @@ where
 }
 
 /// Apply one decoded handler closure and normalise its error into
-/// [`SubscriptionError`].
+/// [`RunnerError`].
 fn apply_handler<P, S>(
     handler: &crate::projection::EventHandler<P, S>,
     projection: &mut P,
     stored: &StoredEvent<S::Id, S::Position, S::Data, S::Metadata>,
     store: &S,
-) -> Result<(), SubscriptionError<S::Error>>
+) -> Result<(), RunnerError<S::Error>>
 where
-    P: Projection<Id = S::Id>,
+    P: Projection<Id = S::Id, Metadata = S::Metadata>,
     S: EventStore,
 {
-    (handler)(
-        projection,
-        stored.aggregate_id(),
-        stored,
-        stored.metadata(),
-        store,
-    )
-    .map_err(|error| SubscriptionError::EventDecode(error.into_decode_error()))
-}
-
-/// Process one event through handler dispatch and checkpoint tracking.
-///
-/// Publishing the new state (to `current()` and the live update stream) is the
-/// caller's responsibility, so it can do so atomically under the projection
-/// lock.
-fn process_subscription_event<P, S>(
-    projection: &mut P,
-    delivery: Checkpointed<S>,
-    handlers: &HashMap<&'static str, crate::projection::EventHandler<P, S>>,
-    store: &S,
-    last_checkpoint: &mut Option<S::Checkpoint>,
-    events_since_snapshot: &mut u64,
-) -> Result<(), SubscriptionError<S::Error>>
-where
-    P: Projection<Id = S::Id>,
-    S: SubscribableStore,
-{
-    let Checkpointed { checkpoint, event } = delivery;
-
-    // Unknown kinds are ignored: filters can intentionally include wider sets
-    // than this projection currently handles.
-    if let Some(handler) = handlers.get(event.kind()) {
-        apply_handler(handler, projection, &event, store)?;
-    }
-
-    *last_checkpoint = Some(checkpoint);
-    *events_since_snapshot += 1;
-
-    Ok(())
+    (handler)(projection, stored, store)
+        .map_err(|error| RunnerError::EventDecode(error.into_decode_error()))
 }
 
 /// Offer a snapshot for the current projection state, resetting the pending
@@ -1065,15 +1141,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn subscription_error_store_displays() {
-        let err: SubscriptionError<io::Error> = SubscriptionError::Store(io::Error::other("test"));
+    fn runner_error_store_displays() {
+        let err: RunnerError<io::Error> = RunnerError::Store(io::Error::other("test"));
         assert!(err.to_string().contains("store error"));
         assert!(err.source().is_some());
     }
 
     #[test]
-    fn subscription_error_task_panicked_displays() {
-        let err: SubscriptionError<io::Error> = SubscriptionError::TaskPanicked;
+    fn runner_error_task_panicked_displays() {
+        let err: RunnerError<io::Error> = RunnerError::TaskPanicked;
         assert!(err.to_string().contains("panicked"));
     }
 
@@ -1082,7 +1158,28 @@ mod tests {
         let handle: SubscriptionHandle<io::Error> = SubscriptionHandle {
             stop_tx: None,
             task: None,
+            store_error: PhantomData,
         };
         assert!(!handle.is_running());
+    }
+
+    #[test]
+    fn runner_error_event_decode_has_source() {
+        let inner = crate::event::EventDecodeError::Store(io::Error::other("bad bytes"));
+        let err: RunnerError<io::Error> = RunnerError::EventDecode(inner);
+        assert!(err.to_string().contains("decode event"));
+        assert!(err.source().is_some());
+    }
+
+    #[test]
+    fn runner_error_catchup_interrupted_displays() {
+        let err: RunnerError<io::Error> = RunnerError::CatchupInterrupted;
+        assert!(err.to_string().contains("catch-up"));
+    }
+
+    #[test]
+    fn await_error_subscription_stopped_displays() {
+        let err = AwaitError::SubscriptionStopped;
+        assert!(err.to_string().contains("stopped"));
     }
 }

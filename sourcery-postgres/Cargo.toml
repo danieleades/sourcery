@@ -36,7 +36,7 @@ testcontainers = { version = "0.27", default-features = false }
 testcontainers-modules = { version = "0.15", default-features = false, features = ["postgres"] }
 tokio = { version = "1", default-features = false, features = ["macros", "rt-multi-thread", "time"] }
 tokio-stream = { version = "0.1", default-features = false }
-uuid = { version = "1", default-features = false, features = ["std", "v4"] }
+uuid = { version = "1", default-features = false, features = ["std", "v4", "serde"] }
 
 [[bench]]
 name = "snapshot_store"

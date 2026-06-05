@@ -70,10 +70,11 @@ fn event_filters() -> [EventFilter<Uuid, i64>; 1] {
 
 /// Await the next matching event within 5s, skipping [`Delivery::Frontier`]
 /// global-progress markers (which carry no event).
-async fn next_event<S>(stream: &mut S) -> Checkpointed<Store<TestMetadata>>
+async fn next_event<S>(stream: &mut S) -> Checkpointed<Store<Uuid, TestMetadata>>
 where
-    S: tokio_stream::Stream<Item = Result<Delivery<Store<TestMetadata>>, sourcery_postgres::Error>>
-        + Unpin,
+    S: tokio_stream::Stream<
+            Item = Result<Delivery<Store<Uuid, TestMetadata>>, sourcery_postgres::Error>,
+        > + Unpin,
 {
     loop {
         match timeout(Duration::from_secs(5), stream.next())
@@ -92,8 +93,9 @@ where
 /// Returns `true` if no event arrived in the window (frontiers are allowed).
 async fn no_event_within<S>(stream: &mut S, within: Duration) -> bool
 where
-    S: tokio_stream::Stream<Item = Result<Delivery<Store<TestMetadata>>, sourcery_postgres::Error>>
-        + Unpin,
+    S: tokio_stream::Stream<
+            Item = Result<Delivery<Store<Uuid, TestMetadata>>, sourcery_postgres::Error>,
+        > + Unpin,
 {
     let deadline = tokio::time::Instant::now() + within;
     loop {
@@ -120,7 +122,7 @@ async fn raw_insert<'c>(
          ($1, $2, $3, $4, $5) RETURNING position, xid",
     )
     .bind("test.agg")
-    .bind(aggregate_id)
+    .bind(aggregate_id.to_string())
     .bind(TestEvent::KIND)
     .bind(sqlx::types::Json(serde_json::json!({ "data": data })))
     .bind(sqlx::types::Json(metadata()))
@@ -132,7 +134,7 @@ async fn raw_insert<'c>(
 #[tokio::test]
 async fn subscription_catches_up_then_streams_live() {
     let db = TestDb::new().await;
-    let store: Store<TestMetadata> = Store::new(db.pool.clone());
+    let store: Store<Uuid, TestMetadata> = Store::new(db.pool.clone());
     store.migrate().await.unwrap();
 
     let id = Uuid::new_v4();
@@ -185,7 +187,7 @@ async fn subscription_catches_up_then_streams_live() {
 #[tokio::test]
 async fn in_flight_transaction_gap_is_not_skipped() {
     let db = TestDb::new().await;
-    let store: Store<TestMetadata> = Store::new(db.pool.clone());
+    let store: Store<Uuid, TestMetadata> = Store::new(db.pool.clone());
     store.migrate().await.unwrap();
 
     let id = Uuid::new_v4();
@@ -230,7 +232,7 @@ async fn in_flight_transaction_gap_is_not_skipped() {
 #[tokio::test]
 async fn subscription_resumes_from_checkpoint() {
     let db = TestDb::new().await;
-    let store: Store<TestMetadata> = Store::new(db.pool.clone());
+    let store: Store<Uuid, TestMetadata> = Store::new(db.pool.clone());
     store.migrate().await.unwrap();
 
     let id = Uuid::new_v4();
@@ -265,7 +267,7 @@ async fn subscription_resumes_from_checkpoint() {
 #[tokio::test]
 async fn current_checkpoint_reports_latest() {
     let db = TestDb::new().await;
-    let store: Store<TestMetadata> = Store::new(db.pool.clone());
+    let store: Store<Uuid, TestMetadata> = Store::new(db.pool.clone());
     store.migrate().await.unwrap();
 
     let filters = event_filters();
@@ -290,7 +292,7 @@ async fn current_checkpoint_reports_latest() {
 #[tokio::test]
 async fn checkpoint_for_position_resolves_exact_watermark() {
     let db = TestDb::new().await;
-    let store: Store<TestMetadata> = Store::new(db.pool.clone());
+    let store: Store<Uuid, TestMetadata> = Store::new(db.pool.clone());
     store.migrate().await.unwrap();
 
     // No event at this position yet.

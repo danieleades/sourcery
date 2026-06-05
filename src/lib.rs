@@ -5,18 +5,26 @@ pub use sourcery_core::test;
 pub use sourcery_core::{
     aggregate,
     aggregate::{Aggregate, Apply, Create, Handle, HandleCreate},
+    concurrency::ConcurrencyConflict,
     event,
     event::{DomainEvent, EventDecodeError, ProjectionEvent},
+    key,
+    key::StorageKey,
     projection,
-    projection::{ApplyProjection, Filters, Projection},
+    projection::{ApplyProjection, EventContext, Filters, Projection},
+    reactor,
+    reactor::{
+        React, ReactError, ReactFilters, Reactor, ReactorBuilder, ReactorError, ReactorHandle,
+        RetryPolicy,
+    },
     repository,
     repository::{
         OptimisticRepository, OptimisticSnapshotRepository, Repository, UncheckedRepository,
     },
     subscription,
     subscription::{
-        AwaitError, Checkpointed, ConsistencyToken, Delivery, SubscribableStore, Subscription,
-        SubscriptionBuilder, SubscriptionError, SubscriptionHandle,
+        AwaitError, Checkpointed, ConsistencyToken, Delivery, RunnerError, SubscribableStore,
+        Subscription, SubscriptionBuilder, SubscriptionHandle,
     },
 };
 // Re-export proc macro derives so consumers only depend on `sourcery`.

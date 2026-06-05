@@ -31,6 +31,26 @@ impl DomainEvent for TestEvent {
     const KIND: &'static str = "test-event";
 }
 
+/// A domain-newtype aggregate id, proving the store is generic over `Id`: any
+/// `Display + FromStr` type is stored in the `TEXT` key column. Parsing back
+/// from the column is infallible here (it wraps a `String`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Sku(String);
+
+impl std::fmt::Display for Sku {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::str::FromStr for Sku {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(s.to_string()))
+    }
+}
+
 /// Test helper to set up a `PostgreSQL` container and connection pool.
 struct TestDb {
     _container: ContainerAsync<Postgres>,
@@ -71,7 +91,7 @@ fn test_metadata(user_id: &str) -> TestMetadata {
 #[tokio::test]
 async fn migrate_creates_event_tables() {
     let db = TestDb::new().await;
-    let store: Store<TestMetadata> = Store::new(db.pool.clone());
+    let store: Store<Uuid, TestMetadata> = Store::new(db.pool.clone());
 
     store.migrate().await.unwrap();
 
@@ -92,7 +112,7 @@ async fn migrate_creates_event_tables() {
 #[tokio::test]
 async fn migrate_is_idempotent() {
     let db = TestDb::new().await;
-    let store: Store<TestMetadata> = Store::new(db.pool.clone());
+    let store: Store<Uuid, TestMetadata> = Store::new(db.pool.clone());
 
     store.migrate().await.unwrap();
     store.migrate().await.unwrap();
@@ -102,7 +122,7 @@ async fn migrate_is_idempotent() {
 #[tokio::test]
 async fn stream_version_returns_none_for_new_stream() {
     let db = TestDb::new().await;
-    let store: Store<TestMetadata> = Store::new(db.pool.clone());
+    let store: Store<Uuid, TestMetadata> = Store::new(db.pool.clone());
     store.migrate().await.unwrap();
 
     let id = Uuid::new_v4();
@@ -114,7 +134,7 @@ async fn stream_version_returns_none_for_new_stream() {
 #[tokio::test]
 async fn commit_events_optimistic_new_creates_stream() {
     let db = TestDb::new().await;
-    let store: Store<TestMetadata> = Store::new(db.pool.clone());
+    let store: Store<Uuid, TestMetadata> = Store::new(db.pool.clone());
     store.migrate().await.unwrap();
 
     let id = Uuid::new_v4();
@@ -136,7 +156,7 @@ async fn commit_events_optimistic_new_creates_stream() {
 #[tokio::test]
 async fn commit_events_optimistic_new_fails_for_existing_stream() {
     let db = TestDb::new().await;
-    let store: Store<TestMetadata> = Store::new(db.pool.clone());
+    let store: Store<Uuid, TestMetadata> = Store::new(db.pool.clone());
     store.migrate().await.unwrap();
 
     let id = Uuid::new_v4();
@@ -171,7 +191,7 @@ async fn commit_events_optimistic_new_fails_for_existing_stream() {
 #[tokio::test]
 async fn commit_events_optimistic_with_expected_version_succeeds() {
     let db = TestDb::new().await;
-    let store: Store<TestMetadata> = Store::new(db.pool.clone());
+    let store: Store<Uuid, TestMetadata> = Store::new(db.pool.clone());
     store.migrate().await.unwrap();
 
     let id = Uuid::new_v4();
@@ -207,7 +227,7 @@ async fn commit_events_optimistic_with_expected_version_succeeds() {
 #[tokio::test]
 async fn commit_events_optimistic_with_wrong_expected_version_fails() {
     let db = TestDb::new().await;
-    let store: Store<TestMetadata> = Store::new(db.pool.clone());
+    let store: Store<Uuid, TestMetadata> = Store::new(db.pool.clone());
     store.migrate().await.unwrap();
 
     let id = Uuid::new_v4();
@@ -242,7 +262,7 @@ async fn commit_events_optimistic_with_wrong_expected_version_fails() {
 #[tokio::test]
 async fn load_events_returns_stored_events() {
     let db = TestDb::new().await;
-    let store: Store<TestMetadata> = Store::new(db.pool.clone());
+    let store: Store<Uuid, TestMetadata> = Store::new(db.pool.clone());
     store.migrate().await.unwrap();
 
     let id = Uuid::new_v4();
@@ -275,7 +295,7 @@ async fn load_events_returns_stored_events() {
 #[tokio::test]
 async fn load_events_deduplicates_events_matched_by_multiple_filters() {
     let db = TestDb::new().await;
-    let store: Store<TestMetadata> = Store::new(db.pool.clone());
+    let store: Store<Uuid, TestMetadata> = Store::new(db.pool.clone());
     store.migrate().await.unwrap();
 
     let id = Uuid::new_v4();
@@ -310,7 +330,7 @@ async fn load_events_deduplicates_events_matched_by_multiple_filters() {
 #[tokio::test]
 async fn load_events_with_after_position_filter() {
     let db = TestDb::new().await;
-    let store: Store<TestMetadata> = Store::new(db.pool.clone());
+    let store: Store<Uuid, TestMetadata> = Store::new(db.pool.clone());
     store.migrate().await.unwrap();
 
     let id = Uuid::new_v4();
@@ -353,7 +373,7 @@ async fn load_events_with_after_position_filter() {
 #[tokio::test]
 async fn commit_multiple_events_atomically() {
     let db = TestDb::new().await;
-    let store: Store<TestMetadata> = Store::new(db.pool.clone());
+    let store: Store<Uuid, TestMetadata> = Store::new(db.pool.clone());
     store.migrate().await.unwrap();
 
     let id = Uuid::new_v4();
@@ -390,7 +410,7 @@ async fn commit_multiple_events_atomically() {
 #[tokio::test]
 async fn events_are_ordered_by_position() {
     let db = TestDb::new().await;
-    let store: Store<TestMetadata> = Store::new(db.pool.clone());
+    let store: Store<Uuid, TestMetadata> = Store::new(db.pool.clone());
     store.migrate().await.unwrap();
 
     let id1 = Uuid::new_v4();
@@ -438,7 +458,7 @@ async fn events_are_ordered_by_position() {
 #[tokio::test]
 async fn metadata_is_preserved() {
     let db = TestDb::new().await;
-    let store: Store<TestMetadata> = Store::new(db.pool.clone());
+    let store: Store<Uuid, TestMetadata> = Store::new(db.pool.clone());
     store.migrate().await.unwrap();
 
     let id = Uuid::new_v4();
@@ -472,7 +492,7 @@ async fn metadata_is_preserved() {
 #[tokio::test]
 async fn commit_events_creates_stream() {
     let db = TestDb::new().await;
-    let store: Store<TestMetadata> = Store::new(db.pool.clone());
+    let store: Store<Uuid, TestMetadata> = Store::new(db.pool.clone());
     store.migrate().await.unwrap();
 
     let id = Uuid::new_v4();
@@ -494,7 +514,7 @@ async fn commit_events_creates_stream() {
 #[tokio::test]
 async fn commit_events_appends_to_existing_stream() {
     let db = TestDb::new().await;
-    let store: Store<TestMetadata> = Store::new(db.pool.clone());
+    let store: Store<Uuid, TestMetadata> = Store::new(db.pool.clone());
     store.migrate().await.unwrap();
 
     let id = Uuid::new_v4();
@@ -537,7 +557,7 @@ async fn commit_events_appends_to_existing_stream() {
 #[tokio::test]
 async fn commit_events_multiple_events_atomically() {
     let db = TestDb::new().await;
-    let store: Store<TestMetadata> = Store::new(db.pool.clone());
+    let store: Store<Uuid, TestMetadata> = Store::new(db.pool.clone());
     store.migrate().await.unwrap();
 
     let id = Uuid::new_v4();
@@ -574,7 +594,7 @@ async fn commit_events_multiple_events_atomically() {
 #[tokio::test]
 async fn decode_event_deserializes_stored_event() {
     let db = TestDb::new().await;
-    let store: Store<TestMetadata> = Store::new(db.pool.clone());
+    let store: Store<Uuid, TestMetadata> = Store::new(db.pool.clone());
     store.migrate().await.unwrap();
 
     let id = Uuid::new_v4();
@@ -601,4 +621,40 @@ async fn decode_event_deserializes_stored_event() {
 
     let decoded: TestEvent = store.decode_event(&stored[0]).unwrap();
     assert_eq!(decoded, original_event);
+}
+
+#[tokio::test]
+async fn non_uuid_newtype_id_round_trips() {
+    let db = TestDb::new().await;
+    let store: Store<Sku, TestMetadata> = Store::new(db.pool.clone());
+    store.migrate().await.unwrap();
+
+    let id = Sku("WIDGET-001".to_string());
+    let metadata = test_metadata("user1");
+
+    let committed = store
+        .commit_events_optimistic(
+            "catalog.product",
+            &id,
+            None,
+            NonEmpty::singleton(test_event("listed")),
+            &metadata,
+        )
+        .await
+        .unwrap();
+
+    // The stream is keyed by the newtype id.
+    let version = store.stream_version("catalog.product", &id).await.unwrap();
+    assert_eq!(version, Some(committed.last_position));
+
+    // And the id decodes back out of the TEXT column unchanged.
+    let filters = vec![EventFilter::for_aggregate(
+        "test-event",
+        "catalog.product",
+        id.clone(),
+    )];
+    let events = store.load_events(&filters).await.unwrap();
+
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].aggregate_id(), &id);
 }

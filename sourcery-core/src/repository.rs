@@ -42,7 +42,9 @@ use crate::{
     aggregate::{Aggregate, Handle, HandleCreate},
     concurrency::{ConcurrencyConflict, ConcurrencyStrategy, Optimistic, Unchecked},
     event::{EventKind, ProjectionEvent},
+    key::StorageKey,
     projection::{Projection, ProjectionError},
+    reactor::{Reactor, ReactorBuilder},
     snapshot::{OfferSnapshotError, Snapshot, SnapshotOffer, SnapshotStore},
     store::{
         CommitError, EventFilter, EventStore, GloballyOrderedStore, OptimisticCommitError,
@@ -123,7 +125,7 @@ pub trait CommitPolicy<S: EventStore>: private::Sealed {
 }
 
 #[doc(hidden)]
-pub trait SnapshotPolicy<S: EventStore, A: Aggregate<Id = S::Id>>: private::Sealed {
+pub trait SnapshotPolicy<S: EventStore, A: Aggregate>: private::Sealed {
     /// Snapshot-layer error type for this policy.
     type SnapshotError: std::error::Error + 'static;
     /// Precomputed snapshot payload representation.
@@ -152,7 +154,7 @@ pub trait SnapshotPolicy<S: EventStore, A: Aggregate<Id = S::Id>>: private::Seal
         kind: &str,
         id: &S::Id,
         events_since_snapshot: u64,
-        new_position: S::Position,
+        new_position: &S::Position,
         prepared: Self::Prepared,
     ) -> impl std::future::Future<Output = Result<(), Self::SnapshotError>> + Send;
 }
@@ -199,7 +201,7 @@ fn apply_stored_events<A, S>(
 where
     S: EventStore,
     S::Position: Clone,
-    A: Aggregate<Id = S::Id>,
+    A: Aggregate,
     A::Event: ProjectionEvent,
 {
     let mut last_event_position: Option<S::Position> = None;
@@ -222,7 +224,7 @@ fn create_from_stored_events<A, S>(
     events: &StoredEvents<S::Id, S::Position, S::Data, S::Metadata>,
 ) -> Result<RebuiltAggregate<A, S>, EventDecodeError<S>>
 where
-    A: Aggregate<Id = S::Id>,
+    A: Aggregate,
     A::Event: ProjectionEvent,
     S: EventStore,
     S::Position: Clone,
@@ -268,17 +270,15 @@ fn replay_projection_events<P, S>(
 where
     S: EventStore,
     S::Position: Clone,
-    P: Projection<Id = S::Id>,
+    P: Projection<Id = S::Id, Metadata = S::Metadata>,
 {
     let mut last_position = None;
 
     for stored in events {
-        let aggregate_id = stored.aggregate_id();
         let kind = stored.kind();
-        let metadata = stored.metadata();
 
         if let Some(handler) = handlers.get(kind) {
-            (handler)(projection, aggregate_id, stored, metadata, store)
+            (handler)(projection, stored, store)
                 .map_err(|error| ProjectionError::EventDecode(error.into_decode_error()))?;
         }
         last_position = Some(stored.position());
@@ -300,6 +300,7 @@ where
 /// let repo = Repository::new(store)
 ///     .with_snapshots(snapshot_store);
 /// ```
+#[derive(Clone)]
 pub struct Snapshots<SS>(
     /// The underlying snapshot store implementation.
     ///
@@ -425,7 +426,7 @@ where
 impl<S, A> SnapshotPolicy<S, A> for crate::snapshot::NoSnapshots<S::Position>
 where
     S: EventStore,
-    A: Aggregate<Id = S::Id>,
+    A: Aggregate,
 {
     type Prepared = ();
     type SnapshotError = Infallible;
@@ -456,7 +457,7 @@ where
         _kind: &str,
         _id: &S::Id,
         _events_since_snapshot: u64,
-        _new_position: S::Position,
+        _new_position: &S::Position,
         _prepared: Self::Prepared,
     ) -> Result<(), Self::SnapshotError> {
         Ok(())
@@ -466,7 +467,7 @@ where
 impl<S, A, SS> SnapshotPolicy<S, A> for Snapshots<SS>
 where
     S: EventStore,
-    A: Aggregate<Id = S::Id> + Serialize + DeserializeOwned + Send,
+    A: Aggregate + Serialize + DeserializeOwned + Send,
     SS: SnapshotStore<S::Id, Position = S::Position>,
 {
     type Prepared = A;
@@ -507,7 +508,7 @@ where
         kind: &str,
         id: &S::Id,
         events_since_snapshot: u64,
-        new_position: S::Position,
+        new_position: &S::Position,
         prepared: Self::Prepared,
     ) -> Result<(), Self::SnapshotError> {
         let offer_result = self.0.offer_snapshot(
@@ -516,7 +517,7 @@ where
             events_since_snapshot,
             move || -> Result<Snapshot<S::Position, A>, Infallible> {
                 Ok(Snapshot {
-                    position: new_position,
+                    position: new_position.clone(),
                     data: prepared,
                 })
             },
@@ -668,6 +669,29 @@ where
     }
 }
 
+// A `Repository` owns no unique state: it is a façade over the store handle `S`
+// and the snapshot-store handle `M`, plus a zero-sized concurrency marker.
+// Clone is therefore a cheap handle-copy (another view of the *same* backends),
+// like cloning the stores it wraps. Hand-written rather than derived so it does
+// not demand `C: Clone` for the phantom marker. This lets a reactor capture a
+// configured repository (`repo.clone()`) to issue commands, instead of
+// reconstructing one from the bare store and losing its strategy/snapshot
+// setup.
+impl<S, C, M> Clone for Repository<S, C, M>
+where
+    S: EventStore + Clone,
+    C: ConcurrencyStrategy,
+    M: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            store: self.store.clone(),
+            snapshots: self.snapshots.clone(),
+            _concurrency: PhantomData,
+        }
+    }
+}
+
 impl<S, M> Repository<S, Optimistic, M>
 where
     S: EventStore,
@@ -765,13 +789,15 @@ where
     ///
     /// Returns [`ProjectionError`] if the store fails to load events or if an
     /// event cannot be decoded into the aggregate's event sum type.
-    pub async fn load<A>(&self, id: &S::Id) -> Result<Option<A>, LoadError<S>>
+    pub async fn load<A>(&self, id: &A::Id) -> Result<Option<A>, LoadError<S>>
     where
-        A: Aggregate<Id = S::Id>,
+        A: Aggregate + Send,
+        A::Id: StorageKey<S::Id> + Sync,
         A::Event: ProjectionEvent,
         M: SnapshotPolicy<S, A> + Sync,
     {
-        Ok(self.load_aggregate::<A>(id).await?.map(|la| la.aggregate))
+        let key = id.to_key();
+        Ok(self.load_aggregate::<A>(&key).await?.map(|la| la.aggregate))
     }
 
     /// Load and rebuild an aggregate, returning enriched load metadata needed
@@ -781,7 +807,7 @@ where
         id: &S::Id,
     ) -> Result<Option<LoadedAggregate<A, S::Position>>, LoadError<S>>
     where
-        A: Aggregate<Id = S::Id>,
+        A: Aggregate + Send,
         A::Event: ProjectionEvent,
         M: SnapshotPolicy<S, A> + Sync,
     {
@@ -839,7 +865,7 @@ where
         metadata: &S::Metadata,
     ) -> Result<S::Position, CommandError<A::Error, C::ConcurrencyError, S::Error, M::SnapshotError>>
     where
-        A: Aggregate<Id = S::Id>,
+        A: Aggregate,
         A::Event: EventKind + Serialize + Send + Sync,
         S::Metadata: Clone,
         C: CommitPolicy<S>,
@@ -858,7 +884,7 @@ where
                 A::KIND,
                 id,
                 events_since_snapshot,
-                new_position.clone(),
+                &new_position,
                 prepared_snapshot,
             )
             .await
@@ -878,7 +904,7 @@ where
         metadata: &S::Metadata,
     ) -> Result<S::Position, CommandError<A::Error, C::ConcurrencyError, S::Error, M::SnapshotError>>
     where
-        A: Aggregate<Id = S::Id>,
+        A: Aggregate,
         A::Event: EventKind + Serialize + Send + Sync,
         S::Metadata: Clone,
         C: CommitPolicy<S>,
@@ -913,7 +939,7 @@ where
                 A::KIND,
                 id,
                 total_events_since_snapshot,
-                new_position.clone(),
+                &new_position,
                 prepared,
             )
             .await
@@ -937,7 +963,7 @@ where
         metadata: &S::Metadata,
     ) -> Result<S::Position, CommandError<A::Error, C::ConcurrencyError, S::Error, M::SnapshotError>>
     where
-        A: Aggregate<Id = S::Id>,
+        A: Aggregate,
         A::Event: EventKind + Serialize + Send + Sync,
         S::Metadata: Clone,
         C: CommitPolicy<S>,
@@ -966,14 +992,25 @@ where
     /// cannot be encoded, the store fails to persist, or snapshot persistence
     /// fails. Returns [`LifecycleError::AggregateAlreadyExists`] if the stream
     /// already exists.
-    pub async fn create<A, Cmd>(
-        &self,
-        id: &S::Id,
-        command: &Cmd,
-        metadata: &S::Metadata,
-    ) -> Result<(), CommandError<A::Error, C::ConcurrencyError, S::Error, M::SnapshotError>>
+    // Returns `impl Future + Send` rather than `async fn` so command futures are
+    // `Send` in the signature and can be spawned (e.g. from a reactor); see
+    // rust-lang/rust#100013. The full error type is irreducibly generic.
+    #[allow(clippy::manual_async_fn, clippy::type_complexity)]
+    pub fn create<'a, A, Cmd>(
+        &'a self,
+        id: &'a A::Id,
+        command: &'a Cmd,
+        metadata: &'a S::Metadata,
+    ) -> impl Future<
+        Output = Result<
+            (),
+            CommandError<A::Error, C::ConcurrencyError, S::Error, M::SnapshotError>,
+        >,
+    > + Send
+    + 'a
     where
-        A: Aggregate<Id = S::Id> + HandleCreate<Cmd>,
+        A: Aggregate + HandleCreate<Cmd> + 'a,
+        A::Id: StorageKey<S::Id> + Sync,
         A::Event: EventKind + Serialize + Send + Sync,
         Cmd: Sync,
         S::Metadata: Clone,
@@ -981,9 +1018,12 @@ where
         M: SnapshotPolicy<S, A> + Sync,
         M::Prepared: Send,
     {
-        self.create_committed::<A, Cmd>(id, command, metadata)
-            .await
-            .map(|_| ())
+        async move {
+            let key = id.to_key();
+            self.create_committed::<A, Cmd>(&key, command, metadata)
+                .await
+                .map(|_| ())
+        }
     }
 
     /// Shared body of [`create`](Self::create) and
@@ -999,7 +1039,7 @@ where
         CommandError<A::Error, C::ConcurrencyError, S::Error, M::SnapshotError>,
     >
     where
-        A: Aggregate<Id = S::Id> + HandleCreate<Cmd>,
+        A: Aggregate + HandleCreate<Cmd>,
         A::Event: EventKind + Serialize + Send + Sync,
         Cmd: Sync,
         S::Metadata: Clone,
@@ -1032,14 +1072,22 @@ where
     /// fails, or the aggregate cannot be rebuilt. Optimistic repositories
     /// return [`CommandError::Concurrency`] on conflicts. Returns
     /// [`LifecycleError::AggregateNotFound`] if the stream does not yet exist.
-    pub async fn update<A, Cmd>(
-        &self,
-        id: &S::Id,
-        command: &Cmd,
-        metadata: &S::Metadata,
-    ) -> Result<(), CommandError<A::Error, C::ConcurrencyError, S::Error, M::SnapshotError>>
+    #[allow(clippy::manual_async_fn, clippy::type_complexity)] // see `create`
+    pub fn update<'a, A, Cmd>(
+        &'a self,
+        id: &'a A::Id,
+        command: &'a Cmd,
+        metadata: &'a S::Metadata,
+    ) -> impl Future<
+        Output = Result<
+            (),
+            CommandError<A::Error, C::ConcurrencyError, S::Error, M::SnapshotError>,
+        >,
+    > + Send
+    + 'a
     where
-        A: Aggregate<Id = S::Id> + Handle<Cmd> + Send,
+        A: Aggregate + Handle<Cmd> + Send + 'a,
+        A::Id: StorageKey<S::Id> + Sync,
         A::Event: ProjectionEvent + EventKind + Serialize + Send + Sync,
         Cmd: Sync,
         S::Metadata: Clone,
@@ -1047,9 +1095,12 @@ where
         M: SnapshotPolicy<S, A> + Sync,
         M::Prepared: Send,
     {
-        self.update_committed::<A, Cmd>(id, command, metadata)
-            .await
-            .map(|_| ())
+        async move {
+            let key = id.to_key();
+            self.update_committed::<A, Cmd>(&key, command, metadata)
+                .await
+                .map(|_| ())
+        }
     }
 
     /// Shared body of [`update`](Self::update) and
@@ -1065,7 +1116,7 @@ where
         CommandError<A::Error, C::ConcurrencyError, S::Error, M::SnapshotError>,
     >
     where
-        A: Aggregate<Id = S::Id> + Handle<Cmd> + Send,
+        A: Aggregate + Handle<Cmd> + Send,
         A::Event: ProjectionEvent + EventKind + Serialize + Send + Sync,
         Cmd: Sync,
         S::Metadata: Clone,
@@ -1116,14 +1167,22 @@ where
     /// cannot be encoded, the store fails to persist, snapshot persistence
     /// fails, or the aggregate cannot be rebuilt. Optimistic repositories
     /// return [`CommandError::Concurrency`] on conflicts.
-    pub async fn upsert<A, Cmd>(
-        &self,
-        id: &S::Id,
-        command: &Cmd,
-        metadata: &S::Metadata,
-    ) -> Result<(), CommandError<A::Error, C::ConcurrencyError, S::Error, M::SnapshotError>>
+    #[allow(clippy::manual_async_fn, clippy::type_complexity)] // see `create`
+    pub fn upsert<'a, A, Cmd>(
+        &'a self,
+        id: &'a A::Id,
+        command: &'a Cmd,
+        metadata: &'a S::Metadata,
+    ) -> impl Future<
+        Output = Result<
+            (),
+            CommandError<A::Error, C::ConcurrencyError, S::Error, M::SnapshotError>,
+        >,
+    > + Send
+    + 'a
     where
-        A: Aggregate<Id = S::Id> + Handle<Cmd> + HandleCreate<Cmd> + Send,
+        A: Aggregate + Handle<Cmd> + HandleCreate<Cmd> + Send + 'a,
+        A::Id: StorageKey<S::Id> + Sync,
         A::Event: ProjectionEvent + EventKind + Serialize + Send + Sync,
         Cmd: Sync,
         S::Metadata: Clone,
@@ -1131,9 +1190,12 @@ where
         M: SnapshotPolicy<S, A> + Sync,
         M::Prepared: Send,
     {
-        self.upsert_committed::<A, Cmd>(id, command, metadata)
-            .await
-            .map(|_| ())
+        async move {
+            let key = id.to_key();
+            self.upsert_committed::<A, Cmd>(&key, command, metadata)
+                .await
+                .map(|_| ())
+        }
     }
 
     /// Shared body of [`upsert`](Self::upsert) and
@@ -1149,7 +1211,7 @@ where
         CommandError<A::Error, C::ConcurrencyError, S::Error, M::SnapshotError>,
     >
     where
-        A: Aggregate<Id = S::Id> + Handle<Cmd> + HandleCreate<Cmd> + Send,
+        A: Aggregate + Handle<Cmd> + HandleCreate<Cmd> + Send,
         A::Event: ProjectionEvent + EventKind + Serialize + Send + Sync,
         Cmd: Sync,
         S::Metadata: Clone,
@@ -1157,14 +1219,16 @@ where
         M: SnapshotPolicy<S, A> + Sync,
         M::Prepared: Send,
     {
+        let loaded = self
+            .load_aggregate::<A>(id)
+            .await
+            .map_err(CommandError::Projection)?;
+
         if let Some(LoadedAggregate {
             aggregate,
             version,
             events_since_snapshot,
-        }) = self
-            .load_aggregate::<A>(id)
-            .await
-            .map_err(CommandError::Projection)?
+        }) = loaded
         {
             let new_events = Handle::<Cmd>::handle(&aggregate, command)
                 .map_err(|error| CommandError::Aggregate(error.into()))?;
@@ -1198,7 +1262,7 @@ where
     }
 }
 
-impl<S, C, SS> Repository<S, C, Snapshots<SS>>
+impl<S, C, M> Repository<S, C, M>
 where
     S: EventStore + GloballyOrderedStore,
     S::Position: Ord,
@@ -1209,29 +1273,41 @@ where
     /// Loads the most recent snapshot (if available), replays events from that
     /// position, and offers a new snapshot after loading.
     ///
+    /// The projection snapshot store is supplied explicitly and is independent
+    /// of any aggregate snapshot store configured via
+    /// [`with_snapshots`](Self::with_snapshots) — mirroring
+    /// [`subscribe_with_snapshots`](Self::subscribe_with_snapshots), which also
+    /// takes its store as an argument. Because projection snapshots are keyed
+    /// by `P::InstanceId` (which differs per projection), passing the store
+    /// per call is what lets one repository snapshot several projections of
+    /// differing instance-id types. The store is borrowed, so the caller
+    /// retains it across calls.
+    ///
     /// # Errors
     ///
     /// Returns [`ProjectionError`] when the store fails to load events or when
     /// an event cannot be deserialised.
     #[tracing::instrument(
-        skip(self, instance_id),
+        skip(self, instance_id, snapshots),
         fields(
             projection_type = std::any::type_name::<P>(),
         )
     )]
-    pub async fn load_projection_with_snapshot<P>(
+    pub async fn load_projection_with_snapshot<P, PS>(
         &self,
         instance_id: &P::InstanceId,
+        snapshots: &PS,
     ) -> Result<P, ProjectionError<S::Error>>
     where
         P: Projection<Id = S::Id, Metadata = S::Metadata> + Serialize + DeserializeOwned + Sync,
         P::InstanceId: Send + Sync,
-        SS: SnapshotStore<P::InstanceId, Position = S::Position>,
+        PS: SnapshotStore<P::InstanceId, Position = S::Position> + Sync,
+        M: Sync,
     {
         tracing::debug!("loading projection with snapshot");
 
         let (mut projection, snapshot_position) =
-            crate::subscription::load_snapshot::<P, SS>(&self.snapshots.0, instance_id).await;
+            crate::subscription::load_snapshot::<P, PS>(snapshots, instance_id).await;
 
         let filters = P::filters::<S>(instance_id);
         let (event_filters, handlers) = filters.into_event_filters(snapshot_position.as_ref());
@@ -1249,8 +1325,8 @@ where
         if event_count > 0
             && let Some(position) = last_position
         {
-            crate::subscription::offer_projection_snapshot::<P, SS>(
-                &self.snapshots.0,
+            crate::subscription::offer_projection_snapshot::<P, PS>(
+                snapshots,
                 instance_id,
                 event_count as u64,
                 &position,
@@ -1357,6 +1433,25 @@ where
         SubscriptionBuilder::new(self.store.clone(), snapshots, instance_id)
     }
 
+    /// Start a write-side reactor over a checkpointed event stream.
+    ///
+    /// Checkpoint persistence is disabled by default. Call
+    /// [`ReactorBuilder::with_checkpoints`] to resume after restart.
+    pub fn react<R>(
+        &self,
+        reactor: R,
+    ) -> ReactorBuilder<S, R, crate::snapshot::NoSnapshots<S::Checkpoint>>
+    where
+        S: SubscribableStore + Clone + 'static,
+        R: Reactor<Id = S::Id, Metadata = S::Metadata>,
+    {
+        ReactorBuilder::new(
+            self.store.clone(),
+            reactor,
+            crate::snapshot::NoSnapshots::new(),
+        )
+    }
+
     /// Execute a command against an existing aggregate stream and return an
     /// exact read-your-writes [`ConsistencyToken`] for the resulting commit.
     ///
@@ -1382,7 +1477,7 @@ where
     /// checkpoint cannot be resolved.
     pub async fn update_tracked<A, Cmd>(
         &self,
-        id: &S::Id,
+        id: &A::Id,
         command: &Cmd,
         metadata: &S::Metadata,
     ) -> Result<
@@ -1391,7 +1486,8 @@ where
     >
     where
         S: SubscribableStore,
-        A: Aggregate<Id = S::Id> + Handle<Cmd> + Send,
+        A: Aggregate + Handle<Cmd> + Send,
+        A::Id: StorageKey<S::Id> + Sync,
         A::Event: ProjectionEvent + EventKind + Serialize + Send + Sync,
         Cmd: Sync,
         S::Metadata: Clone,
@@ -1399,8 +1495,9 @@ where
         M: SnapshotPolicy<S, A> + Sync,
         M::Prepared: Send,
     {
+        let key = id.to_key();
         let position = self
-            .update_committed::<A, Cmd>(id, command, metadata)
+            .update_committed::<A, Cmd>(&key, command, metadata)
             .await?;
         self.token_for(position).await.map_err(CommandError::Store)
     }
@@ -1419,7 +1516,7 @@ where
     /// checkpoint cannot be resolved.
     pub async fn upsert_tracked<A, Cmd>(
         &self,
-        id: &S::Id,
+        id: &A::Id,
         command: &Cmd,
         metadata: &S::Metadata,
     ) -> Result<
@@ -1428,7 +1525,8 @@ where
     >
     where
         S: SubscribableStore,
-        A: Aggregate<Id = S::Id> + Handle<Cmd> + HandleCreate<Cmd> + Send,
+        A: Aggregate + Handle<Cmd> + HandleCreate<Cmd> + Send,
+        A::Id: StorageKey<S::Id> + Sync,
         A::Event: ProjectionEvent + EventKind + Serialize + Send + Sync,
         Cmd: Sync,
         S::Metadata: Clone,
@@ -1436,8 +1534,9 @@ where
         M: SnapshotPolicy<S, A> + Sync,
         M::Prepared: Send,
     {
+        let key = id.to_key();
         let position = self
-            .upsert_committed::<A, Cmd>(id, command, metadata)
+            .upsert_committed::<A, Cmd>(&key, command, metadata)
             .await?;
         self.token_for(position).await.map_err(CommandError::Store)
     }
@@ -1456,7 +1555,7 @@ where
     /// checkpoint cannot be resolved.
     pub async fn create_tracked<A, Cmd>(
         &self,
-        id: &S::Id,
+        id: &A::Id,
         command: &Cmd,
         metadata: &S::Metadata,
     ) -> Result<
@@ -1465,7 +1564,8 @@ where
     >
     where
         S: SubscribableStore,
-        A: Aggregate<Id = S::Id> + HandleCreate<Cmd>,
+        A: Aggregate + HandleCreate<Cmd>,
+        A::Id: StorageKey<S::Id> + Sync,
         A::Event: EventKind + Serialize + Send + Sync,
         Cmd: Sync,
         S::Metadata: Clone,
@@ -1473,8 +1573,9 @@ where
         M: SnapshotPolicy<S, A> + Sync,
         M::Prepared: Send,
     {
+        let key = id.to_key();
         let position = self
-            .create_committed::<A, Cmd>(id, command, metadata)
+            .create_committed::<A, Cmd>(&key, command, metadata)
             .await?;
         self.token_for(position).await.map_err(CommandError::Store)
     }
@@ -1570,31 +1671,42 @@ where
     ///
     /// Returns the last error if all retries are exhausted, or a
     /// non-concurrency error on the first such failure.
-    pub async fn update_with_retry<A, Cmd>(
-        &self,
-        id: &S::Id,
-        command: &Cmd,
-        metadata: &S::Metadata,
+    #[allow(clippy::manual_async_fn, clippy::type_complexity)] // see `create`
+    pub fn update_with_retry<'a, A, Cmd>(
+        &'a self,
+        id: &'a A::Id,
+        command: &'a Cmd,
+        metadata: &'a S::Metadata,
         max_retries: usize,
-    ) -> Result<
-        usize,
-        CommandError<A::Error, ConcurrencyConflict<S::Position>, S::Error, M::SnapshotError>,
-    >
+    ) -> impl Future<
+        Output = Result<
+            usize,
+            CommandError<A::Error, ConcurrencyConflict<S::Position>, S::Error, M::SnapshotError>,
+        >,
+    > + Send
+    + 'a
     where
-        A: Aggregate<Id = S::Id> + Handle<Cmd> + Send,
+        A: Aggregate + Handle<Cmd> + Send + 'a,
+        A::Id: StorageKey<S::Id> + Sync,
         A::Event: ProjectionEvent + EventKind + serde::Serialize + Send + Sync,
         Cmd: Sync,
         S::Metadata: Clone,
         M: SnapshotPolicy<S, A> + Sync,
         M::Prepared: Send,
     {
-        let mut attempt = 0;
-        loop {
-            attempt += 1;
-            match self.update::<A, Cmd>(id, command, metadata).await {
-                Ok(()) => return Ok(attempt),
-                Err(CommandError::Concurrency(_)) if attempt <= max_retries => {}
-                Err(e) => return Err(e),
+        async move {
+            let key = id.to_key();
+            let mut attempt = 0;
+            loop {
+                attempt += 1;
+                match self
+                    .update_committed::<A, Cmd>(&key, command, metadata)
+                    .await
+                {
+                    Ok(_) => return Ok(attempt),
+                    Err(CommandError::Concurrency(_)) if attempt <= max_retries => {}
+                    Err(e) => return Err(e),
+                }
             }
         }
     }
@@ -1633,5 +1745,36 @@ mod tests {
         let msg = error.to_string();
         assert!(msg.contains("concurrency conflict"));
         assert!(error.source().is_none());
+    }
+
+    #[test]
+    fn lifecycle_error_aggregate_not_found_displays() {
+        let err = LifecycleError::AggregateNotFound;
+        assert_eq!(err.to_string(), "aggregate not found");
+    }
+
+    #[test]
+    fn lifecycle_error_aggregate_already_exists_displays() {
+        let err = LifecycleError::AggregateAlreadyExists;
+        assert_eq!(err.to_string(), "aggregate already exists");
+    }
+
+    #[test]
+    fn command_error_lifecycle_propagates_inner_message() {
+        // #[error(transparent)] means the outer message equals the inner one.
+        let inner = LifecycleError::AggregateNotFound;
+        let error: CommandError<String, Infallible, io::Error, Infallible> =
+            CommandError::Lifecycle(inner);
+        assert_eq!(error.to_string(), inner.to_string());
+    }
+
+    #[test]
+    fn command_error_projection_has_source() {
+        let error: CommandError<String, Infallible, io::Error, Infallible> =
+            CommandError::Projection(crate::projection::ProjectionError::Store(io::Error::other(
+                "store error",
+            )));
+        assert!(error.to_string().contains("rebuild aggregate"));
+        assert!(error.source().is_some());
     }
 }

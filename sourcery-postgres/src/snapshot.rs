@@ -29,6 +29,12 @@ pub enum Error {
 /// (`es_snapshots`), using the same database as the event store for
 /// consistency.
 ///
+/// The `aggregate_id` `TEXT` key is the serde-serialised form of the id (so any
+/// `Id: Serialize` works, including `()`), matching the checkpoint store's
+/// keying. Id types used as keys must serialise **deterministically and
+/// injectively** — true for all ordinary id types; avoid `HashMap`/`HashSet`
+/// fields and lossy `#[serde(skip)]`.
+///
 /// # Schema
 ///
 /// The store uses the following table schema (created by
@@ -37,7 +43,7 @@ pub enum Error {
 /// ```sql
 /// CREATE TABLE IF NOT EXISTS es_snapshots (
 ///     aggregate_kind TEXT NOT NULL,
-///     aggregate_id   UUID NOT NULL,
+///     aggregate_id   TEXT NOT NULL,
 ///     position       BIGINT NOT NULL,
 ///     data           JSONB NOT NULL,
 ///     created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -128,7 +134,7 @@ impl Store {
             r"
             CREATE TABLE IF NOT EXISTS es_snapshots (
                 aggregate_kind TEXT NOT NULL,
-                aggregate_id   UUID NOT NULL,
+                aggregate_id   TEXT NOT NULL,
                 position       BIGINT NOT NULL,
                 data           JSONB NOT NULL,
                 created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -143,19 +149,32 @@ impl Store {
     }
 }
 
-impl SnapshotStore<uuid::Uuid> for Store {
+/// Serialise an id into the `es_snapshots.aggregate_id` `TEXT` key.
+///
+/// Snapshot keys are write-only (the store never reconstructs an id from
+/// storage), so a one-way serde projection suffices and matches the checkpoint
+/// store's `instance_id` keying.
+fn snapshot_key<Id: Serialize>(id: &Id) -> Result<String, Error> {
+    serde_json::to_string(id).map_err(|e| Error::Serialization(Box::new(e)))
+}
+
+impl<Id> SnapshotStore<Id> for Store
+where
+    Id: Serialize + Send + Sync,
+{
     type Error = Error;
     type Position = i64;
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(skip(self, id))]
     async fn load<T>(
         &self,
         kind: &str,
-        id: &uuid::Uuid,
+        id: &Id,
     ) -> Result<Option<Snapshot<Self::Position, T>>, Self::Error>
     where
         T: DeserializeOwned,
     {
+        let aggregate_id = snapshot_key(id)?;
         let result = sqlx::query(
             r"
             SELECT position, data
@@ -164,7 +183,7 @@ impl SnapshotStore<uuid::Uuid> for Store {
             ",
         )
         .bind(kind)
-        .bind(id)
+        .bind(&aggregate_id)
         .fetch_optional(&self.pool)
         .await?;
 
@@ -185,11 +204,11 @@ impl SnapshotStore<uuid::Uuid> for Store {
         Ok(snapshot)
     }
 
-    #[tracing::instrument(skip(self, create_snapshot))]
+    #[tracing::instrument(skip(self, id, create_snapshot))]
     async fn offer_snapshot<CE, T, Create>(
         &self,
         kind: &str,
-        id: &uuid::Uuid,
+        id: &Id,
         events_since_last_snapshot: u64,
         create_snapshot: Create,
     ) -> Result<SnapshotOffer, OfferSnapshotError<Self::Error, CE>>
@@ -213,6 +232,8 @@ impl SnapshotStore<uuid::Uuid> for Store {
             return Ok(SnapshotOffer::Declined);
         };
 
+        let aggregate_id = snapshot_key(id).map_err(OfferSnapshotError::Snapshot)?;
+
         // Use ON CONFLICT to upsert, but only if the new position is greater
         // than the existing one. This prevents race conditions where an older
         // snapshot could overwrite a newer one.
@@ -226,7 +247,7 @@ impl SnapshotStore<uuid::Uuid> for Store {
             ",
         )
         .bind(kind)
-        .bind(id)
+        .bind(&aggregate_id)
         .bind(position)
         .bind(sqlx::types::Json(data))
         .execute(&self.pool)

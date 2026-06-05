@@ -6,8 +6,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use sourcery::{
-    Aggregate, Apply, ApplyProjection, Create, DomainEvent, Filters, Handle, HandleCreate,
-    Projection, Repository,
+    Aggregate, Apply, ApplyProjection, Create, DomainEvent, EventContext, Filters, Handle,
+    HandleCreate, Projection, Repository,
     event::EventKind,
     projection::ProjectionError,
     store::{EventStore, inmemory},
@@ -122,11 +122,10 @@ struct TotalsProjection {
 impl ApplyProjection<ValueAdded> for TotalsProjection {
     fn apply_projection(
         &mut self,
-        aggregate_id: &Self::Id,
+        ctx: EventContext<'_, Self::Id, Self::Metadata>,
         event: &ValueAdded,
-        &(): &Self::Metadata,
     ) {
-        *self.totals.entry(aggregate_id.clone()).or_insert(0) += event.amount;
+        *self.totals.entry(ctx.aggregate_id.clone()).or_insert(0) += event.amount;
     }
 }
 
@@ -161,11 +160,10 @@ impl Projection for FilteredTotalsProjection {
 impl ApplyProjection<ValueAdded> for FilteredTotalsProjection {
     fn apply_projection(
         &mut self,
-        aggregate_id: &Self::Id,
+        ctx: EventContext<'_, Self::Id, Self::Metadata>,
         event: &ValueAdded,
-        &(): &Self::Metadata,
     ) {
-        *self.totals.entry(aggregate_id.clone()).or_insert(0) += event.amount;
+        *self.totals.entry(ctx.aggregate_id.clone()).or_insert(0) += event.amount;
     }
 }
 
@@ -354,9 +352,8 @@ impl Projection for EnumProjection {
 impl ApplyProjection<MultiEventCounterEvent> for EnumProjection {
     fn apply_projection(
         &mut self,
-        _aggregate_id: &Self::Id,
+        _ctx: EventContext<'_, Self::Id, Self::Metadata>,
         event: &MultiEventCounterEvent,
-        &(): &Self::Metadata,
     ) {
         match event {
             MultiEventCounterEvent::ValueAdded(e) => {
@@ -400,9 +397,8 @@ impl Projection for EventsForProjection {
 impl ApplyProjection<MultiEventCounterEvent> for EventsForProjection {
     fn apply_projection(
         &mut self,
-        _aggregate_id: &Self::Id,
+        _ctx: EventContext<'_, Self::Id, Self::Metadata>,
         event: &MultiEventCounterEvent,
-        &(): &Self::Metadata,
     ) {
         match event {
             MultiEventCounterEvent::ValueAdded(e) => {
@@ -492,13 +488,76 @@ struct SnapshotProjection {
 impl ApplyProjection<ValueAdded> for SnapshotProjection {
     fn apply_projection(
         &mut self,
-        _aggregate_id: &Self::Id,
+        _ctx: EventContext<'_, Self::Id, Self::Metadata>,
         event: &ValueAdded,
-        &(): &Self::Metadata,
     ) {
         self.total += event.amount;
         self.event_count += 1;
     }
+}
+
+/// Singleton snapshot projection (`InstanceId = ()`), used alongside the
+/// `String`-keyed [`SnapshotProjection`] to prove one repository can snapshot
+/// projections of differing instance-id types.
+#[derive(Debug, Default, Serialize, Deserialize, Projection)]
+#[projection(events(ValueAdded))]
+struct GlobalTotal {
+    sum: i32,
+}
+
+impl ApplyProjection<ValueAdded> for GlobalTotal {
+    fn apply_projection(
+        &mut self,
+        _ctx: EventContext<'_, Self::Id, Self::Metadata>,
+        event: &ValueAdded,
+    ) {
+        self.sum += event.amount;
+    }
+}
+
+#[tokio::test]
+async fn one_repo_snapshots_projections_of_different_instance_id_types() {
+    use sourcery::snapshot::inmemory::Store as SnapshotStore;
+
+    let store = inmemory::Store::new();
+    let repo = Repository::new(store);
+
+    repo.create::<Counter, AddValue>(&"c1".to_string(), &AddValue { amount: 10 }, &())
+        .await
+        .unwrap();
+    repo.update::<Counter, AddValue>(&"c1".to_string(), &AddValue { amount: 5 }, &())
+        .await
+        .unwrap();
+
+    // One key-generic snapshot store serves BOTH a `String`-keyed projection and
+    // a `()`-keyed singleton projection from the same repository over the same
+    // event store. Before E3 this was impossible: the single ambient
+    // `Snapshots<SS>` could key only one `InstanceId` type, and the in-memory
+    // store was monomorphic in its key.
+    let snaps = SnapshotStore::<u64>::always();
+
+    let by_string: SnapshotProjection = repo
+        .load_projection_with_snapshot(&"label".to_string(), &snaps)
+        .await
+        .unwrap();
+    let by_unit: GlobalTotal = repo
+        .load_projection_with_snapshot(&(), &snaps)
+        .await
+        .unwrap();
+
+    assert_eq!(by_string.total, 15);
+    assert_eq!(by_unit.sum, 15);
+
+    // Both snapshots coexist in the one store under distinct (kind, key) pairs;
+    // re-loading the String-keyed projection resumes from its snapshot.
+    repo.update::<Counter, AddValue>(&"c1".to_string(), &AddValue { amount: 7 }, &())
+        .await
+        .unwrap();
+    let resumed: SnapshotProjection = repo
+        .load_projection_with_snapshot(&"label".to_string(), &snaps)
+        .await
+        .unwrap();
+    assert_eq!(resumed.total, 22);
 }
 
 #[tokio::test]
@@ -506,10 +565,10 @@ async fn projection_with_snapshot_exercises_snapshots_wrapper_load() {
     use sourcery::snapshot::inmemory::Store as SnapshotStore;
 
     let store = inmemory::Store::new();
-    // Snapshot store's ID type must match the projection's instance_id type
-    // (String)
-    let snapshots = SnapshotStore::<String, u64>::always();
-    let repo = Repository::new(store).with_snapshots(snapshots);
+    // The projection snapshot store is passed explicitly and is independent of
+    // any aggregate snapshot store.
+    let snapshots = SnapshotStore::<u64>::always();
+    let repo = Repository::new(store);
 
     // Add some events
     repo.create::<Counter, AddValue>(&"c1".to_string(), &AddValue { amount: 10 }, &())
@@ -521,7 +580,7 @@ async fn projection_with_snapshot_exercises_snapshots_wrapper_load() {
 
     // Build projection with snapshot support
     let projection: SnapshotProjection = repo
-        .load_projection_with_snapshot(&"proj-instance".to_string())
+        .load_projection_with_snapshot(&"proj-instance".to_string(), &snapshots)
         .await
         .unwrap();
 
@@ -534,8 +593,8 @@ async fn projection_with_snapshot_offers_snapshot_after_load() {
     use sourcery::snapshot::inmemory::Store as SnapshotStore;
 
     let store = inmemory::Store::new();
-    let snapshots = SnapshotStore::<String, u64>::always();
-    let repo = Repository::new(store).with_snapshots(snapshots);
+    let snapshots = SnapshotStore::<u64>::always();
+    let repo = Repository::new(store);
 
     // Add events
     repo.create::<Counter, AddValue>(&"c1".to_string(), &AddValue { amount: 5 }, &())
@@ -545,7 +604,7 @@ async fn projection_with_snapshot_offers_snapshot_after_load() {
     // Load projection with snapshot - this should offer a snapshot after load
     let instance_id = "proj-instance".to_string();
     let projection: SnapshotProjection = repo
-        .load_projection_with_snapshot(&instance_id)
+        .load_projection_with_snapshot(&instance_id, &snapshots)
         .await
         .unwrap();
 
@@ -558,7 +617,7 @@ async fn projection_with_snapshot_offers_snapshot_after_load() {
 
     // Load again - should now use the snapshot from before
     let projection: SnapshotProjection = repo
-        .load_projection_with_snapshot(&instance_id)
+        .load_projection_with_snapshot(&instance_id, &snapshots)
         .await
         .unwrap();
 
