@@ -543,32 +543,30 @@ impl SnapshotStore<String> for UnreachableCheckpointStore {
     type Error = io::Error;
     type Position = u64;
 
-    fn load<T>(
+    async fn load<T>(
         &self,
         _kind: &str,
         _id: &String,
-    ) -> impl std::future::Future<Output = Result<Option<Snapshot<Self::Position, T>>, Self::Error>> + Send
+    ) -> Result<Option<Snapshot<Self::Position, T>>, Self::Error>
     where
         T: serde::de::DeserializeOwned,
     {
-        async { Err(io::Error::other("checkpoint store unreachable")) }
+        Err(io::Error::other("checkpoint store unreachable"))
     }
 
-    fn offer_snapshot<CE, T, Create>(
+    async fn offer_snapshot<CE, T, Create>(
         &self,
         _kind: &str,
         _id: &String,
         _events_since_last_snapshot: u64,
         _create_snapshot: Create,
-    ) -> impl std::future::Future<
-        Output = Result<SnapshotOffer, OfferSnapshotError<Self::Error, CE>>,
-    > + Send
+    ) -> Result<SnapshotOffer, OfferSnapshotError<Self::Error, CE>>
     where
         CE: std::error::Error + Send + Sync + 'static,
         T: Serialize,
         Create: FnOnce() -> Result<Snapshot<Self::Position, T>, CE> + Send,
     {
-        async { Ok(SnapshotOffer::Declined) }
+        Ok(SnapshotOffer::Declined)
     }
 }
 

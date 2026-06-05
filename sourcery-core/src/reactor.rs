@@ -806,7 +806,7 @@ mod tests {
         let store: NoSnapshots<i64> = NoSnapshots::new();
         let id = "reactor-instance".to_string();
         let result = offer_checkpoint::<_, io::Error>(&store, "MyReactor", &id, 0, &42_i64).await;
-        assert_eq!(result.unwrap(), false);
+        assert!(!result.unwrap());
     }
 
     // --- load_checkpoint ---
@@ -829,7 +829,7 @@ mod tests {
         let store = crate::snapshot::inmemory::Store::<i64>::always();
         let id = "r1".to_string();
         let result = offer_checkpoint::<_, io::Error>(&store, "MyReactor", &id, 1, &42_i64).await;
-        assert_eq!(result.unwrap(), true);
+        assert!(result.unwrap());
     }
 
     #[tokio::test]
@@ -841,7 +841,7 @@ mod tests {
         let store = crate::snapshot::inmemory::Store::<i64>::every(2);
         let id = "r1".to_string();
         let result = offer_checkpoint::<_, io::Error>(&store, "MyReactor", &id, 1, &42_i64).await;
-        assert_eq!(result.unwrap(), false);
+        assert!(!result.unwrap());
     }
 
     #[tokio::test]
