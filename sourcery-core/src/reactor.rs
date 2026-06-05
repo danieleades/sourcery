@@ -834,10 +834,11 @@ mod tests {
 
     #[tokio::test]
     async fn offer_checkpoint_returns_false_when_store_declines() {
-        // When the store declines (e.g. a batching policy), offer_checkpoint
-        // returns false so the caller keeps accumulating the pending-event count
-        // toward the next policy threshold.
-        let store = NoSnapshots::<i64>::new();
+        // A batching store declines an offer below its threshold (`every(2)`
+        // with one pending event). `offer_checkpoint` reports `false` so the
+        // caller keeps accumulating the pending-event count toward the next
+        // threshold rather than resetting it.
+        let store = crate::snapshot::inmemory::Store::<i64>::every(2);
         let id = "r1".to_string();
         let result = offer_checkpoint::<_, io::Error>(&store, "MyReactor", &id, 1, &42_i64).await;
         assert_eq!(result.unwrap(), false);
