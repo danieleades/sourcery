@@ -4,6 +4,7 @@ members = [
     "sourcery-core",
     "sourcery-macros",
     "sourcery-postgres",
+    "examples/storefront",
 ]
 
 [workspace.package]

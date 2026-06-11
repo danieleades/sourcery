@@ -433,7 +433,8 @@ where
 
     #[allow(
         clippy::unused_async_trait_impl,
-        reason = "async keeps this no-op implementation equivalent to the trait future contract"
+        reason = "async keeps this no-op implementation equivalent to the trait future contract; \
+                  revisit after https://github.com/rust-lang/rust/issues/109417"
     )]
     async fn load_base(&self, _kind: &str, _id: &S::Id) -> Option<(A, S::Position)> {
         None
@@ -450,7 +451,8 @@ where
 
     #[allow(
         clippy::unused_async_trait_impl,
-        reason = "async keeps this no-op implementation equivalent to the trait future contract"
+        reason = "async keeps this no-op implementation equivalent to the trait future contract; \
+                  revisit after https://github.com/rust-lang/rust/issues/109417"
     )]
     async fn offer_snapshot(
         &self,

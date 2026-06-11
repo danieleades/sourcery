@@ -69,15 +69,14 @@ src/
   metadata.rs     # RequestContext (custom event metadata)
   domain/
     ids.rs        # id newtypes + StorageKey impls
-    product.rs    # Product aggregate, events, commands
-    order.rs      # Order aggregate, events, commands
-    payment.rs    # Payment aggregate, events, commands (+ event versioning)
+    product.rs    # Product aggregate, events, commands, rule tests
+    order.rs      # Order aggregate, events, commands, rule tests
+    payment.rs    # Payment aggregate, events, commands, rule tests (+ event versioning)
   projections.rs  # the four read models
   coordinator.rs  # FulfillmentCoordinator process manager
 tests/
-  product_rules.rs / order_rules.rs / payment_rules.rs  # given/when/then rules
-  concurrency.rs                                        # optimistic conflict + retry
-  fulfillment.rs                                        # end-to-end through the coordinator
+  concurrency.rs  # optimistic conflict + retry
+  fulfillment.rs  # end-to-end through the coordinator
 ```
 
 ## What it exercises

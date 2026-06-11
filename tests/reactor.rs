@@ -543,6 +543,11 @@ impl SnapshotStore<String> for UnreachableCheckpointStore {
     type Error = io::Error;
     type Position = u64;
 
+    #[allow(
+        clippy::unused_async_trait_impl,
+        reason = "the explicit Future form would make the Send bound depend on T; \
+                  revisit after https://github.com/rust-lang/rust/issues/109417"
+    )]
     async fn load<T>(
         &self,
         _kind: &str,
@@ -554,6 +559,11 @@ impl SnapshotStore<String> for UnreachableCheckpointStore {
         Err(io::Error::other("checkpoint store unreachable"))
     }
 
+    #[allow(
+        clippy::unused_async_trait_impl,
+        reason = "async keeps this test double equivalent to the trait future contract; \
+                  revisit after https://github.com/rust-lang/rust/issues/109417"
+    )]
     async fn offer_snapshot<CE, T, Create>(
         &self,
         _kind: &str,

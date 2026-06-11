@@ -27,7 +27,7 @@ uuid = { version = "1", default-features = false, features = ["std", "v4", "serd
 
 [dev-dependencies]
 # `test-util` exposes `TestFramework` and `RepositoryTestExt`, used only by the
-# integration tests in `tests/`.
+# test suite.
 sourcery = { path = "../..", version = "0.2", features = ["test-util"] }
 tokio = { version = "1", default-features = false, features = ["macros", "rt-multi-thread", "time"] }
 

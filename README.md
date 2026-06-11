@@ -80,6 +80,7 @@ impl Handle<DepositFunds> for Account {
 | [`versioned_events`](examples/versioned_events.rs) | Schema migration via serde |
 | [`optimistic_concurrency`](examples/optimistic_concurrency.rs) | Conflict detection and retry |
 | [`snapshotting`](examples/snapshotting.rs) | Aggregate snapshots for performance |
+| [`storefront`](examples/storefront) | End-to-end storefront app with reactors, projections, snapshots, and tests |
 
 ```shell
 cargo run --example quickstart

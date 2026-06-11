@@ -354,7 +354,8 @@ impl SnapshotStore<String> for FailingLoadSnapshotStore {
 
     #[allow(
         clippy::unused_async_trait_impl,
-        reason = "the explicit Future form would make the Send bound depend on T"
+        reason = "the explicit Future form would make the Send bound depend on T; \
+                  revisit after https://github.com/rust-lang/rust/issues/109417"
     )]
     async fn load<T>(
         &self,
@@ -369,7 +370,8 @@ impl SnapshotStore<String> for FailingLoadSnapshotStore {
 
     #[allow(
         clippy::unused_async_trait_impl,
-        reason = "async keeps this test double equivalent to the trait future contract"
+        reason = "async keeps this test double equivalent to the trait future contract; \
+                  revisit after https://github.com/rust-lang/rust/issues/109417"
     )]
     async fn offer_snapshot<CE, T, Create>(
         &self,
@@ -396,7 +398,8 @@ impl SnapshotStore<String> for CorruptSnapshotStore {
 
     #[allow(
         clippy::unused_async_trait_impl,
-        reason = "the explicit Future form would make the Send bound depend on T"
+        reason = "the explicit Future form would make the Send bound depend on T; \
+                  revisit after https://github.com/rust-lang/rust/issues/109417"
     )]
     async fn load<T>(
         &self,
@@ -411,7 +414,8 @@ impl SnapshotStore<String> for CorruptSnapshotStore {
 
     #[allow(
         clippy::unused_async_trait_impl,
-        reason = "async keeps this test double equivalent to the trait future contract"
+        reason = "async keeps this test double equivalent to the trait future contract; \
+                  revisit after https://github.com/rust-lang/rust/issues/109417"
     )]
     async fn offer_snapshot<CE, T, Create>(
         &self,
@@ -452,7 +456,8 @@ impl SnapshotStore<String> for TrackingSnapshotStore {
 
     #[allow(
         clippy::unused_async_trait_impl,
-        reason = "the explicit Future form would make the Send bound depend on T"
+        reason = "the explicit Future form would make the Send bound depend on T; \
+                  revisit after https://github.com/rust-lang/rust/issues/109417"
     )]
     async fn load<T>(
         &self,
@@ -468,7 +473,8 @@ impl SnapshotStore<String> for TrackingSnapshotStore {
 
     #[allow(
         clippy::unused_async_trait_impl,
-        reason = "async keeps this test double equivalent to the trait future contract"
+        reason = "async keeps this test double equivalent to the trait future contract; \
+                  revisit after https://github.com/rust-lang/rust/issues/109417"
     )]
     async fn offer_snapshot<CE, T, Create>(
         &self,
