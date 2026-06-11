@@ -99,137 +99,6 @@ impl FulfillmentCoordinator {
             .caused_by(ACTOR, format!("{}@{}", ctx.event_kind, ctx.aggregate_id))
     }
 
-    async fn on_order_placed(
-        &self,
-        ctx: EventContext<'_, String, RequestContext>,
-        event: &OrderPlaced,
-    ) -> Result<(), ReactError> {
-        let Some(order_id) = OrderId::from_storage_key(ctx.aggregate_id) else {
-            return Err(ReactError::fatal(CoordinatorError::UnparseableKey(
-                ctx.aggregate_id.clone(),
-            )));
-        };
-        let md = Self::causation(&ctx);
-
-        // Reserve every line. Reservation is idempotent per order, so redelivery
-        // is safe; contention on hot products is expected, hence the retry loop.
-        let mut reserved: Vec<&OrderLine> = Vec::new();
-        for line in &event.lines {
-            let command = Reserve {
-                order_id,
-                quantity: line.quantity,
-            };
-            match self
-                .repo
-                .update_with_retry::<Product, Reserve>(&line.product_id, &command, &md, MAX_RETRIES)
-                .await
-            {
-                Ok(_) => reserved.push(line),
-                Err(CommandError::Aggregate(ProductError::InsufficientStock { .. })) => {
-                    // Compensate: release what we reserved, then cancel the order.
-                    self.release_lines(order_id, &reserved, &md).await?;
-                    self.cancel_order(order_id, "insufficient stock", &md)
-                        .await?;
-                    return Ok(());
-                }
-                Err(other) => classify(Err::<(), _>(other))?,
-            }
-        }
-
-        // All lines reserved → authorize a payment for the order total. Skip if
-        // a payment stream already exists (idempotent under redelivery).
-        let payment_id = PaymentId::for_order(order_id);
-        if self
-            .repo
-            .load::<Payment>(&payment_id)
-            .await
-            .map_err(ReactError::retry)?
-            .is_none()
-        {
-            let amount_cents = self.price_order(event).await?;
-            let command = Authorize {
-                order_id,
-                customer_id: event.customer_id.clone(),
-                amount_cents,
-                currency: "USD".to_string(),
-            };
-            classify(
-                self.repo
-                    .create::<Payment, Authorize>(&payment_id, &command, &md)
-                    .await,
-            )?;
-        }
-        Ok(())
-    }
-
-    async fn on_payment_captured(
-        &self,
-        ctx: EventContext<'_, String, RequestContext>,
-        event: &PaymentCaptured,
-    ) -> Result<(), ReactError> {
-        let order_id = event.order_id;
-        let md = Self::causation(&ctx);
-        let Some(order) = self
-            .repo
-            .load::<Order>(&order_id)
-            .await
-            .map_err(ReactError::retry)?
-        else {
-            return Ok(());
-        };
-
-        if order.status() == OrderStatus::Placed {
-            classify(
-                self.repo
-                    .update::<Order, ConfirmOrder>(&order_id, &ConfirmOrder, &md)
-                    .await,
-            )?;
-        }
-
-        for line in order.lines() {
-            let command = CommitReservation {
-                order_id,
-                quantity: line.quantity,
-            };
-            classify(
-                self.repo
-                    .update_with_retry::<Product, CommitReservation>(
-                        &line.product_id,
-                        &command,
-                        &md,
-                        MAX_RETRIES,
-                    )
-                    .await,
-            )?;
-        }
-        Ok(())
-    }
-
-    async fn on_payment_failed(
-        &self,
-        ctx: EventContext<'_, String, RequestContext>,
-        event: &PaymentFailed,
-    ) -> Result<(), ReactError> {
-        let order_id = event.order_id;
-        let md = Self::causation(&ctx);
-        let Some(order) = self
-            .repo
-            .load::<Order>(&order_id)
-            .await
-            .map_err(ReactError::retry)?
-        else {
-            return Ok(());
-        };
-
-        if matches!(order.status(), OrderStatus::Placed | OrderStatus::Confirmed) {
-            let lines: Vec<&OrderLine> = order.lines().iter().collect();
-            self.release_lines(order_id, &lines, &md).await?;
-            let reason = format!("payment failed: {}", event.reason);
-            self.cancel_order(order_id, &reason, &md).await?;
-        }
-        Ok(())
-    }
-
     /// Total order value in cents, priced from each product's catalogue price.
     async fn price_order(&self, event: &OrderPlaced) -> Result<u64, ReactError> {
         let mut total = 0;
@@ -317,7 +186,71 @@ impl React<OrderPlaced> for FulfillmentCoordinator {
         ctx: EventContext<'_, Self::Id, Self::Metadata>,
         event: &OrderPlaced,
     ) -> impl Future<Output = Result<(), ReactError>> + Send {
-        self.on_order_placed(ctx, event)
+        let order_id = OrderId::from_storage_key(ctx.aggregate_id).ok_or_else(|| {
+            ReactError::fatal(CoordinatorError::UnparseableKey(ctx.aggregate_id.clone()))
+        });
+        let md = Self::causation(&ctx);
+
+        async move {
+            let order_id = order_id?;
+
+            // Reserve every line. Reservation is idempotent per order, so
+            // redelivery is safe; contention on hot products is expected, hence
+            // the retry loop.
+            let mut reserved: Vec<&OrderLine> = Vec::new();
+            for line in &event.lines {
+                let command = Reserve {
+                    order_id,
+                    quantity: line.quantity,
+                };
+                match self
+                    .repo
+                    .update_with_retry::<Product, Reserve>(
+                        &line.product_id,
+                        &command,
+                        &md,
+                        MAX_RETRIES,
+                    )
+                    .await
+                {
+                    Ok(_) => reserved.push(line),
+                    Err(CommandError::Aggregate(ProductError::InsufficientStock { .. })) => {
+                        // Compensate: release what we reserved, then cancel the
+                        // order.
+                        self.release_lines(order_id, &reserved, &md).await?;
+                        self.cancel_order(order_id, "insufficient stock", &md)
+                            .await?;
+                        return Ok(());
+                    }
+                    Err(other) => classify(Err::<(), _>(other))?,
+                }
+            }
+
+            // All lines reserved → authorize a payment for the order total. Skip
+            // if a payment stream already exists (idempotent under redelivery).
+            let payment_id = PaymentId::for_order(order_id);
+            if self
+                .repo
+                .load::<Payment>(&payment_id)
+                .await
+                .map_err(ReactError::retry)?
+                .is_none()
+            {
+                let amount_cents = self.price_order(event).await?;
+                let command = Authorize {
+                    order_id,
+                    customer_id: event.customer_id.clone(),
+                    amount_cents,
+                    currency: "USD".to_string(),
+                };
+                classify(
+                    self.repo
+                        .create::<Payment, Authorize>(&payment_id, &command, &md)
+                        .await,
+                )?;
+            }
+            Ok(())
+        }
     }
 }
 
@@ -327,7 +260,45 @@ impl React<PaymentCaptured> for FulfillmentCoordinator {
         ctx: EventContext<'_, Self::Id, Self::Metadata>,
         event: &PaymentCaptured,
     ) -> impl Future<Output = Result<(), ReactError>> + Send {
-        self.on_payment_captured(ctx, event)
+        let order_id = event.order_id;
+        let md = Self::causation(&ctx);
+
+        async move {
+            let Some(order) = self
+                .repo
+                .load::<Order>(&order_id)
+                .await
+                .map_err(ReactError::retry)?
+            else {
+                return Ok(());
+            };
+
+            if order.status() == OrderStatus::Placed {
+                classify(
+                    self.repo
+                        .update::<Order, ConfirmOrder>(&order_id, &ConfirmOrder, &md)
+                        .await,
+                )?;
+            }
+
+            for line in order.lines() {
+                let command = CommitReservation {
+                    order_id,
+                    quantity: line.quantity,
+                };
+                classify(
+                    self.repo
+                        .update_with_retry::<Product, CommitReservation>(
+                            &line.product_id,
+                            &command,
+                            &md,
+                            MAX_RETRIES,
+                        )
+                        .await,
+                )?;
+            }
+            Ok(())
+        }
     }
 }
 
@@ -337,7 +308,27 @@ impl React<PaymentFailed> for FulfillmentCoordinator {
         ctx: EventContext<'_, Self::Id, Self::Metadata>,
         event: &PaymentFailed,
     ) -> impl Future<Output = Result<(), ReactError>> + Send {
-        self.on_payment_failed(ctx, event)
+        let order_id = event.order_id;
+        let md = Self::causation(&ctx);
+        let reason = format!("payment failed: {}", event.reason);
+
+        async move {
+            let Some(order) = self
+                .repo
+                .load::<Order>(&order_id)
+                .await
+                .map_err(ReactError::retry)?
+            else {
+                return Ok(());
+            };
+
+            if matches!(order.status(), OrderStatus::Placed | OrderStatus::Confirmed) {
+                let lines: Vec<&OrderLine> = order.lines().iter().collect();
+                self.release_lines(order_id, &lines, &md).await?;
+                self.cancel_order(order_id, &reason, &md).await?;
+            }
+            Ok(())
+        }
     }
 }
 
