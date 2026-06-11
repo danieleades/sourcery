@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/danieleades/sourcery/compare/sourcery-v0.2.0...sourcery-v0.3.0) - 2026-06-11
+
+### Added
+
+- [**breaking**] implement "storefront" example and update ergonomics ([#54](https://github.com/danieleades/sourcery/pull/54))
+- [**breaking**] read your own writes ([#53](https://github.com/danieleades/sourcery/pull/53))
+- [**breaking**] add support for 'subscribing' to events to postgres backend ([#44](https://github.com/danieleades/sourcery/pull/44))
+- [**breaking**] add special 'create' events and commands ([#37](https://github.com/danieleades/sourcery/pull/37))
+- add doc comments to generated structs ([#35](https://github.com/danieleades/sourcery/pull/35))
+
+### Other
+
+- move tests closer to code ([#56](https://github.com/danieleades/sourcery/pull/56))
+- *(deps)* bump codecov/codecov-action from 6 to 7 ([#55](https://github.com/danieleades/sourcery/pull/55))
+- [**breaking**] relicense to AGPL-3.0 and add commercial licence ([#52](https://github.com/danieleades/sourcery/pull/52))
+- remove unnecessary Box from SubscribableStore::subscribe ([#49](https://github.com/danieleades/sourcery/pull/49))
+- *(deps)* bump actions/upload-pages-artifact from 4 to 5 ([#43](https://github.com/danieleades/sourcery/pull/43))
+- *(deps)* bump actions/configure-pages from 5 to 6 ([#41](https://github.com/danieleades/sourcery/pull/41))
+- *(deps)* bump codecov/codecov-action from 5 to 6 ([#40](https://github.com/danieleades/sourcery/pull/40))
+- *(deps)* bump actions/deploy-pages from 4 to 5 ([#39](https://github.com/danieleades/sourcery/pull/39))
+- *(deps)* bump tokio from 1.49.0 to 1.50.0 ([#46](https://github.com/danieleades/sourcery/pull/46))
+- *(deps)* bump the patch-updates group across 1 directory with 2 updates ([#48](https://github.com/danieleades/sourcery/pull/48))
+- *(deps)* bump uuid from 1.21.0 to 1.23.2 ([#47](https://github.com/danieleades/sourcery/pull/47))
+- *(deps)* bump transitive deps to fix cargo-deny advisories ([#45](https://github.com/danieleades/sourcery/pull/45))
+
 ## [0.2.0](https://github.com/danieleades/sourcery/compare/sourcery-v0.1.0...sourcery-v0.2.0) - 2026-02-12
 
 ### Added
