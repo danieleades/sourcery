@@ -17,7 +17,7 @@ default = []
 postgres = ["sourcery/postgres"]
 
 [dependencies]
-sourcery = { path = "../..", version = "0.2" }
+sourcery = { path = "../..", version = "0.3" }
 serde = { version = "1", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
 thiserror = { version = "2", default-features = false, features = ["std"] }
@@ -28,7 +28,7 @@ uuid = { version = "1", default-features = false, features = ["std", "v4", "serd
 [dev-dependencies]
 # `test-util` exposes `TestFramework` and `RepositoryTestExt`, used only by the
 # test suite.
-sourcery = { path = "../..", version = "0.2", features = ["test-util"] }
+sourcery = { path = "../..", version = "0.3", features = ["test-util"] }
 tokio = { version = "1", default-features = false, features = ["macros", "rt-multi-thread", "time"] }
 
 [[bin]]

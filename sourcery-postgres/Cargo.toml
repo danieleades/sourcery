@@ -17,7 +17,7 @@ workspace = true
 default = []
 
 [dependencies]
-sourcery-core = { path = "../sourcery-core", version = "0.2" }
+sourcery-core = { path = "../sourcery-core", version = "0.3" }
 async-stream = "0.3"
 futures-core = { version = "0.3", default-features = false }
 nonempty = "0.12"
