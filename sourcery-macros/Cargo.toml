@@ -17,7 +17,7 @@ proc-macro = true
 workspace = true
 
 [dependencies]
-darling = { version = "0.23", default-features = false }
+darling = { version = "0.24", default-features = false }
 heck = "0.5"
 syn = { version = "2", default-features = false, features = ["full", "parsing", "proc-macro"] }
 quote = { version = "1", default-features = false, features = ["proc-macro"] }
